@@ -1,0 +1,19 @@
+[package]
+name = "mdaw-dsp"
+description = "Deterministic built-in DSP, tempo compiler and offline render."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+mdaw-model.workspace = true
+imbl.workspace = true
+libm.workspace = true
+
+[dev-dependencies]
+blake3.workspace = true
