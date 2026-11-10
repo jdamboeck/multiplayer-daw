@@ -14,3 +14,15 @@ workspace = true
 mdaw-model.workspace = true
 mdaw-proto.workspace = true
 mdaw-net.workspace = true
+anyhow.workspace = true
+blake3.workspace = true
+getrandom.workspace = true
+postcard.workspace = true
+quinn.workspace = true
+rusqlite.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+mdaw-sync.workspace = true
+proptest.workspace = true
+tempfile.workspace = true
