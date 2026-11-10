@@ -17,11 +17,17 @@ mdaw-sync.workspace = true
 mdaw-dsp.workspace = true
 mdaw-engine.workspace = true
 mdaw-net.workspace = true
+anyhow.workspace = true
+getrandom.workspace = true
+quinn.workspace = true
+tokio.workspace = true
 eframe.workspace = true
 egui.workspace = true
 
 [dev-dependencies]
 egui_kittest = { workspace = true, features = ["wgpu"] }
+mdaw-server.workspace = true
+tempfile.workspace = true
 
 [lib]
 name = "mdaw_client"

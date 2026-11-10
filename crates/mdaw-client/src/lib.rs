@@ -5,9 +5,12 @@
 //! real server (M2 on).
 
 mod app;
+mod link;
+pub mod profile;
 mod session;
 mod theme;
 pub mod ui;
 
 pub use app::{DawApp, Focus, Selection, Tab};
-pub use session::Session;
+pub use link::{Waker, Who};
+pub use session::{Displaced, Session, Status};
