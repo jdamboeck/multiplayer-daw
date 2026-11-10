@@ -1,0 +1,19 @@
+[package]
+name = "mdaw-model"
+description = "Document model, IDs, ops and deterministic apply for the multiplayer DAW."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+imbl.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+postcard.workspace = true
+proptest.workspace = true
