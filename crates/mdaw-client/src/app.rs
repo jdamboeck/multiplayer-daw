@@ -81,6 +81,11 @@ impl DawApp {
     /// Runs one frame.
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         self.session.frame();
+        // The loop belongs to the transport, which others may have moved.
+        match self.session.loop_range() {
+            Some(range) => (self.loop_on, self.loop_range) = (true, range),
+            None => self.loop_on = false,
+        }
         self.drop_stale_selection();
         self.shortcuts(ui.ctx());
         piano_roll::release_preview(self, ui.ctx());
@@ -115,7 +120,7 @@ impl DawApp {
 
         let editing = self.editing.take();
         self.session.set_editing(editing);
-        if self.session.engine().is_playing() || self.transport.meter_active() {
+        if self.session.is_playing() || self.transport.meter_active() {
             ui.ctx().request_repaint();
         } else if let Some(wait) = self.session.next_frame_in() {
             ui.ctx().request_repaint_after(wait);
@@ -123,27 +128,25 @@ impl DawApp {
     }
 
     pub fn toggle_play(&mut self) {
-        let engine = self.session.engine_mut();
-        if engine.is_playing() {
-            engine.stop()
+        if self.session.is_playing() {
+            self.session.pause()
         } else {
-            engine.play()
+            self.session.play()
         }
     }
 
     /// Stops. When already stopped, goes back to the start.
     pub fn stop(&mut self) {
-        let engine = self.session.engine_mut();
-        if engine.is_playing() {
-            engine.stop()
+        if self.session.is_playing() {
+            self.session.pause()
         } else {
-            engine.seek(Tick::ZERO)
+            self.session.seek(Tick::ZERO)
         }
     }
 
     pub fn apply_loop(&mut self) {
         let range = (self.loop_on && !self.loop_range.is_empty()).then_some(self.loop_range);
-        self.session.engine_mut().set_loop(range);
+        self.session.set_loop(range);
     }
 
     pub fn add_track(&mut self) {
@@ -234,7 +237,7 @@ impl DawApp {
             self.toggle_play();
         }
         if pressed(Modifiers::NONE, Key::Home) {
-            self.session.engine_mut().seek(Tick::ZERO);
+            self.session.seek(Tick::ZERO);
         }
         if pressed(Modifiers::NONE, Key::Delete) || pressed(Modifiers::NONE, Key::Backspace) {
             self.delete_selection();

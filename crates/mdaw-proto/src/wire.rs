@@ -3,7 +3,7 @@
 //! A frame is a `u32` little-endian length followed by that many bytes of postcard. The client
 //! opens one bidirectional stream per connection and speaks first with [`Hello`].
 
-use crate::{Event, Txn};
+use crate::{Event, TransportState, Txn};
 use mdaw_model::{ActorId, EntityRef, Project, Tick, TrackId, UserId};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -22,6 +22,9 @@ pub enum ClientMsg {
     Submit(Txn),
     /// Relayed to the other clients, never stored. At most 10 per second.
     Presence(Presence),
+    /// Asks for a new state of the shared transport. Any client may, and each request is
+    /// answered with exactly one [`ServerMsg::Transport`] that names the asker.
+    SetTransport(TransportState),
 }
 
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
@@ -64,6 +67,15 @@ pub enum ServerMsg {
     Peers(Vec<Peer>),
     /// Another client's presence.
     Presence { actor: ActorId, presence: Presence },
+    /// The state of the shared transport. Sent to everyone when it changes, the client that
+    /// asked included.
+    Transport {
+        state: TransportState,
+        /// The client whose request this answers; `None` when the server moved the transport
+        /// itself. A client that counts its unanswered requests knows from this when its own
+        /// idea of the transport is the older one.
+        by: Option<ActorId>,
+    },
 }
 
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
@@ -80,6 +92,8 @@ pub struct Welcome {
     /// with. Pending transactions up to it must not be sent again.
     pub acked: Option<u64>,
     pub peers: Vec<Peer>,
+    /// The shared transport as it is now.
+    pub transport: TransportState,
 }
 
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
@@ -240,6 +254,13 @@ mod tests {
                 user: UserId(1),
                 name: "ada".into(),
             }],
+            transport: TransportState {
+                playing: true,
+                anchor_tick: 960.5,
+                anchor_server_micros: 1_234_567,
+                loop_range: Some(mdaw_model::TickRange::new(Tick(0), Tick(3840))),
+                epoch: 3,
+            },
         }));
         let frame = encode(&welcome).unwrap();
         assert_eq!(decode::<ServerMsg>(&frame[4..]).unwrap(), welcome);

@@ -1,10 +1,11 @@
 # mdaw protocol
 
-What client and server say to each other, as built. Protocol version **1**. The types live in
-`mdaw-proto` (`lib.rs` for events, `wire.rs` for messages) and in `mdaw-model` (ops); this text
-explains the rules around them. It covers what exists after milestone M2: the state plane with
-live edits. Transport, checkout and commit, blobs and live MIDI are in `docs/plan.md` and get
-their sections here when they are built.
+What client and server say to each other, as built. Protocol version **2**. The types live in
+`mdaw-proto` (`lib.rs` for events, `wire.rs` for messages, `transport.rs` for the transport and
+datagrams) and in `mdaw-model` (ops); this text explains the rules around them. It covers what
+exists after milestone M3: the state plane with live edits, and the shared clock and transport.
+Checkout and commit, blobs and live MIDI are in `docs/plan.md` and get their sections here when
+they are built.
 
 ## Connection
 
@@ -34,7 +35,7 @@ trims it, drops control characters, cuts it to 32 characters and calls an empty 
 The server answers with one of:
 
 ```
-Welcome { actor, user, session_secret, head_seq, sync, acked, peers }
+Welcome { actor, user, session_secret, head_seq, sync, acked, peers, transport }
 Refused(BadToken | ProtoVersion(server's) | Protocol)      // then the server closes
 ```
 
@@ -43,6 +44,7 @@ Refused(BadToken | ProtoVersion(server's) | Protocol)      // then the server cl
 - `sync` is `Snapshot(Project)` at `head_seq`, or on a resume `Events(...)` with everything after
   `last_seq`.
 - `session_secret` proves on the next connection that the previous one was this client's.
+- `transport` is the shared transport as it is now (see "Clock and transport").
 
 ### Resuming
 
@@ -138,6 +140,79 @@ lock; the server does not look at it, and an edit that arrives anyway is sequenc
 A hold that is not repeated for 2 s lapses, and all holds of a client end when it disconnects.
 
 `Peers` is sent whenever someone joins or leaves.
+
+## Clock and transport
+
+The transport is session state. It is not part of the document, is not stored, and starts out
+stopped at tick 0 when the server starts. All times are the server's clock: microseconds since
+the server process started.
+
+### Clock
+
+```
+Ping { t0 }                      // datagram, client to server; t0 is the client's own clock
+Pong { t0, server_micros }       // datagram, the answer
+```
+
+Datagrams are postcard without a length prefix. They may get lost; nothing waits for them.
+
+A client pings 5 times, 20 ms apart, on every new connection, then once a second. For each pong
+that comes back at client time `t1`, the round trip is `t1 - t0` and the offset of the server's
+clock is `server_micros - (t0 + t1) / 2`. The client keeps the last 16 samples and believes the
+one with the shortest round trip: that one spent the least time queued, so its halfway point is
+closest to the truth. The estimate is off by at most half of that round trip. It starts from
+nothing on every connection.
+
+### Transport
+
+```
+TransportState { playing, anchor_tick: f64, anchor_server_micros, loop_range, epoch }
+
+SetTransport(TransportState)                         // client to server
+Transport { state: TransportState, by: Option<ActorId> }    // server to everyone
+```
+
+- Stopped, the playhead rests at `anchor_tick`. Playing, it is at `anchor_tick` at
+  `anchor_server_micros` and moves on from there by the project's tempo map. Before that time it
+  waits at `anchor_tick`.
+- With a `loop_range`, playback that started before the region's end wraps from its end to its
+  start. Playback anchored at or behind the end runs on.
+- Any client may ask for a new state. A request is the whole state, and the last one to reach the
+  server wins as a whole. The server forces it into range: ticks into the song, an empty loop
+  region to none, the anchor time of a playing state to between 10 s ago and 2 s ahead, the
+  anchor time of a stopped state to now. It numbers the result with the next `epoch` and sends
+  it to everyone, the asker included, with `by` naming the asker.
+- A request that makes no sense (an anchor tick that is not a number) changes nothing. The asker
+  alone gets the unchanged state back, again with `by`. So every request is answered exactly
+  once to the one who made it.
+- When a transaction that changes the tempo map is sequenced while the playhead moves, the
+  server re-anchors: the new anchor is where the playhead is at that moment by the old map. It
+  sends the `Event` first, then `Transport` with `by: None`.
+- When the last client leaves while the transport plays, the server stops it at the nearest
+  whole tick. The loop region stays.
+
+### What the client does
+
+- **Start and seek.** To start, a client asks for `playing` with the anchor 150 ms ahead of its
+  estimate of the server's clock, so that the message is everywhere before it is due and all
+  engines start on the same sample. A seek during playback is the same with a new
+  `anchor_tick`: everyone waits at the new place for 150 ms. Pause asks for a stopped state at
+  the nearest whole tick to where the playhead is.
+- **Acting at once.** The asker acts on its request without waiting. It counts its unanswered
+  requests; while there are any, it ignores what the server says about the transport, because a
+  later answer will replace it. The answer to its last request then counts, whatever it is.
+- **Following.** The engine turns the anchor into its own clock (`anchor_server_micros - offset`)
+  and compares, per audio buffer, where its playhead is with where the anchor puts it at the
+  time the buffer will be heard. A fresh anchor is taken up exactly, on the sample it is due. A
+  playhead that is more than 20 ms off for three buffers in a row jumps to where it should be;
+  smaller errors are left alone (no continuous correction in the prototype). A better clock
+  estimate moves the anchor without restarting anything.
+- **Tempo.** A client that sees the tempo map change while the playhead moves re-anchors by
+  itself the same way the server does, and takes the server's anchor when it arrives.
+- **Link.** A client can leave the shared transport (the Link switch). Its transport is then
+  private: it starts as a copy of the shared one, and play, stop, seek and loop act on it alone
+  and are not sent. Linked again, the client takes up the shared state. A client whose
+  connection is down, or that has no clock estimate yet, behaves as unlinked until it has both.
 
 ## Server storage
 

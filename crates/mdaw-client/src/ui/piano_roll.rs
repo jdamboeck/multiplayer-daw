@@ -298,7 +298,7 @@ fn interact_ruler(app: &mut DawApp, ui: &Ui, layout: &RollLayout) {
     let tick = snap_round(layout.axis.tick(pos.x).max(0.0), app.roll.snap);
     if app.roll.last_seek != Some(tick) {
         app.roll.last_seek = Some(tick);
-        app.session.engine_mut().seek(tick);
+        app.session.seek(tick);
     }
 }
 

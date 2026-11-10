@@ -24,13 +24,21 @@ fn serve(dir: &Path, listen: &str) -> Server {
 }
 
 fn window<'a>(server: &Server, name: &str) -> App<'a> {
+    window_with(server, name, Engine::manual(48_000, false))
+}
+
+/// A window whose engine keeps time like one with an audio device.
+fn live_window<'a>(server: &Server, name: &str) -> App<'a> {
+    window_with(server, name, Engine::manual(48_000, true))
+}
+
+fn window_with<'a>(server: &Server, name: &str, engine: Engine) -> App<'a> {
     let mut user_key = [0u8; 16];
     user_key[..name.len()].copy_from_slice(name.as_bytes());
     let who = Who {
         user_key,
         name: name.into(),
     };
-    let engine = Engine::manual(48_000, false);
     let session = Session::join(server.join_info().clone(), who, engine, Arc::new(|| {})).unwrap();
     let mut harness = Harness::builder()
         .with_size(vec2(1280.0, 800.0))
@@ -321,6 +329,47 @@ fn a_refused_edit_shows_a_notice_that_can_be_dismissed() {
     ann.get_by_label("Dismiss").click();
     ann.run_steps(3);
     assert!(!shows(&ann, "An edit was not accepted"));
+}
+
+#[test]
+fn play_in_one_window_plays_in_the_other_until_it_unlinks() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = serve(dir.path(), "127.0.0.1:0");
+    let (mut ann, mut ben) = (live_window(&server, "ann"), live_window(&server, "ben"));
+    until(&mut ann, &mut ben, "both know the server's clock", |a, b| {
+        a.session.timing().is_some() && b.session.timing().is_some()
+    });
+    assert!(shows(&ben, "clock ±"));
+
+    ann.get_by_label("Play").click();
+    until(&mut ann, &mut ben, "it plays in both", |a, b| {
+        a.session.position() > 0.0 && b.session.position() > 0.0
+    });
+    assert!(shows(&ben, "Pause"), "ben's button is the one that stops it");
+    assert!(shows(&ben, "in sync"));
+
+    // The loop is part of what is shared.
+    ann.get_by_label("Loop").click();
+    until(&mut ann, &mut ben, "ben loops too", |_, b| b.loop_on);
+    assert_eq!(ben.state().loop_range, ann.state().loop_range);
+
+    // Ben unlinks: what ann does no longer reaches ben's transport.
+    ben.get_by_label("Link").click();
+    ben.run_steps(2);
+    assert_eq!(ben.state().session.linked(), Some(false));
+    ann.get_by_label("Pause").click();
+    until(&mut ann, &mut ben, "ann has stopped and ben knows", |a, b| {
+        !a.session.is_playing() && b.session.shared_transport().is_some_and(|t| !t.playing)
+    });
+    assert!(ben.state().session.is_playing());
+    assert!(shows(&ben, "Pause") && !shows(&ben, "in sync"));
+
+    // Linked again, ben is where everyone is: stopped, at ann's playhead.
+    ben.get_by_label("Link").click();
+    until(&mut ann, &mut ben, "ben is back with ann", |a, b| {
+        !b.session.is_playing() && a.session.position() == b.session.position()
+    });
+    assert!(shows(&ben, "Play"));
 }
 
 /// Writes PNGs of what collaboration looks like. Run with

@@ -23,7 +23,7 @@ pub fn show(app: &mut DawApp, ui: &mut Ui) {
     let tempo = project.tempo_map();
     ui.add_space(3.0);
     ui.horizontal(|ui| {
-        let playing = app.session.engine().is_playing();
+        let playing = app.session.is_playing();
         let label = if playing { "Pause" } else { "Play" };
         if ui
             .add(Button::new(label).min_size(vec2(76.0, 0.0)))
@@ -47,9 +47,16 @@ pub fn show(app: &mut DawApp, ui: &mut Ui) {
         {
             app.apply_loop();
         }
+        if let Some(mut linked) = app.session.linked() {
+            let hint = "Play, stop, seek and loop together with everyone else. \
+                        Switched off, this client plays on its own.";
+            if ui.toggle_value(&mut linked, "Link").on_hover_text(hint).changed() {
+                app.session.set_linked(linked);
+            }
+        }
 
         ui.separator();
-        let tick = app.session.engine().position();
+        let tick = app.session.position();
         ui.label(
             RichText::new(format_position(tick))
                 .monospace()
@@ -128,9 +135,39 @@ pub fn show(app: &mut DawApp, ui: &mut Ui) {
                     .small(),
             );
             connection(app, ui);
+            timing(app, ui);
         });
     });
     ui.add_space(3.0);
+}
+
+/// How well this client keeps time with the shared transport.
+fn timing(app: &DawApp, ui: &mut Ui) {
+    let session = &app.session;
+    if session.linked() != Some(true) || session.status() != Status::Online {
+        return;
+    }
+    let Some(timing) = session.timing() else {
+        ui.label(RichText::new("syncing").color(theme::WARN).small())
+            .on_hover_text("Measuring the server's clock. Until that is done, this client plays on its own.");
+        ui.separator();
+        return;
+    };
+    let ms = |micros: i64| micros as f64 / 1000.0;
+    let text = match timing.drift_micros {
+        Some(drift) => format!("in sync {:+.1} ms", ms(drift)),
+        None => format!("clock ±{:.1} ms", ms(timing.rtt_micros) / 2.0),
+    };
+    ui.label(RichText::new(text).color(theme::TEXT_DIM).small())
+        .on_hover_text(format!(
+            "Shared transport\n\
+             Round trip to the server: {:.1} ms; its clock is known to half of that.\n\
+             While playing: how far this client's audio is ahead of the shared playhead.\n\
+             Jumps made to get back in step: {}",
+            ms(timing.rtt_micros),
+            timing.resyncs
+        ));
+    ui.separator();
 }
 
 /// Who is here, or what is wrong with the connection.

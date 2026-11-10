@@ -13,4 +13,4 @@ pub mod ui;
 
 pub use app::{DawApp, Focus, Selection, Tab};
 pub use link::{Waker, Who};
-pub use session::{Displaced, Session, Status};
+pub use session::{Displaced, Session, Status, Timing};

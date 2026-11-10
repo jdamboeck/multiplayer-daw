@@ -5,14 +5,15 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use mdaw_dsp::pocket;
-use mdaw_engine::Engine;
+use mdaw_engine::{Engine, clock};
 use mdaw_model::{
-    ActorId, BuiltinKind, Device, DeviceKind, EntityRef, IdGen, Op, Project, TempoPoint, Tick, TrackContent,
-    TrackId, TrackShell, UserId, apply, apply_all,
+    ActorId, BuiltinKind, Device, DeviceKind, EntityRef, IdGen, Op, Project, TempoMap, TempoPoint, Tick,
+    TickRange, TrackContent, TrackId, TrackShell, UserId, apply, apply_all,
 };
-use mdaw_net::JoinInfo;
+use mdaw_net::{ClockEstimate, JoinInfo};
 use mdaw_proto::{
-    ClientMsg, Event, EventBody, Peer, Presence, ServerMsg, Superseded, SyncData, Txn, Welcome,
+    ClientMsg, Event, EventBody, Peer, Presence, START_LEAD_MICROS, ServerMsg, Superseded, SyncData,
+    TransportState, Txn, Welcome,
 };
 use mdaw_sync::{Gesture, Loopback, Replica};
 
@@ -56,6 +57,21 @@ pub struct Displaced {
     pub lost: Superseded,
 }
 
+/// How well this client keeps time with the shared transport.
+#[derive(Clone, Copy, Debug)]
+pub struct Timing {
+    /// The server's clock now, as this client estimates it.
+    pub server_micros: i64,
+    /// Round trip of the ping the estimate rests on. The estimate is off by at most half of
+    /// it.
+    pub rtt_micros: i64,
+    /// How far the audio is ahead of where the shared transport puts it. `None` unless
+    /// playing.
+    pub drift_micros: Option<i64>,
+    /// How often the engine had to jump to get back in step.
+    pub resyncs: u64,
+}
+
 pub struct Session {
     replica: Replica,
     backend: Backend,
@@ -66,6 +82,10 @@ pub struct Session {
     editing: Option<EntityRef>,
     displaced: Vec<Displaced>,
     notices: Vec<String>,
+    /// The tempo map of the view when the transport was last looked at.
+    tempo: TempoMap,
+    /// The loop of the private transport.
+    private_loop: Option<TickRange>,
 }
 
 enum Backend {
@@ -87,6 +107,20 @@ struct Remote {
     presence: HashMap<ActorId, (Presence, Instant)>,
     presence_sent: Presence,
     presence_sent_at: Instant,
+    /// Whether this client takes part in the shared transport, as far as the user decides.
+    linked: bool,
+    /// The server's clock against the engine's, once the connection has measured it.
+    clock: Option<ClockEstimate>,
+    /// The shared transport: what the server said last, or what this client asked for since.
+    transport: TransportState,
+    /// The server spoke about the transport since it was last looked at.
+    transport_heard: bool,
+    /// Requests for the shared transport the server has not answered yet. While there are
+    /// any, what it says is older than what this client asked for.
+    transport_asked: u32,
+    /// What the engine was last told to follow, and under which clock offset. `None` while
+    /// the engine runs the private transport.
+    applied: Option<(TransportState, i64)>,
 }
 
 impl Session {
@@ -135,7 +169,7 @@ impl Session {
                 // The link would keep trying, but a first attempt that fails is more likely a
                 // wrong join string than a server about to come back.
                 Some(LinkEvent::Down(reason)) => bail!("could not join: {reason}"),
-                Some(LinkEvent::Msg(_)) => {}
+                Some(LinkEvent::Msg(_) | LinkEvent::Clock(_)) => {}
                 None => bail!("could not join: the server did not answer"),
             }
         };
@@ -145,6 +179,7 @@ impl Session {
             head_seq,
             sync,
             peers,
+            transport,
             ..
         } = *welcome;
         let SyncData::Snapshot(project) = sync else {
@@ -160,6 +195,12 @@ impl Session {
             presence: HashMap::new(),
             presence_sent: Presence::default(),
             presence_sent_at: Instant::now(),
+            linked: true,
+            clock: None,
+            transport,
+            transport_heard: true,
+            transport_asked: 0,
+            applied: None,
         };
         remote.set_peers(peers);
         Ok(Self::new(
@@ -180,7 +221,10 @@ impl Session {
             editing: None,
             displaced: Vec::new(),
             notices: Vec::new(),
+            tempo: TempoMap::default(),
+            private_loop: None,
         };
+        session.tempo = session.replica.view().tempo_map();
         session.engine.set_project(session.replica.view());
         session
     }
@@ -242,7 +286,189 @@ impl Session {
         self.receive();
         self.share_presence();
         self.engine.set_project(self.replica.view());
+        self.sync_transport();
         self.engine.tick();
+    }
+
+    /// Whether this client takes part in the shared transport. `None` without a server.
+    pub fn linked(&self) -> Option<bool> {
+        match &self.backend {
+            Backend::Local(_) => None,
+            Backend::Remote(remote) => Some(remote.linked),
+        }
+    }
+
+    /// Joins or leaves the shared transport. Leaving, playback goes on privately from where it
+    /// is; joining, it becomes what everyone else hears.
+    pub fn set_linked(&mut self, linked: bool) {
+        if let Backend::Remote(remote) = &mut self.backend {
+            remote.linked = linked;
+        }
+        self.sync_transport();
+    }
+
+    /// Whether play, pause, seek and loop currently act on the shared transport: linked,
+    /// connected, and the server's clock is known.
+    pub fn is_sharing_transport(&self) -> bool {
+        matches!(&self.backend, Backend::Remote(remote) if remote.sharing().is_some())
+    }
+
+    /// The shared transport as this client knows it, whether it takes part or not. `None`
+    /// without a server.
+    pub fn shared_transport(&self) -> Option<TransportState> {
+        match &self.backend {
+            Backend::Local(_) => None,
+            Backend::Remote(remote) => Some(remote.transport),
+        }
+    }
+
+    /// How well this client keeps time, while it shares the transport.
+    pub fn timing(&self) -> Option<Timing> {
+        let Backend::Remote(remote) = &self.backend else {
+            return None;
+        };
+        let offset = remote.sharing()?;
+        Some(Timing {
+            server_micros: clock::now_micros() + offset,
+            rtt_micros: remote.clock?.rtt_micros,
+            drift_micros: self.engine.drift_micros(),
+            resyncs: self.engine.stats().resyncs,
+        })
+    }
+
+    /// Whether the transport is playing, as far as the user is concerned: a start that is
+    /// scheduled counts.
+    pub fn is_playing(&self) -> bool {
+        match &self.backend {
+            Backend::Remote(remote) if remote.sharing().is_some() => remote.transport.playing,
+            _ => self.engine.is_playing(),
+        }
+    }
+
+    /// The playhead in ticks.
+    pub fn position(&self) -> f64 {
+        self.engine.position()
+    }
+
+    /// The loop region of the transport this client follows, if looping is on.
+    pub fn loop_range(&self) -> Option<TickRange> {
+        match &self.backend {
+            Backend::Remote(remote) if remote.sharing().is_some() => remote.transport.loop_range,
+            _ => self.private_loop,
+        }
+    }
+
+    pub fn play(&mut self) {
+        let Some((remote, now)) = shared(&mut self.backend) else {
+            self.engine.play();
+            return;
+        };
+        if !remote.transport.playing {
+            // Far enough ahead that everyone has heard of it when it is due.
+            remote.request(TransportState {
+                playing: true,
+                anchor_server_micros: now + START_LEAD_MICROS,
+                ..remote.transport
+            });
+            self.sync_transport();
+        }
+    }
+
+    /// Stops where the playhead is.
+    pub fn pause(&mut self) {
+        let Some((remote, now)) = shared(&mut self.backend) else {
+            self.engine.stop();
+            return;
+        };
+        if remote.transport.playing {
+            remote.request(TransportState {
+                playing: false,
+                anchor_tick: remote.transport.position(now, &self.tempo).round(),
+                anchor_server_micros: now,
+                ..remote.transport
+            });
+            self.sync_transport();
+        }
+    }
+
+    pub fn seek(&mut self, tick: Tick) {
+        let Some((remote, now)) = shared(&mut self.backend) else {
+            self.engine.seek(tick);
+            return;
+        };
+        remote.request(TransportState {
+            anchor_tick: tick.0.max(0) as f64,
+            anchor_server_micros: now + START_LEAD_MICROS,
+            ..remote.transport
+        });
+        self.sync_transport();
+    }
+
+    /// Sets the loop region, or turns looping off.
+    pub fn set_loop(&mut self, range: Option<TickRange>) {
+        let range = range.filter(|range| !range.is_empty());
+        let Some((remote, now)) = shared(&mut self.backend) else {
+            self.private_loop = range;
+            self.engine.set_loop(range);
+            return;
+        };
+        if remote.transport.loop_range != range {
+            // What the old loop did to the playhead so far stays done.
+            remote.request(TransportState {
+                loop_range: range,
+                ..remote.transport.reanchored(now, &self.tempo)
+            });
+            self.sync_transport();
+        }
+    }
+
+    /// Keeps the engine on the transport this client follows.
+    fn sync_transport(&mut self) {
+        let tempo = self.replica.view().tempo_map();
+        let before = std::mem::replace(&mut self.tempo, tempo);
+        let Backend::Remote(remote) = &mut self.backend else {
+            return;
+        };
+        let heard = std::mem::take(&mut remote.transport_heard);
+        let Some(offset) = remote.sharing() else {
+            if remote.applied.take().is_some() {
+                // On its own from here: the private transport starts as a copy.
+                self.private_loop = remote.transport.loop_range;
+                self.engine.unfollow();
+            }
+            return;
+        };
+        let now = clock::now_micros() + offset;
+        if before != self.tempo && !heard {
+            // The tempo changed under a running transport. The server will say where that
+            // leaves the playhead; until then, and for an edit of our own that the server has
+            // yet to see, the answer is: where it is now.
+            remote.transport = remote.transport.reanchored(now, &before);
+        }
+        let state = remote.transport;
+        let follow = |engine: &mut Engine, fresh| {
+            engine.follow(state.anchor_tick, state.anchor_server_micros - offset, fresh)
+        };
+        match remote.applied {
+            Some((applied, at)) if same_playback(&applied, &state) => {
+                if state.playing && at != offset {
+                    // The same playback, with a better idea of the server's clock.
+                    follow(&mut self.engine, false);
+                }
+            }
+            _ => {
+                self.engine.set_loop(state.loop_range);
+                if state.playing {
+                    follow(&mut self.engine, true);
+                } else {
+                    if self.engine.is_playing() {
+                        self.engine.stop();
+                    }
+                    self.engine.seek(Tick(state.anchor_tick.round() as i64));
+                }
+            }
+        }
+        remote.applied = Some((state, offset));
     }
 
     pub fn status(&self) -> Status {
@@ -369,6 +595,7 @@ impl Session {
             }
         }
         self.engine.set_project(self.replica.view());
+        self.sync_transport();
         true
     }
 
@@ -387,9 +614,17 @@ impl Session {
                         sync,
                         acked,
                         peers,
+                        transport,
                         ..
                     } = *welcome;
                     remote.epoch = epoch;
+                    // A new connection measures the clock anew; the transport is shared again
+                    // once it has.
+                    remote.clock = None;
+                    // Requests that went down with the old connection get no answer.
+                    remote.transport_asked = 0;
+                    remote.transport = transport;
+                    remote.transport_heard = true;
                     remote.set_peers(peers);
                     remote.presence_sent = Presence::default();
                     self.user = user;
@@ -406,6 +641,20 @@ impl Session {
                             }
                         }
                         Err(_) => remote.lose_track(),
+                    }
+                }
+                LinkEvent::Clock(estimate) => remote.clock = Some(estimate),
+                // The transport is not part of the document: it holds even while the replica
+                // waits for a fresh copy.
+                LinkEvent::Msg(ServerMsg::Transport { state, by }) => {
+                    if by == Some(self.replica.actor()) {
+                        remote.transport_asked = remote.transport_asked.saturating_sub(1);
+                    }
+                    // The server takes requests in order: as long as one of ours is on its
+                    // way, it will replace this state, and showing it would only be a flicker.
+                    if remote.transport_asked == 0 {
+                        remote.transport = state;
+                        remote.transport_heard = true;
                     }
                 }
                 LinkEvent::Msg(_) if remote.desynced => {}
@@ -430,6 +679,7 @@ impl Session {
                     if remote.status == Status::Online {
                         remote.status = Status::Reconnecting;
                     }
+                    remote.clock = None;
                     remote.presence.clear();
                 }
                 LinkEvent::Refused(reason) => {
@@ -476,12 +726,45 @@ impl Remote {
         self.peers = peers;
     }
 
+    /// The offset of the server's clock from the engine's, if this client shares the
+    /// transport right now.
+    fn sharing(&self) -> Option<i64> {
+        let clock = self
+            .clock
+            .filter(|_| self.linked && self.status == Status::Online)?;
+        Some(clock.offset_micros)
+    }
+
+    /// Asks the server for a new state of the shared transport, and acts as if it had agreed:
+    /// whatever it answers replaces this.
+    fn request(&mut self, state: TransportState) {
+        self.transport = state;
+        self.transport_asked += 1;
+        self.link.send(self.epoch, ClientMsg::SetTransport(state));
+    }
+
     /// The replica and the server's log no longer fit together: start over with a snapshot.
     fn lose_track(&mut self) {
         self.desynced = true;
         self.status = Status::Reconnecting;
         self.link.rejoin();
     }
+}
+
+/// The shared transport and the server's time now, if this client shares it.
+fn shared(backend: &mut Backend) -> Option<(&mut Remote, i64)> {
+    let Backend::Remote(remote) = backend else {
+        return None;
+    };
+    let offset = remote.sharing()?;
+    Some((remote, clock::now_micros() + offset))
+}
+
+/// Whether two states put the playhead in the same place at all times. The epoch only counts
+/// the server's answers, and a playhead at rest is nowhere else at another time.
+fn same_playback(a: &TransportState, b: &TransportState) -> bool {
+    let place = |s: &TransportState| (s.playing, s.anchor_tick, s.loop_range);
+    place(a) == place(b) && (!a.playing || a.anchor_server_micros == b.anchor_server_micros)
 }
 
 fn notice(notices: &mut Vec<String>, text: &str) {

@@ -1,6 +1,7 @@
 //! One project and everyone connected to it. Runs on a single thread: whatever order commands
 //! arrive in is the order of the log.
 
+use crate::clock::Clock;
 use crate::sequencer::Sequencer;
 use crate::store::Store;
 use anyhow::{Context, Result};
@@ -8,7 +9,8 @@ use mdaw_model::{
     ActorId, DEFAULT_MILLI_BPM, IdGen, Op, Project, TempoPoint, Tick, UserId, apply, apply_all,
 };
 use mdaw_proto::{
-    ClientMsg, Hello, PROTO_VERSION, Peer, Presence, RefuseReason, ServerMsg, SyncData, Txn, Welcome,
+    ClientMsg, Hello, PROTO_VERSION, Peer, Presence, RefuseReason, ServerMsg, SyncData, TransportState, Txn,
+    Welcome,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -44,6 +46,9 @@ pub struct Hub {
     /// `last_txn` of connections that have ended, for when their clients resume.
     departed: HashMap<ActorId, Option<u64>>,
     snapshot_seq: u64,
+    clock: Clock,
+    /// The shared transport. Lives as long as the process.
+    transport: TransportState,
 }
 
 impl Hub {
@@ -92,6 +97,8 @@ impl Hub {
             sessions: BTreeMap::new(),
             departed: HashMap::new(),
             snapshot_seq,
+            clock: Clock::new(),
+            transport: TransportState::default(),
         })
     }
 
@@ -106,6 +113,15 @@ impl Hub {
 
     pub fn head(&self) -> u64 {
         self.seq.head()
+    }
+
+    /// The clock the transport's anchors are measured on.
+    pub fn clock(&self) -> Clock {
+        self.clock
+    }
+
+    pub fn transport(&self) -> &TransportState {
+        &self.transport
     }
 
     /// Admits a client. Its `Welcome` is the first thing `sink` receives; from then on it gets
@@ -160,6 +176,7 @@ impl Hub {
             sync,
             acked,
             peers: self.peers(),
+            transport: self.transport,
         };
         if !sink(ServerMsg::Welcome(Box::new(welcome))) {
             self.sessions.remove(&actor);
@@ -177,6 +194,7 @@ impl Hub {
             ClientMsg::Hello(_) => self.leave(actor),
             ClientMsg::Submit(txn) => self.submit(actor, txn),
             ClientMsg::Presence(presence) => self.presence(actor, presence),
+            ClientMsg::SetTransport(state) => self.set_transport(actor, state),
         }
     }
 
@@ -186,6 +204,9 @@ impl Hub {
         };
         let client_txn_id = txn.client_txn_id;
         session.last_txn = session.last_txn.max(Some(client_txn_id));
+        let now = self.clock.micros();
+        // While the transport runs, a change of tempo changes where the playhead is.
+        let tempo = self.transport.running(now).then(|| self.seq.doc().tempo_map());
         match self.seq.sequence(actor, session.user, now_millis(), txn) {
             Ok(event) => {
                 // A log the disk refuses cannot be continued in memory: clients would hold
@@ -198,6 +219,14 @@ impl Hub {
                     self.snapshot_seq = event.seq;
                 }
                 self.broadcast(None, &ServerMsg::Event(event));
+                if let Some(old) = tempo.filter(|old| *old != self.seq.doc().tempo_map()) {
+                    // Everyone was where the old tempo put them. Going on from there keeps the
+                    // music continuous; the old anchor under the new tempo would be a jump.
+                    self.transport = self.transport.reanchored(now, &old);
+                    self.transport.epoch += 1;
+                    let state = self.transport;
+                    self.broadcast(None, &ServerMsg::Transport { state, by: None });
+                }
             }
             Err(reason) => {
                 if !(session.sink)(ServerMsg::Rejected {
@@ -213,6 +242,30 @@ impl Hub {
     pub fn presence(&mut self, actor: ActorId, presence: Presence) {
         if self.sessions.contains_key(&actor) {
             self.broadcast(Some(actor), &ServerMsg::Presence { actor, presence });
+        }
+    }
+
+    /// Any client may move the shared transport; the last request wins. Everyone is told,
+    /// the one who asked too: the state counts from the server's answer on.
+    pub fn set_transport(&mut self, actor: ActorId, wanted: TransportState) {
+        if !self.sessions.contains_key(&actor) {
+            return;
+        }
+        let by = Some(actor);
+        match wanted.accepted(self.clock.micros(), &self.transport) {
+            Some(state) => {
+                self.transport = state;
+                self.broadcast(None, &ServerMsg::Transport { state, by });
+            }
+            None => {
+                // The client already acts on what it asked for: put it right.
+                let state = self.transport;
+                let current = ServerMsg::Transport { state, by };
+                let session = self.sessions.get_mut(&actor).expect("checked above");
+                if !(session.sink)(current) {
+                    self.leave(actor);
+                }
+            }
         }
     }
 
@@ -242,6 +295,18 @@ impl Hub {
             self.departed.clear();
         }
         self.departed.insert(actor, session.last_txn);
+        if self.sessions.is_empty() && self.transport.playing {
+            // Nobody listens: whoever comes next finds the playhead where it was left.
+            let now = self.clock.micros();
+            let tick = self.transport.position(now, &self.seq.doc().tempo_map());
+            self.transport = TransportState {
+                playing: false,
+                anchor_tick: tick.round(),
+                anchor_server_micros: now,
+                loop_range: self.transport.loop_range,
+                epoch: self.transport.epoch + 1,
+            };
+        }
         true
     }
 

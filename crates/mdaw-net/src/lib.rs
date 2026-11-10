@@ -1,14 +1,16 @@
-//! The transport under the protocol: QUIC with a pinned server certificate, and frames on
-//! streams. Message types live in `mdaw-proto`.
+//! The transport under the protocol: QUIC with a pinned server certificate, frames on streams,
+//! datagrams and the clock estimate built on them. Message types live in `mdaw-proto`.
 
+mod clock;
 mod join;
 mod tls;
 
+pub use clock::{ClockEstimate, ClockSync};
 pub use join::JoinInfo;
 pub use tls::Identity;
 
 use anyhow::{Context, Result, bail};
-use mdaw_proto::{ALPN, payload_len};
+use mdaw_proto::{ALPN, Datagram, payload_len};
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{Connection, Endpoint, RecvStream, SendStream, TransportConfig, VarInt};
 use serde::Serialize;
@@ -98,6 +100,20 @@ pub async fn read_frame<T: DeserializeOwned>(stream: &mut RecvStream) -> Result<
         .await
         .context("the stream ended inside a frame")?;
     Ok(Some(mdaw_proto::decode(&payload)?))
+}
+
+/// Sends a datagram. It may never arrive; that it could not even be queued is not reported
+/// either, since the next one makes up for it.
+pub fn send_datagram(connection: &Connection, datagram: &Datagram) {
+    let _ = connection.send_datagram(datagram.encode().into());
+}
+
+/// Waits for the next datagram. `None` for one this version does not understand.
+///
+/// Cancel safe: a datagram is either returned or still waiting.
+pub async fn read_datagram(connection: &Connection) -> Result<Option<Datagram>> {
+    let bytes = connection.read_datagram().await?;
+    Ok(Datagram::decode(&bytes).ok())
 }
 
 /// The ALPN list both sides configure.

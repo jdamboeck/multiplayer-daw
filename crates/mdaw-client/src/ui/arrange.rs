@@ -236,7 +236,7 @@ fn interact_ruler(app: &mut DawApp, ui: &Ui, layout: &ArrangeLayout, snap: i64) 
         }
     } else if app.arrange.last_seek != Some(tick) {
         app.arrange.last_seek = Some(tick);
-        app.session.engine_mut().seek(tick);
+        app.session.seek(tick);
     }
 }
 

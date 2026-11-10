@@ -1,11 +1,12 @@
 //! The network side: accepts connections and turns their streams into hub commands.
 
+use crate::clock::Clock;
 use crate::hub::{Hub, Sink};
 use crate::store::Store;
 use anyhow::{Context, Result, bail};
 use mdaw_model::ActorId;
 use mdaw_net::{Identity, JoinInfo, read_frame, write_frame};
-use mdaw_proto::{ClientMsg, Hello, RefuseReason, ServerMsg};
+use mdaw_proto::{ClientMsg, Datagram, Hello, RefuseReason, ServerMsg};
 use quinn::{Connection, Endpoint, VarInt};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -49,6 +50,7 @@ enum Command {
 pub struct Server {
     join: JoinInfo,
     endpoint: Endpoint,
+    clock: Clock,
     runtime: Option<tokio::runtime::Runtime>,
     commands: std_mpsc::Sender<Command>,
     hub: Option<JoinHandle<()>>,
@@ -69,6 +71,7 @@ impl Server {
         let identity = Identity::load_or_create(&config.data_dir)?;
         let hub = Hub::open(Store::open(&config.data_dir.join("project.db"))?)?;
         let token = hub.token().to_string();
+        let clock = hub.clock();
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -96,10 +99,11 @@ impl Server {
         let hub = std::thread::Builder::new()
             .name("mdaw-project".into())
             .spawn(move || run_hub(hub, inbox))?;
-        runtime.spawn(accept(endpoint.clone(), commands.clone()));
+        runtime.spawn(accept(endpoint.clone(), commands.clone(), clock));
         Ok(Self {
             join,
             endpoint,
+            clock,
             runtime: Some(runtime),
             commands,
             hub: Some(hub),
@@ -113,6 +117,11 @@ impl Server {
 
     pub fn local_addr(&self) -> Result<SocketAddr> {
         Ok(self.endpoint.local_addr()?)
+    }
+
+    /// The clock the shared transport runs on.
+    pub fn clock(&self) -> Clock {
+        self.clock
     }
 
     /// Disconnects everyone and waits until the project is on disk.
@@ -156,20 +165,20 @@ fn run_hub(mut hub: Hub, inbox: std_mpsc::Receiver<Command>) {
     }
 }
 
-async fn accept(endpoint: Endpoint, commands: std_mpsc::Sender<Command>) {
+async fn accept(endpoint: Endpoint, commands: std_mpsc::Sender<Command>, clock: Clock) {
     while let Some(incoming) = endpoint.accept().await {
         let commands = commands.clone();
         tokio::spawn(async move {
             // A connection that fails is the client's to retry; the server has nothing to do.
             if let Ok(connection) = incoming.await {
-                let _ = serve(&connection, commands).await;
+                let _ = serve(&connection, commands, clock).await;
                 connection.close(VarInt::from_u32(0), b"");
             }
         });
     }
 }
 
-async fn serve(connection: &Connection, commands: std_mpsc::Sender<Command>) -> Result<()> {
+async fn serve(connection: &Connection, commands: std_mpsc::Sender<Command>, clock: Clock) -> Result<()> {
     let (mut send, mut recv) = connection.accept_bi().await?;
     let first = tokio::time::timeout(HELLO_TIMEOUT, read_frame::<ClientMsg>(&mut recv)).await??;
     let Some(ClientMsg::Hello(hello)) = first else {
@@ -206,9 +215,20 @@ async fn serve(connection: &Connection, commands: std_mpsc::Sender<Command>) -> 
         }
         anyhow::Ok(())
     };
-    let result = tokio::select! {
+    // Pings are answered right here, without a detour through the project thread: the less
+    // time passes between reading the clock and sending it, the better the clients' estimates.
+    let clock_service = async {
+        loop {
+            if let Some(Datagram::Ping { t0 }) = mdaw_net::read_datagram(connection).await? {
+                let server_micros = clock.micros();
+                mdaw_net::send_datagram(connection, &Datagram::Pong { t0, server_micros });
+            }
+        }
+    };
+    let result: Result<()> = tokio::select! {
         result = writer => result,
         result = reader => result,
+        result = clock_service => result,
     };
     let _ = commands.send(Command::Leave { actor });
     result

@@ -16,7 +16,9 @@ Prototype of a server/client DAW for collaborative editing. Working name.
 - **M2** done: server and live sync. Several clients edit one project over QUIC, see who is there and
   what the others hold, keep working through a lost connection, and can bring back an edit that lost
   against a concurrent one.
-- **M3** (shared clock and transport) is next. Until then every client plays on its own.
+- **M3** done: shared clock and transport. Play, stop, seek and loop are for everyone at once, on the
+  same sample as far as the clocks allow; a client can unlink to play on its own.
+- **M4** (checkout, commit and changelog samples) is next.
 
 ## Run
 

@@ -145,7 +145,7 @@ impl World {
             }
             ServerMsg::Event(event) => c.replica.on_event(&event).expect("events arrive in order"),
             ServerMsg::Rejected { client_txn_id, .. } => c.replica.on_rejected(client_txn_id),
-            ServerMsg::Peers(_) | ServerMsg::Presence { .. } => {}
+            ServerMsg::Peers(_) | ServerMsg::Presence { .. } | ServerMsg::Transport { .. } => {}
             ServerMsg::Refused(reason) => panic!("refused: {reason}"),
         }
         assert_eq!(
