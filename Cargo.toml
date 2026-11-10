@@ -1,0 +1,38 @@
+[workspace]
+resolver = "3"
+members = ["spikes/*"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+mdaw-model = { path = "crates/mdaw-model" }
+mdaw-proto = { path = "crates/mdaw-proto" }
+mdaw-sync = { path = "crates/mdaw-sync" }
+mdaw-dsp = { path = "crates/mdaw-dsp" }
+mdaw-engine = { path = "crates/mdaw-engine" }
+mdaw-net = { path = "crates/mdaw-net" }
+imbl = { version = "7", features = ["serde"] }
+serde = { version = "1", features = ["derive", "rc"] }
+postcard = { version = "1.1", features = ["use-std"] }
+proptest = "1.12"
+libm = "0.2"
+rtrb = "0.4"
+eframe = "0.37"
+egui = "0.37"
+egui_kittest = "0.37"
+cpal = "0.18"
+blake3 = "1.8"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
