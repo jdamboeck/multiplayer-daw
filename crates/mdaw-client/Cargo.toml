@@ -1,0 +1,32 @@
+[package]
+name = "mdaw-client"
+description = "Desktop client."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+mdaw-model.workspace = true
+mdaw-proto.workspace = true
+mdaw-sync.workspace = true
+mdaw-dsp.workspace = true
+mdaw-engine.workspace = true
+mdaw-net.workspace = true
+eframe.workspace = true
+egui.workspace = true
+
+[dev-dependencies]
+egui_kittest = { workspace = true, features = ["wgpu"] }
+
+[lib]
+name = "mdaw_client"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mdaw"
+path = "src/main.rs"
