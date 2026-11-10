@@ -1,0 +1,20 @@
+[package]
+name = "mdaw-engine"
+description = "Client audio engine: device I/O, transport and plugin hosting."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+mdaw-model.workspace = true
+mdaw-dsp.workspace = true
+rtrb.workspace = true
+cpal.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+cpal = { workspace = true, features = ["pipewire"] }
