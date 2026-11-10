@@ -3,10 +3,10 @@
 use std::collections::BTreeSet;
 
 use egui::{Key, Modifiers};
-use mdaw_model::{ClipId, NoteId, Op, Tick, TickRange, TrackId};
+use mdaw_model::{ClipId, EntityRef, NoteId, Op, Tick, TickRange, TrackId};
 
 use crate::session::{Session, new_track};
-use crate::ui::{arrange, devices, piano_roll, transport};
+use crate::ui::{arrange, changelog, devices, piano_roll, transport};
 
 /// The view that keyboard commands such as Delete act on: the one clicked last.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -21,6 +21,7 @@ pub enum Tab {
     #[default]
     Notes,
     Device,
+    Changelog,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -43,6 +44,8 @@ pub struct DawApp {
     pub(crate) transport: transport::TransportState,
     pub(crate) gestures: crate::ui::Gestures,
     pub(crate) rename: Option<(TrackId, String, bool)>,
+    /// What the user is dragging in this frame; the views set it, the session shares it.
+    pub(crate) editing: Option<EntityRef>,
 }
 
 impl DawApp {
@@ -62,6 +65,7 @@ impl DawApp {
             transport: transport::TransportState::default(),
             gestures: crate::ui::Gestures::default(),
             rename: None,
+            editing: None,
         }
     }
 
@@ -82,6 +86,9 @@ impl DawApp {
         piano_roll::release_preview(self, ui.ctx());
 
         egui::Panel::top("transport").show(ui, |ui| transport::show(self, ui));
+        if !self.session.notices().is_empty() {
+            egui::Panel::top("notices").show(ui, |ui| transport::notices(self, ui));
+        }
         egui::Panel::bottom("editor")
             .resizable(true)
             .default_size(330.0)
@@ -90,21 +97,28 @@ impl DawApp {
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.tab, Tab::Notes, "Notes");
                     ui.selectable_value(&mut self.tab, Tab::Device, "Device");
+                    ui.selectable_value(&mut self.tab, Tab::Changelog, "Changelog");
                     ui.separator();
                     match self.tab {
                         Tab::Notes => piano_roll::toolbar(self, ui),
                         Tab::Device => devices::toolbar(self, ui),
+                        Tab::Changelog => changelog::toolbar(self, ui),
                     }
                 });
                 match self.tab {
                     Tab::Notes => piano_roll::show(self, ui),
                     Tab::Device => devices::show(self, ui),
+                    Tab::Changelog => changelog::show(self, ui),
                 }
             });
         egui::CentralPanel::no_frame().show(ui, |ui| arrange::show(self, ui));
 
+        let editing = self.editing.take();
+        self.session.set_editing(editing);
         if self.session.engine().is_playing() || self.transport.meter_active() {
             ui.ctx().request_repaint();
+        } else if let Some(wait) = self.session.next_frame_in() {
+            ui.ctx().request_repaint_after(wait);
         }
     }
 

@@ -1,12 +1,56 @@
 //! The `mdaw` desktop client.
 
-use mdaw_client::{DawApp, Session};
+use std::path::PathBuf;
+use std::process::ExitCode;
+use std::sync::{Arc, OnceLock};
+
+use mdaw_client::{DawApp, Session, Waker, profile};
 use mdaw_engine::Engine;
+use mdaw_net::JoinInfo;
 
 // Debug builds stop on any allocation made inside the audio callback.
 #[cfg(debug_assertions)]
 #[global_allocator]
 static ALLOC: mdaw_engine::alloc_guard::GuardedAlloc = mdaw_engine::alloc_guard::GuardedAlloc;
+
+const USAGE: &str = "\
+mdaw, a collaborative DAW (prototype)
+
+Usage: mdaw [--join <mdaw://...>] [--name <name>] [--profile <dir>]
+
+  --join <string>   Join the project on a server. The server prints the join string when it starts.
+                    Without it, mdaw opens a local project that is not saved.
+  --name <name>     The name others see. Remembered in the profile.
+  --profile <dir>   Where this install keeps its identity. Use different directories to run
+                    several clients as different people on one machine.
+  -h, --help        Show this text.
+";
+
+#[derive(Default)]
+struct Args {
+    join: Option<JoinInfo>,
+    name: Option<String>,
+    profile: Option<PathBuf>,
+}
+
+/// `Ok(None)` means help was asked for.
+fn parse(mut args: impl Iterator<Item = String>) -> Result<Option<Args>, String> {
+    let mut parsed = Args::default();
+    while let Some(arg) = args.next() {
+        let mut value = |what: &str| args.next().ok_or_else(|| format!("{arg} needs {what}"));
+        match arg.as_str() {
+            "-h" | "--help" => return Ok(None),
+            "--join" => {
+                let text = value("a join string")?;
+                parsed.join = Some(text.parse().map_err(|err| format!("not a join string: {err}"))?);
+            }
+            "--name" => parsed.name = Some(value("a name")?),
+            "--profile" => parsed.profile = Some(value("a directory")?.into()),
+            other => return Err(format!("unknown argument {other}")),
+        }
+    }
+    Ok(Some(parsed))
+}
 
 struct Shell {
     app: DawApp,
@@ -18,7 +62,19 @@ impl eframe::App for Shell {
     }
 }
 
-fn main() -> eframe::Result {
+fn main() -> ExitCode {
+    let args = match parse(std::env::args().skip(1)) {
+        Ok(Some(args)) => args,
+        Ok(None) => {
+            print!("{USAGE}");
+            return ExitCode::SUCCESS;
+        }
+        Err(err) => {
+            eprintln!("mdaw: {err}\n\n{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
+
     #[cfg(debug_assertions)]
     mdaw_engine::alloc_guard::set_abort(true);
 
@@ -26,20 +82,65 @@ fn main() -> eframe::Result {
         eprintln!("mdaw: no audio output ({err}); running without sound");
         Engine::manual(48_000, true)
     });
+
+    // The network thread wakes the UI through this once the window exists.
+    let ctx: Arc<OnceLock<egui::Context>> = Arc::default();
+    let mut title = "mdaw".to_string();
+    let session = match args.join {
+        None => Session::starter(engine),
+        Some(join) => {
+            let Some(dir) = args.profile.or_else(profile::default_dir) else {
+                eprintln!("mdaw: no place for the profile; pass --profile <dir>");
+                return ExitCode::FAILURE;
+            };
+            let who = match profile::open(&dir, args.name.as_deref()) {
+                Ok(who) => who,
+                Err(err) => {
+                    eprintln!("mdaw: {err:#}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            title = format!("mdaw - {} @ {}:{}", who.name, join.host, join.port);
+            let waker: Waker = {
+                let ctx = ctx.clone();
+                Arc::new(move || {
+                    if let Some(ctx) = ctx.get() {
+                        ctx.request_repaint();
+                    }
+                })
+            };
+            match Session::join(join, who, engine, waker) {
+                Ok(session) => session,
+                Err(err) => {
+                    eprintln!("mdaw: {err:#}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+    };
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("mdaw")
+            .with_title(&title)
             .with_inner_size([1280.0, 800.0]),
         ..Default::default()
     };
-    eframe::run_native(
+    let run = eframe::run_native(
         "mdaw",
         options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             DawApp::setup(&cc.egui_ctx);
+            let _ = ctx.set(cc.egui_ctx.clone());
             Ok(Box::new(Shell {
-                app: DawApp::new(Session::starter(engine)),
+                app: DawApp::new(session),
             }))
         }),
-    )
+    );
+    match run {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("mdaw: {err}");
+            ExitCode::FAILURE
+        }
+    }
 }

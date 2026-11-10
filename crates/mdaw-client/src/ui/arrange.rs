@@ -7,7 +7,8 @@ use egui::{
     TextEdit, Ui, UiBuilder, pos2, vec2,
 };
 use mdaw_model::{
-    Clip, ClipId, ClipProp, MixProp, Op, PPQ, Project, ShellProp, TICKS_PER_BAR, Tick, Track, TrackId,
+    Clip, ClipId, ClipProp, EntityRef, MixProp, Op, PPQ, Project, ShellProp, TICKS_PER_BAR, Tick, Track,
+    TrackId,
 };
 
 use super::{
@@ -280,9 +281,13 @@ fn interact_lanes(app: &mut DawApp, ui: &Ui, layout: &ArrangeLayout, tracks: &Tr
     let origin = ui.input(|i| i.pointer.press_origin());
 
     if let Some(pos) = response.hover_pos()
-        && matches!(hit(layout, tracks, pos), Hit::Clip { edge: true, .. })
+        && let Hit::Clip { track, clip, edge } = hit(layout, tracks, pos)
     {
-        ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
+        if app.session.locked_by(&EntityRef::Clip(track, clip)).is_some() {
+            ui.ctx().set_cursor_icon(CursorIcon::NotAllowed);
+        } else if edge {
+            ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
+        }
     }
     if matches!(app.arrange.drag, Drag::Resize { .. }) {
         ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
@@ -301,7 +306,10 @@ fn interact_lanes(app: &mut DawApp, ui: &Ui, layout: &ArrangeLayout, tracks: &Tr
                     }
                     app.sel.track = Some(track);
                     app.sel.clip = Some((track, clip));
-                    if edge {
+                    if app.session.locked_by(&EntityRef::Clip(track, clip)).is_some() {
+                        // Someone else is moving it. Wait for them rather than fight over it.
+                        Drag::None
+                    } else if edge {
                         Drag::Resize {
                             track,
                             clip,
@@ -360,6 +368,10 @@ fn interact_lanes(app: &mut DawApp, ui: &Ui, layout: &ArrangeLayout, tracks: &Tr
             }
             Drag::None | Drag::Loop { .. } => {}
         }
+    }
+
+    if let Drag::Move { track, clip, .. } | Drag::Resize { track, clip, .. } = app.arrange.drag {
+        app.editing = Some(EntityRef::Clip(track, clip));
     }
 
     if response.drag_stopped() {
@@ -492,7 +504,14 @@ fn paint_lanes(app: &DawApp, painter: &Painter, layout: &ArrangeLayout, tracks: 
             );
             if rect.right() >= lanes.left() && rect.left() <= lanes.right() {
                 let selected = app.sel.clip == Some((*track_id, *clip_id));
-                paint_clip(painter, rect, clip, length, color, selected);
+                match app.session.locked_by(&EntityRef::Clip(*track_id, *clip_id)) {
+                    Some(holder) => {
+                        let dimmed = theme::mix(color, theme::LANE, 0.65);
+                        paint_clip(painter, rect, clip, length, dimmed, selected);
+                        paint_holder(painter, rect, holder);
+                    }
+                    None => paint_clip(painter, rect, clip, length, color, selected),
+                }
             }
         }
         if let Drag::New {
@@ -549,6 +568,19 @@ fn paint_clip(painter: &Painter, rect: Rect, clip: &Clip, length: Tick, color: C
         Stroke::new(1.0, color)
     };
     painter.rect_stroke(rect, 4.0, stroke, StrokeKind::Inside);
+}
+
+/// Marks a clip as being moved by someone else.
+fn paint_holder(painter: &Painter, rect: Rect, holder: &str) {
+    let painter = painter.with_clip_rect(rect.intersect(painter.clip_rect()));
+    let font = FontId::proportional(11.0);
+    let galley = painter.layout_no_wrap(holder.to_string(), font, Color32::BLACK);
+    let tag = Rect::from_min_size(
+        rect.left_bottom() - vec2(0.0, galley.size().y + 4.0),
+        galley.size() + vec2(10.0, 4.0),
+    );
+    painter.rect_filled(tag, 4.0, theme::WARN);
+    painter.galley(tag.min + vec2(5.0, 2.0), galley, Color32::BLACK);
 }
 
 fn header(app: &mut DawApp, ui: &mut Ui, rect: Rect, clip: Rect, id: TrackId, track: &Track) {

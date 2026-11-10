@@ -1,6 +1,7 @@
 //! The views, and the helpers they share.
 
 pub mod arrange;
+pub mod changelog;
 pub mod devices;
 pub mod piano_roll;
 pub mod transport;

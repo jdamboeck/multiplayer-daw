@@ -4,7 +4,7 @@ use egui::{Align, Button, DragValue, Layout, Rect, RichText, Sense, Ui, pos2, ve
 use mdaw_model::{Op, TempoPoint, Tick};
 
 use super::{MAX_DB, MIN_DB, db_to_gain, format_position, format_time, gain_to_db};
-use crate::{DawApp, theme};
+use crate::{DawApp, Status, theme};
 
 #[derive(Default)]
 pub struct TransportState {
@@ -127,9 +127,70 @@ pub fn show(app: &mut DawApp, ui: &mut Ui) {
                     .color(theme::TEXT_DIM)
                     .small(),
             );
+            connection(app, ui);
         });
     });
     ui.add_space(3.0);
+}
+
+/// Who is here, or what is wrong with the connection.
+fn connection(app: &DawApp, ui: &mut Ui) {
+    let session = &app.session;
+    let waiting = match session.unconfirmed() {
+        0 => String::new(),
+        1 => ", 1 edit waiting".into(),
+        n => format!(", {n} edits waiting"),
+    };
+    match session.status() {
+        Status::Local => {}
+        Status::Online => {
+            let me = session.actor();
+            let mut names: Vec<String> = Vec::new();
+            for peer in session.peers() {
+                names.push(if peer.actor == me {
+                    format!("{} (you)", peer.name)
+                } else {
+                    peer.name.clone()
+                });
+            }
+            let shown = names.iter().take(4).cloned().collect::<Vec<_>>().join(", ");
+            let more = match names.len().saturating_sub(4) {
+                0 => String::new(),
+                n => format!(" +{n}"),
+            };
+            ui.label(RichText::new(format!("Online: {shown}{more}")).color(theme::METER))
+                .on_hover_text(names.join("\n"));
+            ui.separator();
+        }
+        Status::Reconnecting => {
+            ui.label(RichText::new(format!("Reconnecting{waiting}")).color(theme::WARN))
+                .on_hover_text("The connection to the server is down. You can keep working; edits are sent when it is back.");
+            ui.separator();
+        }
+        Status::Refused => {
+            ui.label(RichText::new(format!("Disconnected{waiting}")).color(theme::METER_HOT))
+                .on_hover_text(
+                    "The server no longer accepts this client. Restart with a current join string.",
+                );
+            ui.separator();
+        }
+    }
+}
+
+/// A strip under the transport bar for things that happened behind the user's back.
+pub fn notices(app: &mut DawApp, ui: &mut Ui) {
+    let mut dismiss = None;
+    for (index, text) in app.session.notices().iter().enumerate() {
+        ui.horizontal(|ui| {
+            if ui.small_button("Dismiss").clicked() {
+                dismiss = Some(index);
+            }
+            ui.label(RichText::new(text).color(theme::WARN));
+        });
+    }
+    if let Some(index) = dismiss {
+        app.session.dismiss_notice(index);
+    }
 }
 
 fn meter(app: &mut DawApp, ui: &mut Ui) {
