@@ -1,6 +1,9 @@
 //! The device panel of the selected track.
 
-use egui::{Align2, Color32, ComboBox, FontId, Response, RichText, Sense, Shape, Stroke, Ui, pos2, vec2};
+use egui::{
+    Align, Align2, Color32, ComboBox, FontId, Layout, Response, RichText, Sense, Shape, Stroke, Ui, pos2,
+    vec2,
+};
 use mdaw_dsp::pocket::{self, ParamInfo, Scale};
 use mdaw_model::{BuiltinKind, Device, DeviceKind, Op, TrackId};
 
@@ -52,31 +55,48 @@ pub fn show(app: &mut DawApp, ui: &mut Ui) {
 }
 
 fn pocket_panel(app: &mut DawApp, ui: &mut Ui, track: TrackId, device: &Device) {
+    // Two rows of sections, so the panel fits a window of ordinary width.
+    const ROWS: [&[usize]; 2] = [&[0, 4], &[1, 2, 3]];
     ui.horizontal_top(|ui| {
         ui.vertical(|ui| {
+            ui.set_width(64.0);
             ui.label(RichText::new("Pocket").strong().size(15.0));
             ui.label(RichText::new("Synth").small().color(theme::TEXT_DIM));
             let mut on = !device.bypass;
             if ui.checkbox(&mut on, "On").changed() {
+                let bypass = !on;
                 app.session.edit(vec![Op::DeviceSetBypass {
                     track,
                     id: device.id,
-                    bypass: !on,
+                    bypass,
                 }]);
             }
         });
-        for (title, params) in SECTIONS {
-            ui.separator();
-            ui.vertical(|ui| {
-                ui.label(RichText::new(title).small().color(theme::TEXT_DIM));
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 2.0;
-                    for &index in params {
-                        param(app, ui, track, device, &pocket::PARAMS[index]);
+        ui.separator();
+        ui.vertical(|ui| {
+            for row in ROWS {
+                // A fixed height, because a separator takes all the height it is offered.
+                let size = vec2(ui.available_width(), 98.0);
+                ui.allocate_ui_with_layout(size, Layout::left_to_right(Align::Min), |ui| {
+                    for (position, &section) in row.iter().enumerate() {
+                        if position > 0 {
+                            ui.separator();
+                        }
+                        let (title, params) = SECTIONS[section];
+                        ui.vertical(|ui| {
+                            ui.label(RichText::new(title).small().color(theme::TEXT_DIM));
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 2.0;
+                                for &index in params {
+                                    param(app, ui, track, device, &pocket::PARAMS[index]);
+                                }
+                            });
+                        });
                     }
                 });
-            });
-        }
+                ui.add_space(4.0);
+            }
+        });
     });
 }
 
