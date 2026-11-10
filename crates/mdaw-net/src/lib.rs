@@ -10,7 +10,8 @@ pub use join::JoinInfo;
 pub use tls::Identity;
 
 use anyhow::{Context, Result, bail};
-use mdaw_proto::{ALPN, Datagram, payload_len};
+use mdaw_model::BlobHash;
+use mdaw_proto::{ALPN, BlobAnswer, BlobRequest, Datagram, MAX_BLOB, payload_len};
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{Connection, Endpoint, RecvStream, SendStream, TransportConfig, VarInt};
 use serde::Serialize;
@@ -104,6 +105,42 @@ pub async fn read_frame<T: DeserializeOwned>(stream: &mut RecvStream) -> Result<
 
 /// Sends a datagram. It may never arrive; that it could not even be queued is not reported
 /// either, since the next one makes up for it.
+/// Uploads a blob on a stream of its own. True once the server holds it.
+pub async fn put_blob(connection: &Connection, hash: BlobHash, bytes: &[u8]) -> Result<bool> {
+    let (mut send, mut recv) = connection.open_bi().await?;
+    let len = bytes.len() as u64;
+    write_frame(&mut send, &BlobRequest::Put { hash, len }).await?;
+    match read_frame::<BlobAnswer>(&mut recv).await? {
+        Some(BlobAnswer::Stored) => return Ok(true),
+        Some(BlobAnswer::Send) => {}
+        _ => return Ok(false),
+    }
+    send.write_all(bytes).await?;
+    send.finish()?;
+    Ok(matches!(
+        read_frame::<BlobAnswer>(&mut recv).await?,
+        Some(BlobAnswer::Stored)
+    ))
+}
+
+/// Downloads a blob on a stream of its own and checks its hash. `None` when the server does
+/// not have it.
+pub async fn get_blob(connection: &Connection, hash: BlobHash) -> Result<Option<Vec<u8>>> {
+    let (mut send, mut recv) = connection.open_bi().await?;
+    write_frame(&mut send, &BlobRequest::Get { hash }).await?;
+    send.finish()?;
+    let len = match read_frame::<BlobAnswer>(&mut recv).await? {
+        Some(BlobAnswer::Found { len }) if len <= MAX_BLOB => len,
+        Some(BlobAnswer::Missing) => return Ok(None),
+        _ => bail!("the server answered a download with something unexpected"),
+    };
+    let bytes = recv.read_to_end(len as usize).await?;
+    if bytes.len() as u64 != len || mdaw_proto::blob_hash(&bytes) != hash {
+        bail!("a download from the server arrived damaged");
+    }
+    Ok(Some(bytes))
+}
+
 pub fn send_datagram(connection: &Connection, datagram: &Datagram) {
     let _ = connection.send_datagram(datagram.encode().into());
 }

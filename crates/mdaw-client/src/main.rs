@@ -5,6 +5,7 @@ use std::process::ExitCode;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use mdaw_client::checkout::Files;
 use mdaw_client::{DawApp, Session, Waker, profile};
 use mdaw_engine::Engine;
 use mdaw_net::JoinInfo;
@@ -145,8 +146,14 @@ fn main() -> ExitCode {
                     }
                 })
             };
+            // Checkouts and forks are kept per server, inside the profile.
+            let server: String = join.fingerprint[..8].iter().map(|b| format!("{b:02x}")).collect();
+            let files = Files::new(dir.join("projects").join(server));
             match Session::join(join, who, engine, waker) {
-                Ok(session) => session,
+                Ok(mut session) => {
+                    session.set_files(files);
+                    session
+                }
                 Err(err) => {
                     eprintln!("mdaw: {err:#}");
                     return ExitCode::FAILURE;

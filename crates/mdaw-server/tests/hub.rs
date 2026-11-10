@@ -2,7 +2,7 @@
 
 use mdaw_model::*;
 use mdaw_proto::*;
-use mdaw_server::{Hub, Sink, Store};
+use mdaw_server::{Blobs, Hub, Sink, Store};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
@@ -87,7 +87,7 @@ fn clap(n: u64) -> Txn {
 }
 
 fn hub() -> Hub {
-    Hub::open(Store::in_memory().unwrap()).unwrap()
+    Hub::open(Store::in_memory().unwrap(), Blobs::in_memory()).unwrap()
 }
 
 #[test]
@@ -351,7 +351,7 @@ fn a_client_that_cannot_keep_up_is_dropped() {
 fn the_project_survives_a_restart() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("project.db");
-    let mut hub = Hub::open(Store::open(&path).unwrap()).unwrap();
+    let mut hub = Hub::open(Store::open(&path).unwrap(), Blobs::in_memory()).unwrap();
     let (ann, _, ann_welcome) = join(&mut hub, 1);
     for n in 1..=1005 {
         hub.submit(ann, rename(n));
@@ -360,7 +360,7 @@ fn the_project_survives_a_restart() {
     let (doc, token) = (hub.doc().clone(), hub.token().to_string());
     drop(hub);
 
-    let mut hub = Hub::open(Store::open(&path).unwrap()).unwrap();
+    let mut hub = Hub::open(Store::open(&path).unwrap(), Blobs::in_memory()).unwrap();
     assert_eq!(hub.head(), 1005);
     assert_eq!(hub.doc(), &doc);
     assert_eq!(hub.token(), token);

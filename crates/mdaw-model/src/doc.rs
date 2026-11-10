@@ -63,6 +63,18 @@ impl Project {
         }
     }
 
+    /// Replaces a track's contents wholesale. Used for the private view of a checkout, never on
+    /// the shared document.
+    pub fn set_content(&mut self, track: TrackId, content: Arc<TrackContent>) -> bool {
+        match self.tracks.get_mut(&track) {
+            Some(t) if !Arc::ptr_eq(&t.content, &content) => {
+                Arc::make_mut(t).content = content;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Replaces a track's stem. Driven by `Commit` events.
     pub fn set_stem(&mut self, track: TrackId, stem: Option<Stem>) -> bool {
         match self.tracks.get_mut(&track) {

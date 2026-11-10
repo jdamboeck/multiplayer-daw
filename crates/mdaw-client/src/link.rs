@@ -5,6 +5,7 @@
 //! pauses and asks the server to resume where it left off.
 
 use mdaw_engine::clock;
+use mdaw_model::BlobHash;
 use mdaw_net::{ClockEstimate, ClockSync, JoinInfo};
 use mdaw_proto::{ClientMsg, Datagram, Hello, PROTO_VERSION, RefuseReason, Resume, ServerMsg, Welcome};
 use std::sync::Arc;
@@ -48,11 +49,21 @@ pub enum LinkEvent {
     Down(String),
     /// The server turned this client away. No further attempt follows.
     Refused(RefuseReason),
+    /// The answer to [`Link::put`]: whether the server holds the blob now.
+    Stored { hash: BlobHash, ok: bool },
+    /// The answer to [`Link::get`]: the blob, or `None` if the server lacks it or the
+    /// download failed.
+    Fetched {
+        hash: BlobHash,
+        bytes: Option<Arc<[u8]>>,
+    },
 }
 
 enum Out {
     Msg(u64, ClientMsg),
     Rejoin,
+    Put(BlobHash, Arc<[u8]>),
+    Get(BlobHash),
 }
 
 pub struct Link {
@@ -106,6 +117,17 @@ impl Link {
     /// connection is gone by the time it would be written.
     pub fn send(&self, epoch: u64, msg: ClientMsg) {
         let _ = self.out.send(Out::Msg(epoch, msg));
+    }
+
+    /// Uploads a blob on the current connection, or the next one if there is none. The outcome
+    /// arrives as [`LinkEvent::Stored`].
+    pub fn put(&self, hash: BlobHash, bytes: Arc<[u8]>) {
+        let _ = self.out.send(Out::Put(hash, bytes));
+    }
+
+    /// Downloads a blob. The outcome arrives as [`LinkEvent::Fetched`].
+    pub fn get(&self, hash: BlobHash) {
+        let _ = self.out.send(Out::Get(hash));
     }
 
     /// Drops the connection and joins again from scratch, to receive the whole document.
@@ -280,6 +302,24 @@ impl Task {
                     }
                     // Meant for a connection that is gone; its sender has been told to resend.
                     Some(Out::Msg(..)) => {}
+                    // Blobs travel on streams of their own, so they never hold up the rest.
+                    Some(Out::Put(hash, bytes)) => {
+                        let (connection, events, waker) = (connection.clone(), events.clone(), waker.clone());
+                        tokio::spawn(async move {
+                            let ok = matches!(mdaw_net::put_blob(&connection, hash, &bytes).await, Ok(true));
+                            let _ = events.send(LinkEvent::Stored { hash, ok });
+                            waker();
+                        });
+                    }
+                    Some(Out::Get(hash)) => {
+                        let (connection, events, waker) = (connection.clone(), events.clone(), waker.clone());
+                        tokio::spawn(async move {
+                            let bytes = mdaw_net::get_blob(&connection, hash).await.ok().flatten();
+                            let bytes = bytes.map(Arc::from);
+                            let _ = events.send(LinkEvent::Fetched { hash, bytes });
+                            waker();
+                        });
+                    }
                     Some(Out::Rejoin) => return End::Rejoin,
                     None => return End::Stop,
                 }

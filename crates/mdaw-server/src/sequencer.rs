@@ -1,7 +1,9 @@
 //! Decides what enters the log and in which order. Pure: no I/O, no clock.
 
-use mdaw_model::{ActorId, Op, Project, PropKey, Scope, UserId, apply};
-use mdaw_proto::{Event, EventBody, RejectReason, Superseded, Txn};
+use mdaw_model::{ActorId, BlobHash, DeviceKind, Op, Project, PropKey, Scope, TrackId, UserId, apply};
+use mdaw_proto::{
+    CommitRequest, Event, EventBody, RejectReason, ReleaseReason, Sample, Superseded, Txn, apply_event,
+};
 use std::collections::VecDeque;
 
 /// Events kept in memory to find what a transaction displaced. A client further behind than
@@ -122,12 +124,167 @@ impl Sequencer {
                 superseded,
             },
         };
-        self.head = seq;
+        Ok(self.push(event))
+    }
+
+    /// Takes `track` out of live editing for `user`.
+    pub fn checkout(
+        &mut self,
+        actor: ActorId,
+        user: UserId,
+        wall_ts: u64,
+        track: TrackId,
+    ) -> Result<Event, RejectReason> {
+        let current = self.doc.track(track).ok_or(RejectReason::NoSuchTrack)?;
+        if let Some(checkout) = current.checkout {
+            return Err(RejectReason::CheckedOut {
+                track,
+                by: checkout.user,
+            });
+        }
+        Ok(self.append(actor, user, wall_ts, EventBody::Checkout { track }))
+    }
+
+    /// Ends the checkout of `track`: `user`'s own, or with `forced` anyone's.
+    pub fn release(
+        &mut self,
+        actor: ActorId,
+        user: UserId,
+        wall_ts: u64,
+        track: TrackId,
+        forced: bool,
+    ) -> Result<Event, RejectReason> {
+        let current = self.doc.track(track).ok_or(RejectReason::NoSuchTrack)?;
+        let checkout = current.checkout.ok_or(RejectReason::NotCheckedOut { track })?;
+        let reason = if forced {
+            ReleaseReason::Forced { owner: checkout.user }
+        } else if checkout.user == user {
+            ReleaseReason::Abandoned
+        } else {
+            return Err(RejectReason::NotOwner { track });
+        };
+        Ok(self.append(actor, user, wall_ts, EventBody::Release { track, reason }))
+    }
+
+    /// Hands in the work of `user`'s checkout. `has_blob` tells which blobs the server holds.
+    pub fn commit(
+        &mut self,
+        actor: ActorId,
+        user: UserId,
+        wall_ts: u64,
+        commit: CommitRequest,
+        has_blob: impl Fn(&BlobHash) -> bool,
+    ) -> Result<Event, RejectReason> {
+        let track = commit.track;
+        let current = self.doc.track(track).ok_or(RejectReason::NoSuchTrack)?;
+        if current.checkout.is_none_or(|c| c.user != user) {
+            return Err(RejectReason::NotOwner { track });
+        }
+        for op in &commit.ops {
+            op.validate().map_err(|e| RejectReason::Invalid(e.to_string()))?;
+            if op.scope() != Scope::TrackContent(track) {
+                return Err(RejectReason::OutOfScope);
+            }
+        }
+        for op in &commit.project_fix {
+            op.validate().map_err(|e| RejectReason::Invalid(e.to_string()))?;
+            if op.scope() != Scope::Project || op.adds_clap_device() {
+                return Err(RejectReason::OutOfScope);
+            }
+        }
+        // What the track will be, to see what it needs.
+        let mut after = (*current.content).clone();
+        {
+            let mut doc = self.doc.clone();
+            for op in &commit.ops {
+                apply(&mut doc, op);
+            }
+            if let Some(t) = doc.track(track) {
+                after = (*t.content).clone();
+            }
+        }
+        if after.has_clap_device() && commit.stem.is_none() {
+            return Err(RejectReason::StemRequired);
+        }
+        let states = after.devices.iter().filter_map(|d| match &d.kind {
+            DeviceKind::Clap { state, .. } => *state,
+            DeviceKind::Builtin { .. } => None,
+        });
+        let blobs = commit
+            .entry
+            .samples
+            .iter()
+            .map(|s| s.blob)
+            .chain(commit.stem.map(|s| s.blob))
+            .chain(states);
+        for blob in blobs {
+            if !has_blob(&blob) {
+                return Err(RejectReason::MissingBlob(blob));
+            }
+        }
+        let body = EventBody::Commit {
+            track,
+            ops: commit.ops,
+            project_fix: commit.project_fix,
+            stem: commit.stem,
+            entry: commit.entry,
+        };
+        Ok(self.append(actor, user, wall_ts, body))
+    }
+
+    /// Adds a sample to the entry of event `entry_seq`.
+    pub fn attach(
+        &mut self,
+        actor: ActorId,
+        user: UserId,
+        wall_ts: u64,
+        entry_seq: u64,
+        sample: Sample,
+        has_blob: impl Fn(&BlobHash) -> bool,
+    ) -> Result<Event, RejectReason> {
+        if entry_seq == 0 || entry_seq > self.head {
+            return Err(RejectReason::NoSuchEntry);
+        }
+        if !has_blob(&sample.blob) {
+            return Err(RejectReason::MissingBlob(sample.blob));
+        }
+        Ok(self.append(actor, user, wall_ts, EventBody::Attach { entry_seq, sample }))
+    }
+
+    /// The latest events the changelog shows, oldest first.
+    pub fn history(&self, limit: usize) -> Vec<Event> {
+        let mut notable: Vec<Event> = self
+            .tail
+            .iter()
+            .rev()
+            .filter(|e| e.is_notable())
+            .take(limit)
+            .cloned()
+            .collect();
+        notable.reverse();
+        notable
+    }
+
+    fn append(&mut self, actor: ActorId, user: UserId, wall_ts: u64, body: EventBody) -> Event {
+        let event = Event {
+            seq: self.head + 1,
+            actor,
+            user,
+            wall_ts,
+            body,
+        };
+        apply_event(&mut self.doc, &event);
+        self.push(event)
+    }
+
+    /// Puts an event whose effect is in `doc` already at the end of the log.
+    fn push(&mut self, event: Event) -> Event {
+        self.head = event.seq;
         self.tail.push_back(event.clone());
         if self.tail.len() > TAIL {
             self.tail.pop_front();
         }
-        Ok(event)
+        event
     }
 
     /// Events the author of `txn` had not seen when making it, newest first.
@@ -150,9 +307,8 @@ impl Sequencer {
                 Some((
                     e,
                     e.ops()
-                        .iter()
-                        .rev()
-                        .find(|o| o.entity() == entity && o.prop() == prop)?,
+                        .filter(|o| o.entity() == entity && o.prop() == prop)
+                        .last()?,
                 ))
             });
             if let Some((event, lost)) = last

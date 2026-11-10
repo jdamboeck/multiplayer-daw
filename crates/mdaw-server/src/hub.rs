@@ -1,16 +1,15 @@
 //! One project and everyone connected to it. Runs on a single thread: whatever order commands
 //! arrive in is the order of the log.
 
+use crate::blobs::Blobs;
 use crate::clock::Clock;
 use crate::sequencer::Sequencer;
 use crate::store::Store;
 use anyhow::{Context, Result};
-use mdaw_model::{
-    ActorId, DEFAULT_MILLI_BPM, IdGen, Op, Project, TempoPoint, Tick, UserId, apply, apply_all,
-};
+use mdaw_model::{ActorId, DEFAULT_MILLI_BPM, IdGen, Op, Project, TempoPoint, Tick, TrackId, UserId, apply};
 use mdaw_proto::{
-    ClientMsg, Hello, PROTO_VERSION, Peer, Presence, RefuseReason, ServerMsg, SyncData, TransportState, Txn,
-    Welcome,
+    ClientMsg, CommitRequest, Event, Hello, LEASE_STALE_SECS, PROTO_VERSION, Peer, Presence, RefuseReason,
+    RejectReason, Request, Sample, ServerMsg, SyncData, TransportState, Txn, Welcome, apply_event,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -21,6 +20,9 @@ const SNAPSHOT_EVERY: u64 = 1000;
 
 /// A client missing more events than this gets the whole document instead.
 const CATCH_UP_LIMIT: u64 = 5000;
+
+/// Changelog entries a new client gets with the document.
+const HISTORY: usize = 200;
 
 /// IDs in the document a new project starts with belong to this actor, which no connection gets.
 const TEMPLATE_ACTOR: ActorId = ActorId(0);
@@ -49,11 +51,16 @@ pub struct Hub {
     clock: Clock,
     /// The shared transport. Lives as long as the process.
     transport: TransportState,
+    blobs: Blobs,
+    /// When the owner of each checkout last renewed its lease, on `clock`.
+    leases: BTreeMap<TrackId, i64>,
+    /// The checkouts last announced as stale.
+    stale: Vec<TrackId>,
 }
 
 impl Hub {
     /// Loads the project from `store`, creating an empty one in a new store.
-    pub fn open(store: Store) -> Result<Self> {
+    pub fn open(store: Store, blobs: Blobs) -> Result<Self> {
         let token = match store.meta("token")? {
             Some(token) => String::from_utf8(token).context("stored token")?,
             None => {
@@ -84,11 +91,19 @@ impl Hub {
             let events = store.events_after(at, 1000)?;
             let last = events.last().context("the event log has a gap")?.seq;
             for event in &events {
-                apply_all(&mut doc, event.ops());
+                apply_event(&mut doc, event);
             }
             at = last;
         }
         let recent = store.events_after(head.saturating_sub(4096), 4096)?;
+        let clock = Clock::new();
+        // After a restart every owner gets a full lease to come back.
+        let leases = doc
+            .tracks
+            .iter()
+            .filter(|(_, t)| t.checkout.is_some())
+            .map(|(&id, _)| (id, clock.micros()))
+            .collect();
         Ok(Self {
             store,
             seq: Sequencer::new(doc, head, recent),
@@ -97,8 +112,11 @@ impl Hub {
             sessions: BTreeMap::new(),
             departed: HashMap::new(),
             snapshot_seq,
-            clock: Clock::new(),
+            clock,
             transport: TransportState::default(),
+            blobs,
+            leases,
+            stale: Vec::new(),
         })
     }
 
@@ -124,6 +142,15 @@ impl Hub {
         &self.transport
     }
 
+    pub fn blobs(&self) -> &Blobs {
+        &self.blobs
+    }
+
+    /// The checkouts whose lease ran out, as last announced.
+    pub fn stale(&self) -> &[TrackId] {
+        &self.stale
+    }
+
     /// Admits a client. Its `Welcome` is the first thing `sink` receives; from then on it gets
     /// every event.
     pub fn join(&mut self, hello: Hello, mut sink: Sink) -> Result<ActorId, RefuseReason> {
@@ -141,6 +168,7 @@ impl Hub {
         let resume = hello
             .resume
             .filter(|r| r.session_secret == self.secret(r.prev_actor) && r.last_seq <= head);
+        let mut history = Vec::new();
         let (sync, acked) = match resume {
             Some(resume) => {
                 // Whatever connection the client had before is replaced by this one.
@@ -158,6 +186,9 @@ impl Hub {
             }
             None => (SyncData::Snapshot(self.seq.doc().clone()), None),
         };
+        if matches!(sync, SyncData::Snapshot(_)) {
+            history = self.seq.history(HISTORY);
+        }
 
         self.sessions.insert(
             actor,
@@ -177,6 +208,8 @@ impl Hub {
             acked,
             peers: self.peers(),
             transport: self.transport,
+            history,
+            stale: self.stale.clone(),
         };
         if !sink(ServerMsg::Welcome(Box::new(welcome))) {
             self.sessions.remove(&actor);
@@ -195,6 +228,151 @@ impl Hub {
             ClientMsg::Submit(txn) => self.submit(actor, txn),
             ClientMsg::Presence(presence) => self.presence(actor, presence),
             ClientMsg::SetTransport(state) => self.set_transport(actor, state),
+            ClientMsg::Checkout { track } => self.checkout(actor, track),
+            ClientMsg::LeaseRenew { track } => self.renew(actor, track),
+            ClientMsg::Release { track } => self.release(actor, track, false),
+            ClientMsg::ForceRelease { track } => self.release(actor, track, true),
+            ClientMsg::Commit(commit) => self.commit(actor, *commit),
+            ClientMsg::Attach { entry_seq, sample } => self.attach(actor, entry_seq, sample),
+        }
+    }
+
+    pub fn checkout(&mut self, actor: ActorId, track: TrackId) {
+        let Some(user) = self.sessions.get(&actor).map(|s| s.user) else {
+            return;
+        };
+        let result = self.seq.checkout(actor, user, now_millis(), track);
+        if result.is_ok() {
+            self.leases.insert(track, self.clock.micros());
+        }
+        self.settle(actor, Request::Checkout(track), result);
+    }
+
+    pub fn release(&mut self, actor: ActorId, track: TrackId, forced: bool) {
+        let Some(user) = self.sessions.get(&actor).map(|s| s.user) else {
+            return;
+        };
+        let result = self.seq.release(actor, user, now_millis(), track, forced);
+        let request = if forced {
+            Request::ForceRelease(track)
+        } else {
+            Request::Release(track)
+        };
+        self.settle(actor, request, result);
+    }
+
+    pub fn commit(&mut self, actor: ActorId, commit: CommitRequest) {
+        let Some(user) = self.sessions.get(&actor).map(|s| s.user) else {
+            return;
+        };
+        let request = Request::Commit(commit.track);
+        let now = self.clock.micros();
+        let tempo = self.transport.running(now).then(|| self.seq.doc().tempo_map());
+        let blobs = &self.blobs;
+        let result = self
+            .seq
+            .commit(actor, user, now_millis(), commit, |h| blobs.has(h));
+        let accepted = result.is_ok();
+        self.settle(actor, request, result);
+        if accepted {
+            self.follow_tempo(now, tempo);
+        }
+    }
+
+    pub fn attach(&mut self, actor: ActorId, entry_seq: u64, sample: Sample) {
+        let Some(user) = self.sessions.get(&actor).map(|s| s.user) else {
+            return;
+        };
+        let blobs = &self.blobs;
+        let result = self
+            .seq
+            .attach(actor, user, now_millis(), entry_seq, sample, |h| blobs.has(h));
+        self.settle(actor, Request::Attach(entry_seq), result);
+    }
+
+    /// The owner of a checkout is still at it.
+    pub fn renew(&mut self, actor: ActorId, track: TrackId) {
+        let Some(user) = self.sessions.get(&actor).map(|s| s.user) else {
+            return;
+        };
+        let owned = self
+            .seq
+            .doc()
+            .track(track)
+            .and_then(|t| t.checkout)
+            .is_some_and(|c| c.user == user);
+        if owned {
+            self.leases.insert(track, self.clock.micros());
+            self.check_leases();
+        }
+    }
+
+    /// Looks at the time. Call about once a second.
+    pub fn tick(&mut self) {
+        self.check_leases();
+    }
+
+    /// Announces the checkouts whose lease ran out, when that set changes.
+    fn check_leases(&mut self) {
+        let now = self.clock.micros();
+        let limit = LEASE_STALE_SECS as i64 * 1_000_000;
+        let doc = self.seq.doc();
+        self.leases
+            .retain(|id, _| doc.track(*id).is_some_and(|t| t.checkout.is_some()));
+        let stale: Vec<TrackId> = self
+            .leases
+            .iter()
+            .filter(|(_, at)| now - **at > limit)
+            .map(|(id, _)| *id)
+            .collect();
+        if stale != self.stale {
+            self.stale = stale.clone();
+            self.broadcast(None, &ServerMsg::Stale(stale));
+        }
+    }
+
+    /// Stores and sends an accepted event, or tells the asker why not.
+    fn settle(&mut self, actor: ActorId, request: Request, result: Result<Event, RejectReason>) {
+        match result {
+            Ok(event) => {
+                self.record(event);
+                self.check_leases();
+            }
+            Err(reason) => {
+                let Some(session) = self.sessions.get_mut(&actor) else {
+                    return;
+                };
+                if !(session.sink)(ServerMsg::Denied { request, reason }) {
+                    self.leave(actor);
+                }
+            }
+        }
+    }
+
+    /// Puts a sequenced event on disk and sends it to everyone.
+    fn record(&mut self, event: Event) {
+        // A log the disk refuses cannot be continued in memory: clients would hold events that
+        // are gone after a restart.
+        self.store.append(&event).expect("appending to the event log");
+        if event.seq - self.snapshot_seq >= SNAPSHOT_EVERY {
+            self.store
+                .put_snapshot(event.seq, self.seq.doc())
+                .expect("storing a snapshot");
+            self.snapshot_seq = event.seq;
+        }
+        self.broadcast(None, &ServerMsg::Event(event));
+    }
+
+    /// After an event: if the tempo changed under a running transport, keeps the playhead
+    /// where it was. `old` is the tempo map before the event, taken only while running.
+    fn follow_tempo(&mut self, now: i64, old: Option<mdaw_model::TempoMap>) {
+        if let Some(old) = old.filter(|old| *old != self.seq.doc().tempo_map()) {
+            // Everyone was where the old tempo put them. Going on from there keeps the music
+            // continuous; the old anchor under the new tempo would be a jump.
+            self.transport = self.transport.reanchored(now, &old);
+            self.transport.epoch += 1;
+            let state = self.transport;
+            self.broadcast(None, &ServerMsg::Transport { state, by: None });
         }
     }
 
@@ -209,24 +387,8 @@ impl Hub {
         let tempo = self.transport.running(now).then(|| self.seq.doc().tempo_map());
         match self.seq.sequence(actor, session.user, now_millis(), txn) {
             Ok(event) => {
-                // A log the disk refuses cannot be continued in memory: clients would hold
-                // events that are gone after a restart.
-                self.store.append(&event).expect("appending to the event log");
-                if event.seq - self.snapshot_seq >= SNAPSHOT_EVERY {
-                    self.store
-                        .put_snapshot(event.seq, self.seq.doc())
-                        .expect("storing a snapshot");
-                    self.snapshot_seq = event.seq;
-                }
-                self.broadcast(None, &ServerMsg::Event(event));
-                if let Some(old) = tempo.filter(|old| *old != self.seq.doc().tempo_map()) {
-                    // Everyone was where the old tempo put them. Going on from there keeps the
-                    // music continuous; the old anchor under the new tempo would be a jump.
-                    self.transport = self.transport.reanchored(now, &old);
-                    self.transport.epoch += 1;
-                    let state = self.transport;
-                    self.broadcast(None, &ServerMsg::Transport { state, by: None });
-                }
+                self.record(event);
+                self.follow_tempo(now, tempo);
             }
             Err(reason) => {
                 if !(session.sink)(ServerMsg::Rejected {

@@ -4,4 +4,4 @@ mod loopback;
 mod replica;
 
 pub use loopback::Loopback;
-pub use replica::{Gesture, Replica, SyncError};
+pub use replica::{Ended, Gesture, Replica, SyncError, Workspace};

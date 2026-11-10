@@ -2,12 +2,14 @@
 //! stores the log, and sends every client every event. It also keeps what is shared but not stored:
 //! who is there, and the transport with the clock it runs on.
 
+mod blobs;
 mod clock;
 mod hub;
 mod sequencer;
 mod server;
 mod store;
 
+pub use blobs::Blobs;
 pub use clock::Clock;
 pub use hub::{Hub, Sink};
 pub use sequencer::Sequencer;

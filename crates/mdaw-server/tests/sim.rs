@@ -4,7 +4,7 @@
 
 use mdaw_model::*;
 use mdaw_proto::*;
-use mdaw_server::{Hub, Sink, Store};
+use mdaw_server::{Blobs, Hub, Sink, Store};
 use mdaw_sync::Replica;
 use proptest::prelude::*;
 use std::collections::VecDeque;
@@ -50,7 +50,7 @@ fn sink(queue: &Queue) -> Sink {
 
 impl World {
     fn new(clients: u8) -> Self {
-        let mut hub = Hub::open(Store::in_memory().unwrap()).unwrap();
+        let mut hub = Hub::open(Store::in_memory().unwrap(), Blobs::in_memory()).unwrap();
         let history = vec![hub.doc().clone()];
         let observer = Queue::default();
         let hello = Hello {
@@ -145,7 +145,11 @@ impl World {
             }
             ServerMsg::Event(event) => c.replica.on_event(&event).expect("events arrive in order"),
             ServerMsg::Rejected { client_txn_id, .. } => c.replica.on_rejected(client_txn_id),
-            ServerMsg::Peers(_) | ServerMsg::Presence { .. } | ServerMsg::Transport { .. } => {}
+            ServerMsg::Peers(_)
+            | ServerMsg::Presence { .. }
+            | ServerMsg::Transport { .. }
+            | ServerMsg::Stale(_) => {}
+            ServerMsg::Denied { request, reason } => panic!("{request:?} denied: {reason}"),
             ServerMsg::Refused(reason) => panic!("refused: {reason}"),
         }
         assert_eq!(
@@ -275,7 +279,7 @@ impl World {
             let ServerMsg::Event(event) = msg else { continue };
             events += 1;
             assert_eq!(event.seq, events);
-            apply_all(&mut doc, event.ops());
+            apply_event(&mut doc, event);
             let first = seen.insert((event.user, event.client_txn_id()));
             assert!(
                 first || self.resent_blindly,

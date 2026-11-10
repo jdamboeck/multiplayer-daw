@@ -1,12 +1,13 @@
 //! The network side: accepts connections and turns their streams into hub commands.
 
+use crate::blobs::Blobs;
 use crate::clock::Clock;
 use crate::hub::{Hub, Sink};
 use crate::store::Store;
 use anyhow::{Context, Result, bail};
 use mdaw_model::ActorId;
 use mdaw_net::{Identity, JoinInfo, read_frame, write_frame};
-use mdaw_proto::{ClientMsg, Datagram, Hello, RefuseReason, ServerMsg};
+use mdaw_proto::{BlobAnswer, BlobRequest, ClientMsg, Datagram, Hello, MAX_BLOB, RefuseReason, ServerMsg};
 use quinn::{Connection, Endpoint, VarInt};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -69,7 +70,8 @@ impl Server {
             }
         }
         let identity = Identity::load_or_create(&config.data_dir)?;
-        let hub = Hub::open(Store::open(&config.data_dir.join("project.db"))?)?;
+        let blobs = Blobs::open(config.data_dir.join("blobs"))?;
+        let hub = Hub::open(Store::open(&config.data_dir.join("project.db"))?, blobs.clone())?;
         let token = hub.token().to_string();
         let clock = hub.clock();
 
@@ -99,7 +101,7 @@ impl Server {
         let hub = std::thread::Builder::new()
             .name("mdaw-project".into())
             .spawn(move || run_hub(hub, inbox))?;
-        runtime.spawn(accept(endpoint.clone(), commands.clone(), clock));
+        runtime.spawn(accept(endpoint.clone(), commands.clone(), clock, blobs));
         Ok(Self {
             join,
             endpoint,
@@ -153,7 +155,17 @@ impl Drop for Server {
 }
 
 fn run_hub(mut hub: Hub, inbox: std_mpsc::Receiver<Command>) {
-    while let Ok(command) = inbox.recv() {
+    let mut ticked = std::time::Instant::now();
+    loop {
+        if ticked.elapsed() >= Duration::from_secs(1) {
+            hub.tick();
+            ticked = std::time::Instant::now();
+        }
+        let command = match inbox.recv_timeout(Duration::from_secs(1)) {
+            Ok(command) => command,
+            Err(std_mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
+        };
         match command {
             Command::Join { hello, sink, reply } => {
                 let _ = reply.send(hub.join(hello, sink));
@@ -165,20 +177,26 @@ fn run_hub(mut hub: Hub, inbox: std_mpsc::Receiver<Command>) {
     }
 }
 
-async fn accept(endpoint: Endpoint, commands: std_mpsc::Sender<Command>, clock: Clock) {
+async fn accept(endpoint: Endpoint, commands: std_mpsc::Sender<Command>, clock: Clock, blobs: Blobs) {
     while let Some(incoming) = endpoint.accept().await {
         let commands = commands.clone();
+        let blobs = blobs.clone();
         tokio::spawn(async move {
             // A connection that fails is the client's to retry; the server has nothing to do.
             if let Ok(connection) = incoming.await {
-                let _ = serve(&connection, commands, clock).await;
+                let _ = serve(&connection, commands, clock, blobs).await;
                 connection.close(VarInt::from_u32(0), b"");
             }
         });
     }
 }
 
-async fn serve(connection: &Connection, commands: std_mpsc::Sender<Command>, clock: Clock) -> Result<()> {
+async fn serve(
+    connection: &Connection,
+    commands: std_mpsc::Sender<Command>,
+    clock: Clock,
+    blobs: Blobs,
+) -> Result<()> {
     let (mut send, mut recv) = connection.accept_bi().await?;
     let first = tokio::time::timeout(HELLO_TIMEOUT, read_frame::<ClientMsg>(&mut recv)).await??;
     let Some(ClientMsg::Hello(hello)) = first else {
@@ -225,13 +243,63 @@ async fn serve(connection: &Connection, commands: std_mpsc::Sender<Command>, clo
             }
         }
     };
+    // Every further stream carries one blob. Only a client that was let in gets here.
+    let blob_service = async {
+        loop {
+            let (send, recv) = connection.accept_bi().await?;
+            let blobs = blobs.clone();
+            tokio::spawn(async move {
+                let _ = blob_stream(send, recv, blobs).await;
+            });
+        }
+    };
     let result: Result<()> = tokio::select! {
         result = writer => result,
         result = reader => result,
         result = clock_service => result,
+        result = blob_service => result,
     };
     let _ = commands.send(Command::Leave { actor });
     result
+}
+
+/// Serves one blob stream: an upload or a download.
+async fn blob_stream(mut send: quinn::SendStream, mut recv: quinn::RecvStream, blobs: Blobs) -> Result<()> {
+    let request = tokio::time::timeout(HELLO_TIMEOUT, read_frame::<BlobRequest>(&mut recv)).await??;
+    match request {
+        Some(BlobRequest::Put { hash, len }) => {
+            if blobs.has(&hash) {
+                write_frame(&mut send, &BlobAnswer::Stored).await?;
+            } else if len > MAX_BLOB {
+                write_frame(&mut send, &BlobAnswer::Refused).await?;
+            } else {
+                write_frame(&mut send, &BlobAnswer::Send).await?;
+                let bytes = recv.read_to_end(len as usize).await?;
+                let blobs2 = blobs.clone();
+                let stored = bytes.len() as u64 == len
+                    && tokio::task::spawn_blocking(move || blobs2.put(&hash, &bytes)).await??;
+                let answer = if stored {
+                    BlobAnswer::Stored
+                } else {
+                    BlobAnswer::Refused
+                };
+                write_frame(&mut send, &answer).await?;
+            }
+        }
+        Some(BlobRequest::Get { hash }) => {
+            let blobs2 = blobs.clone();
+            match tokio::task::spawn_blocking(move || blobs2.get(&hash)).await?? {
+                Some(bytes) => {
+                    let len = bytes.len() as u64;
+                    write_frame(&mut send, &BlobAnswer::Found { len }).await?;
+                    send.write_all(&bytes).await?;
+                }
+                None => write_frame(&mut send, &BlobAnswer::Missing).await?,
+            }
+        }
+        None => return Ok(()),
+    }
+    finish(send).await
 }
 
 /// Ends a stream and waits until the peer has everything written to it.

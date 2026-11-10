@@ -1,10 +1,12 @@
 //! Messages of the control stream and how they are framed.
 //!
-//! A frame is a `u32` little-endian length followed by that many bytes of postcard. The client
-//! opens one bidirectional stream per connection and speaks first with [`Hello`].
+//! A frame is a `u32` little-endian length followed by that many bytes of postcard. The first
+//! bidirectional stream the client opens is the control stream, on which it speaks first with
+//! [`Hello`]. Every further stream it opens carries one blob: a [`BlobRequest`] frame, answered
+//! with [`BlobAnswer`] frames and raw bytes.
 
-use crate::{Event, TransportState, Txn};
-use mdaw_model::{ActorId, EntityRef, Project, Tick, TrackId, UserId};
+use crate::{ChangelogEntry, Event, Sample, TransportState, Txn};
+use mdaw_model::{ActorId, BlobHash, EntityRef, Op, Project, Stem, Tick, TrackId, UserId};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -14,6 +16,9 @@ pub const ALPN: &[u8] = b"mdaw/0";
 
 /// Largest frame either side accepts.
 pub const MAX_FRAME: usize = 16 << 20;
+
+/// Largest blob either side accepts.
+pub const MAX_BLOB: u64 = 256 << 20;
 
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub enum ClientMsg {
@@ -25,6 +30,73 @@ pub enum ClientMsg {
     /// Asks for a new state of the shared transport. Any client may, and each request is
     /// answered with exactly one [`ServerMsg::Transport`] that names the asker.
     SetTransport(TransportState),
+    /// Takes the track's contents out of live editing, for the sender alone to work on.
+    Checkout {
+        track: TrackId,
+    },
+    /// "I am still working on it." Sent every [`crate::LEASE_RENEW_SECS`] by the owner of a
+    /// checkout; without it the checkout is shown as stale to everyone.
+    LeaseRenew {
+        track: TrackId,
+    },
+    /// Gives the sender's checkout up. The track keeps the contents it had.
+    Release {
+        track: TrackId,
+    },
+    /// Ends someone else's checkout. Anyone may.
+    ForceRelease {
+        track: TrackId,
+    },
+    /// Hands in the work of a checkout. Every blob it names must have been uploaded before.
+    Commit(Box<CommitRequest>),
+    /// Adds a sample to an entry of the log that exists already.
+    Attach {
+        entry_seq: u64,
+        sample: Sample,
+    },
+}
+
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+pub struct CommitRequest {
+    pub track: TrackId,
+    pub ops: Vec<Op>,
+    pub project_fix: Vec<Op>,
+    pub stem: Option<Stem>,
+    pub entry: ChangelogEntry,
+}
+
+/// What a client asked for outside of a transaction. Names the request in a refusal.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum Request {
+    Checkout(TrackId),
+    Release(TrackId),
+    ForceRelease(TrackId),
+    Commit(TrackId),
+    Attach(u64),
+}
+
+/// The first frame of a blob stream.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum BlobRequest {
+    /// The client offers a blob of `len` bytes. After [`BlobAnswer::Send`] it writes the bytes
+    /// and finishes the stream, and the server answers once more.
+    Put { hash: BlobHash, len: u64 },
+    /// The client asks for a blob. After [`BlobAnswer::Found`] the server writes the bytes.
+    Get { hash: BlobHash },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum BlobAnswer {
+    /// To a `Put`: go ahead.
+    Send,
+    /// To a `Put`: the server has the blob, either from before or as of now.
+    Stored,
+    /// To a `Put`: too large, or the bytes did not hash to what was announced.
+    Refused,
+    /// To a `Get`: `len` bytes follow.
+    Found { len: u64 },
+    /// To a `Get`: the server has no such blob.
+    Missing,
 }
 
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
@@ -76,6 +148,11 @@ pub enum ServerMsg {
         /// idea of the transport is the older one.
         by: Option<ActorId>,
     },
+    /// A request other than a transaction was turned down. Nothing changed.
+    Denied { request: Request, reason: RejectReason },
+    /// The checkouts whose owners have not renewed their lease in time. Sent whenever the set
+    /// changes.
+    Stale(Vec<TrackId>),
 }
 
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
@@ -94,6 +171,11 @@ pub struct Welcome {
     pub peers: Vec<Peer>,
     /// The shared transport as it is now.
     pub transport: TransportState,
+    /// With a snapshot: the latest events the changelog shows, oldest first. Their effect on
+    /// the document is in the snapshot already.
+    pub history: Vec<Event>,
+    /// The checkouts without a fresh lease.
+    pub stale: Vec<TrackId>,
 }
 
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
@@ -150,11 +232,33 @@ pub enum RejectReason {
     /// `base_seq` is ahead of the log.
     FutureBase,
     /// The track's contents are locked by a checkout.
-    CheckedOut { track: TrackId, by: UserId },
+    CheckedOut {
+        track: TrackId,
+        by: UserId,
+    },
     /// Tracks with CLAP devices are edited only through checkout.
-    ClapTrack { track: TrackId },
+    ClapTrack {
+        track: TrackId,
+    },
     /// CLAP devices are added only by a commit.
     ClapOutsideCommit,
+    NoSuchTrack,
+    /// The request needs the sender to own the track's checkout.
+    NotOwner {
+        track: TrackId,
+    },
+    /// There is no checkout to release.
+    NotCheckedOut {
+        track: TrackId,
+    },
+    /// A commit may only carry content ops of its track and project-scope fixes.
+    OutOfScope,
+    /// A blob the request names was not uploaded.
+    MissingBlob(BlobHash),
+    /// A track with CLAP devices must be committed with a stem.
+    StemRequired,
+    /// The entry to attach to is not in the log.
+    NoSuchEntry,
 }
 
 impl fmt::Display for RejectReason {
@@ -165,6 +269,13 @@ impl fmt::Display for RejectReason {
             RejectReason::CheckedOut { .. } => write!(f, "the track is checked out"),
             RejectReason::ClapTrack { .. } => write!(f, "tracks with plugins are edited through checkout"),
             RejectReason::ClapOutsideCommit => write!(f, "plugins are added through checkout"),
+            RejectReason::NoSuchTrack => write!(f, "the track does not exist any more"),
+            RejectReason::NotOwner { .. } => write!(f, "the track is not checked out by you"),
+            RejectReason::NotCheckedOut { .. } => write!(f, "the track is not checked out"),
+            RejectReason::OutOfScope => write!(f, "the commit reaches outside of its track"),
+            RejectReason::MissingBlob(_) => write!(f, "the server did not get all the audio"),
+            RejectReason::StemRequired => write!(f, "a track with plugins is committed with its audio"),
+            RejectReason::NoSuchEntry => write!(f, "the changelog entry does not exist"),
         }
     }
 }
@@ -261,6 +372,8 @@ mod tests {
                 loop_range: Some(mdaw_model::TickRange::new(Tick(0), Tick(3840))),
                 epoch: 3,
             },
+            history: Vec::new(),
+            stale: Vec::new(),
         }));
         let frame = encode(&welcome).unwrap();
         assert_eq!(decode::<ServerMsg>(&frame[4..]).unwrap(), welcome);

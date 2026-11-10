@@ -89,7 +89,9 @@ fn txn(id: u64, base_seq: u64, ops: Vec<Op>) -> Txn {
 }
 
 fn superseded(seq: &mut Sequencer, who: (ActorId, UserId), t: Txn) -> Vec<Superseded> {
-    let EventBody::Txn { superseded, .. } = seq.sequence(who.0, who.1, 0, t).unwrap().body;
+    let EventBody::Txn { superseded, .. } = seq.sequence(who.0, who.1, 0, t).unwrap().body else {
+        unreachable!()
+    };
     superseded
 }
 
@@ -108,7 +110,7 @@ fn events_get_consecutive_numbers_and_carry_the_transaction() {
         (8, ANN.0, ANN.1, 42)
     );
     assert_eq!(event.client_txn_id(), Some(5));
-    assert_eq!(event.ops(), [pitch(62)]);
+    assert_eq!(event.ops().cloned().collect::<Vec<_>>(), [pitch(62)]);
     assert_eq!(seq.head(), 8);
     assert_eq!(note(&seq).pitch, 62);
     assert_eq!(

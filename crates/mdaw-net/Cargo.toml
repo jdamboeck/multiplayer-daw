@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 mdaw-proto.workspace = true
+mdaw-model.workspace = true
 anyhow.workspace = true
 quinn.workspace = true
 rcgen.workspace = true
