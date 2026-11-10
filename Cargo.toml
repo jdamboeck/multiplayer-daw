@@ -16,10 +16,12 @@ mdaw-sync = { path = "crates/mdaw-sync" }
 mdaw-dsp = { path = "crates/mdaw-dsp" }
 mdaw-engine = { path = "crates/mdaw-engine" }
 mdaw-net = { path = "crates/mdaw-net" }
+mdaw-server = { path = "crates/mdaw-server" }
 imbl = { version = "7", features = ["serde"] }
 serde = { version = "1", features = ["derive", "rc"] }
 postcard = { version = "1.1", features = ["use-std"] }
 proptest = "1.12"
+tempfile = "3"
 libm = "0.2"
 rtrb = "0.4"
 eframe = "0.37"
@@ -27,6 +29,14 @@ egui = "0.37"
 egui_kittest = "0.37"
 cpal = "0.18"
 blake3 = "1.8"
+anyhow = "1"
+tokio = { version = "1.54", features = ["rt", "rt-multi-thread", "net", "sync", "time", "macros", "signal"] }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = "0.14"
+sha2 = "0.11"
+getrandom = "0.4"
+rusqlite = { version = "0.41", features = ["bundled"] }
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

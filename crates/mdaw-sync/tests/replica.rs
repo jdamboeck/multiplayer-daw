@@ -1,5 +1,5 @@
 use mdaw_model::*;
-use mdaw_proto::{Event, EventBody, Txn};
+use mdaw_proto::{Event, EventBody, SyncData, Txn};
 use mdaw_sync::{Gesture, Loopback, Replica, SyncError};
 use proptest::prelude::*;
 use std::collections::VecDeque;
@@ -267,6 +267,99 @@ fn events_must_arrive_in_order() {
     assert_eq!(b.on_event(&one), Err(SyncError::Gap { expected: 2, got: 1 }));
     b.on_event(&two).unwrap();
     assert_eq!(b.view(), &server.doc);
+}
+
+#[test]
+fn a_reconnect_continues_with_the_events_missed() {
+    let mut server = Server::new();
+    let mut replica = Replica::new(ActorId(1), base(), 0);
+    let first = replica.submit(vec![add(0, 60)]).unwrap();
+    let second = replica.submit(vec![add(1, 62)]).unwrap();
+    let third = replica.submit(vec![pitch(1, 64)]).unwrap();
+
+    // The server got the first two before the connection broke; someone else edited meanwhile.
+    let missed = vec![
+        server.sequence(ActorId(1), first),
+        server.sequence(
+            ActorId(2),
+            Txn {
+                client_txn_id: 1,
+                base_seq: 0,
+                ops: vec![add(5, 70)],
+            },
+        ),
+        server.sequence(ActorId(1), second),
+    ];
+    let resend = replica
+        .resync(ActorId(3), 3, SyncData::Events(missed), Some(2))
+        .unwrap();
+    assert_eq!(resend, std::slice::from_ref(&third));
+    assert_eq!(replica.actor(), ActorId(3));
+    assert_eq!(replica.seq(), 3);
+    assert_eq!(replica.confirmed(), &server.doc);
+    assert_eq!(
+        note_pitch(replica.view(), 1),
+        Some(64),
+        "the unconfirmed edit stays on top"
+    );
+    assert_eq!(note_pitch(replica.view(), 5), Some(70));
+
+    // The rest is confirmed under the new actor.
+    replica.on_event(&server.sequence(ActorId(3), third)).unwrap();
+    assert_eq!(replica.pending().len(), 0);
+    assert_eq!(replica.view(), &server.doc);
+
+    // IDs minted from now on belong to the new actor.
+    assert_eq!(replica.ids().note().0.actor(), ActorId(3));
+    // Undo still reaches back across the reconnect.
+    let undone = replica.undo().unwrap();
+    assert_eq!(undone.client_txn_id, 4);
+    assert_eq!(note_pitch(replica.view(), 1), Some(62));
+}
+
+#[test]
+fn a_reconnect_can_replace_the_document() {
+    let mut replica = Replica::new(ActorId(1), base(), 0);
+    let kept = replica.submit(vec![add(0, 60)]).unwrap();
+
+    let mut current = base();
+    apply(&mut current, &add(5, 70)).unwrap();
+    let resend = replica
+        .resync(ActorId(2), 40, SyncData::Snapshot(current.clone()), None)
+        .unwrap();
+    assert_eq!(resend, [kept]);
+    assert_eq!(replica.seq(), 40);
+    assert_eq!(replica.confirmed(), &current);
+    assert_eq!(
+        (note_pitch(replica.view(), 0), note_pitch(replica.view(), 5)),
+        (Some(60), Some(70))
+    );
+}
+
+#[test]
+fn a_reconnect_with_a_hole_in_the_events_is_an_error() {
+    let mut server = Server::new();
+    let mut replica = Replica::new(ActorId(1), base(), 0);
+    let txn = |n| Txn {
+        client_txn_id: n,
+        base_seq: 0,
+        ops: vec![add(n, 60)],
+    };
+    let events: Vec<Event> = (1..=3).map(|n| server.sequence(ActorId(2), txn(n))).collect();
+
+    let skipped = SyncData::Events(events[1..].to_vec());
+    assert_eq!(
+        replica.resync(ActorId(3), 3, skipped, None).err(),
+        Some(SyncError::Gap { expected: 1, got: 2 })
+    );
+    let short = SyncData::Events(events[..2].to_vec());
+    assert!(replica.resync(ActorId(3), 3, short, None).is_err());
+    assert_eq!(
+        (replica.seq(), replica.actor()),
+        (0, ActorId(1)),
+        "a refused resync changes nothing"
+    );
+    assert_eq!(replica.confirmed(), &base());
 }
 
 #[test]

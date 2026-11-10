@@ -1,11 +1,18 @@
 //! What travels between client and server. The document itself lives in `mdaw-model`; this crate
 //! wraps its ops into transactions and into the events of the project's log.
 
+mod wire;
+
 use mdaw_model::{ActorId, EntityRef, Op, PropKey, UserId};
 use serde::{Deserialize, Serialize};
 
+pub use wire::{
+    ALPN, ClientMsg, FrameError, Hello, MAX_FRAME, Peer, Presence, RefuseReason, RejectReason, Resume,
+    ServerMsg, SyncData, Welcome, decode, encode, payload_len,
+};
+
 /// Bumped on every incompatible change to the wire format or to the meaning of an op.
-pub const PROTO_VERSION: u32 = 0;
+pub const PROTO_VERSION: u32 = 1;
 
 /// One user gesture: applied atomically, sequenced as a whole, undone as a whole.
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]

@@ -1,5 +1,5 @@
 use mdaw_model::{ActorId, IdGen, Op, Project, PropKey, apply, apply_all};
-use mdaw_proto::{Event, Txn};
+use mdaw_proto::{Event, SyncData, Txn};
 use std::collections::VecDeque;
 use std::fmt;
 
@@ -240,6 +240,57 @@ impl Replica {
             self.rebuild();
         }
         Ok(())
+    }
+
+    /// Continues on a new connection, after the server's `Welcome`.
+    ///
+    /// `sync` brings the confirmed document to `head_seq`. `acked` is the last of this replica's
+    /// transactions the server dealt with on the previous connection; those leave the pending
+    /// queue. Returns what is still pending, to be sent again under the new `actor`.
+    ///
+    /// On an error nothing has changed, and the way out is to join afresh.
+    pub fn resync(
+        &mut self,
+        actor: ActorId,
+        head_seq: u64,
+        sync: SyncData,
+        acked: Option<u64>,
+    ) -> Result<Vec<Txn>, SyncError> {
+        match sync {
+            SyncData::Snapshot(project) => self.confirmed = project,
+            SyncData::Events(events) => {
+                // Checked before anything changes, so a refused resync leaves the replica whole.
+                let mut next = self.seq + 1;
+                for event in &events {
+                    if event.seq != next {
+                        return Err(SyncError::Gap {
+                            expected: next,
+                            got: event.seq,
+                        });
+                    }
+                    next += 1;
+                }
+                if next != head_seq + 1 {
+                    return Err(SyncError::Gap {
+                        expected: next,
+                        got: head_seq + 1,
+                    });
+                }
+                for event in &events {
+                    apply_all(&mut self.confirmed, event.ops());
+                }
+            }
+        }
+        self.seq = head_seq;
+        if let Some(acked) = acked {
+            self.pending.retain(|txn| txn.client_txn_id > acked);
+        }
+        // IDs minted from here on must not collide with the old connection's.
+        if actor != self.ids.actor() {
+            self.ids = IdGen::new(actor);
+        }
+        self.rebuild();
+        Ok(self.pending.iter().cloned().collect())
     }
 
     /// The server refused a transaction: forget it and everything it did locally.
