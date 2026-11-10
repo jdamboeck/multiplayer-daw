@@ -12,3 +12,13 @@ workspace = true
 
 [dependencies]
 mdaw-proto.workspace = true
+anyhow.workspace = true
+quinn.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+serde.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
