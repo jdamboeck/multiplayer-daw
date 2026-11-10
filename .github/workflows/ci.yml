@@ -1,0 +1,28 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Linux audio and windowing headers
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libjack-jackd2-dev libpipewire-0.3-dev libclang-dev libx11-dev libxcb1-dev libxkbcommon-dev libwayland-dev
+      - run: cargo fmt --all -- --check
+      # Spikes are throwaway binaries and stay out of the gate.
+      - run: cargo clippy --workspace --exclude 'spike-*' --all-targets -- -D warnings
+      - run: cargo test --workspace --exclude 'spike-*'
