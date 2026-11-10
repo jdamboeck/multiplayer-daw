@@ -2,6 +2,7 @@
 //! there in step with the document.
 
 pub mod alloc_guard;
+pub mod clock;
 mod engine;
 mod rt;
 

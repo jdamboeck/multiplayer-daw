@@ -1,5 +1,5 @@
-use crate::alloc_guard;
-use crate::rt::{Command, RtCore, Shared};
+use crate::rt::{Anchor, Command, RtCore, Shared};
+use crate::{alloc_guard, clock};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use mdaw_dsp::{Compiler, Graph};
 use mdaw_model::{Project, Tick, TickRange, TrackId};
@@ -7,8 +7,10 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+/// Output latencies beyond this are taken for a misreport.
+const MAX_LATENCY: Duration = Duration::from_secs(1);
 /// Capacity of the command ring.
 const COMMANDS: usize = 1024;
 /// Graphs that may be on their way to or from the audio thread at once.
@@ -33,10 +35,24 @@ enum Backend {
     /// A running audio device. The stream owns the real-time core.
     Device(#[allow(dead_code)] cpal::Stream),
     /// No device: the owner renders by calling [`Engine::pump`].
-    Manual {
-        core: Box<RtCore>,
-        clock: Option<Instant>,
-    },
+    Manual { core: Box<RtCore>, clock: ManualClock },
+}
+
+/// Time as an engine without a device sees it: the frames rendered so far, counted from when
+/// it was made. Counting frames instead of measuring each step loses no fractions.
+struct ManualClock {
+    /// Follow the real clock, by rendering what is due on every [`Engine::tick`]. Otherwise
+    /// time passes only in [`Engine::pump`].
+    real_time: bool,
+    start_micros: i64,
+    frames: u64,
+}
+
+impl ManualClock {
+    /// When the next frame to be rendered is heard.
+    fn micros(&self, sample_rate: u32) -> i64 {
+        self.start_micros + (self.frames as u128 * 1_000_000 / sample_rate as u128) as i64
+    }
 }
 
 /// Counters for diagnostics.
@@ -47,6 +63,8 @@ pub struct Stats {
     pub max_callback_micros: u64,
     pub overruns: u64,
     pub stream_errors: u64,
+    /// Jumps made to get back in step with a followed transport.
+    pub resyncs: u64,
 }
 
 /// Control-side handle of the audio engine. Lives on the UI thread; every method returns
@@ -76,6 +94,8 @@ struct Parts {
 }
 
 fn parts(sample_rate: u32) -> Parts {
+    // Start the clock before the audio thread reads it.
+    clock::now_micros();
     let (commands, command_rx) = rtrb::RingBuffer::new(COMMANDS);
     let (garbage_tx, garbage) = rtrb::RingBuffer::new(MAX_GRAPHS_IN_FLIGHT + 1);
     let shared = Arc::new(Shared::default());
@@ -146,7 +166,8 @@ impl Engine {
 
     /// An engine without an audio device. With `real_time`, [`Engine::tick`] renders (and
     /// discards) as much audio as wall-clock time has passed, so the transport moves as if a
-    /// device were attached. Without it, only [`Engine::pump`] advances time.
+    /// device were attached. Without it, only [`Engine::pump`] advances time, and
+    /// [`Engine::now_micros`] with it.
     pub fn manual(sample_rate: u32, real_time: bool) -> Engine {
         let Parts {
             core,
@@ -156,7 +177,11 @@ impl Engine {
         } = parts(sample_rate);
         let backend = Backend::Manual {
             core: Box::new(core),
-            clock: real_time.then(Instant::now),
+            clock: ManualClock {
+                real_time,
+                start_micros: clock::now_micros(),
+                frames: 0,
+            },
         };
         let description = format!("no audio device, {sample_rate} Hz");
         Self::assemble(sample_rate, description, commands, garbage, shared, backend)
@@ -212,20 +237,29 @@ impl Engine {
             self.graphs_in_flight = self.graphs_in_flight.saturating_sub(1);
         }
         self.flush();
-        if let Backend::Manual {
-            core,
-            clock: Some(clock),
-        } = &mut self.backend
+        if let Backend::Manual { core, clock } = &mut self.backend
+            && clock.real_time
         {
-            let frames = (clock.elapsed().as_secs_f64() * self.sample_rate as f64) as usize;
-            *clock = Instant::now();
+            let rate = self.sample_rate as u64;
+            let passed = (clock::now_micros() - clock.start_micros).max(0) as u64;
+            let due = (passed as u128 * rate as u128 / 1_000_000) as u64;
+            // After a long pause, skip ahead instead of rendering it all.
+            clock.frames = clock.frames.max(due.saturating_sub(rate));
             let mut sink = [0.0f32; 1024];
-            let mut left = frames.min(self.sample_rate as usize);
-            while left > 0 {
-                let n = left.min(sink.len() / 2);
-                core.fill(&mut sink[..n * 2], 2, |s| s);
-                left -= n;
+            while clock.frames < due {
+                let n = ((due - clock.frames) as usize).min(sink.len() / 2);
+                core.fill(&mut sink[..n * 2], 2, clock.micros(self.sample_rate), |s| s);
+                clock.frames += n as u64;
             }
+        }
+    }
+
+    /// The time [`Engine::follow`] is given anchors on: [`clock::now_micros`], except for a
+    /// manual engine that is not real-time, whose time is the audio pumped so far.
+    pub fn now_micros(&self) -> i64 {
+        match &self.backend {
+            Backend::Manual { clock, .. } if !clock.real_time => clock.micros(self.sample_rate),
+            _ => clock::now_micros(),
         }
     }
 
@@ -268,6 +302,36 @@ impl Engine {
     pub fn stop(&mut self) {
         self.playing = false;
         self.send(Command::Stop);
+    }
+
+    /// Plays in step with a transport kept elsewhere: the playhead is at `tick` at `at_micros`
+    /// on [`Engine::now_micros`]. If that is still to come, the playhead waits at `tick` and
+    /// starts on time; if it has passed, playback is wherever that puts it by now. The engine
+    /// then keeps to it, jumping when it finds itself more than 20 ms off.
+    ///
+    /// `fresh` says the anchor describes a new playback, as after a seek, and not a better
+    /// estimate of the same one; the playhead then moves there without delay.
+    pub fn follow(&mut self, tick: f64, at_micros: i64, fresh: bool) {
+        self.playing = true;
+        let anchor = Anchor {
+            tick,
+            micros: at_micros,
+        };
+        self.send(Command::Follow { anchor, fresh });
+    }
+
+    /// Stops following. Playback goes on freely from where it is.
+    pub fn unfollow(&mut self) {
+        self.send(Command::Unfollow);
+    }
+
+    /// While following, once started: how far the playhead is ahead of where the anchor puts
+    /// it, in microseconds.
+    pub fn drift_micros(&self) -> Option<i64> {
+        self.shared
+            .following
+            .load(Relaxed)
+            .then(|| self.shared.drift_micros.load(Relaxed))
     }
 
     /// What the transport was last told, without waiting for the audio thread to catch up.
@@ -324,6 +388,7 @@ impl Engine {
             max_callback_micros: self.shared.max_micros.load(Relaxed),
             overruns: self.shared.overruns.load(Relaxed),
             stream_errors: self.shared.stream_errors.load(Relaxed),
+            resyncs: self.shared.resyncs.load(Relaxed),
         }
     }
 
@@ -331,14 +396,15 @@ impl Engine {
     /// [`Engine::manual`]; returns `None` when a device is attached.
     pub fn pump(&mut self, frames: usize) -> Option<Vec<f32>> {
         self.flush();
-        let Backend::Manual { core, .. } = &mut self.backend else {
+        let Backend::Manual { core, clock } = &mut self.backend else {
             return None;
         };
         let mut out = vec![0.0f32; frames * 2];
         {
             let _realtime = alloc_guard::enter();
-            core.fill(&mut out, 2, |s| s);
+            core.fill(&mut out, 2, clock.micros(self.sample_rate), |s| s);
         }
+        clock.frames += frames as u64;
         Some(out)
     }
 }
@@ -358,10 +424,14 @@ where
     device
         .build_output_stream(
             config,
-            move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
+            move |data: &mut [T], info: &cpal::OutputCallbackInfo| {
                 let _realtime = alloc_guard::enter();
                 let started = Instant::now();
-                core.fill(data, channels, T::from_sample);
+                // The device says how long after this call the buffer is heard.
+                let stamp = info.timestamp();
+                let latency = stamp.playback.duration_since(stamp.callback).min(MAX_LATENCY);
+                let play_micros = clock::now_micros() + latency.as_micros() as i64;
+                core.fill(data, channels, play_micros, T::from_sample);
                 let micros = started.elapsed().as_micros() as u64;
                 shared.max_micros.fetch_max(micros, Relaxed);
                 let budget = (data.len() / channels.max(1)) as u64 * 1_000_000 / sample_rate;

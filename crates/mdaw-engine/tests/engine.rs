@@ -372,3 +372,197 @@ fn a_stalled_audio_thread_does_not_lose_the_latest_document() {
     );
     no_allocations();
 }
+
+/// Where free playback from tick 0 is after `micros`, in ticks at 120 bpm.
+fn ticks_after(micros: i64) -> f64 {
+    micros as f64 / 1e6 * 2.0 * PPQ as f64
+}
+
+#[test]
+fn a_followed_start_begins_on_the_exact_frame() {
+    let song = Song::new(&[(0, 1, 60), (1, 1, 64)]);
+    let mut free = engine(&song);
+    free.play();
+    let reference = pump(&mut free, BEAT * 2);
+
+    let mut engine = engine(&song);
+    // 150 ms from now are 7200 frames.
+    engine.follow(0.0, engine.now_micros() + 150_000, true);
+    assert!(engine.is_playing(), "as far as the user is concerned");
+    let mut audio = Vec::new();
+    for frames in [441, 1, 2048, 37, 513].into_iter().cycle() {
+        if audio.len() >= (7200 + BEAT * 2) * 2 {
+            break;
+        }
+        audio.extend(pump(&mut engine, frames));
+        if audio.len() <= 7200 * 2 {
+            assert_eq!(engine.position(), 0.0, "waiting at the anchor");
+            assert_eq!(engine.drift_micros(), None);
+        }
+    }
+    assert_eq!(peak(&audio[..7200 * 2]), 0.0);
+    assert!(
+        audio[7200 * 2..][..BEAT * 4] == reference[..],
+        "playback starts on frame 7200, whatever the buffer sizes"
+    );
+    assert_eq!(engine.drift_micros(), Some(0));
+    assert_eq!(engine.stats().resyncs, 0);
+    no_allocations();
+}
+
+#[test]
+fn a_follower_that_comes_late_is_where_the_others_are() {
+    let song = Song::new(&[(0, 8, 60)]);
+    let mut engine = engine(&song);
+    // The others started a second ago.
+    engine.follow(0.0, engine.now_micros() - 1_000_000, true);
+    let audio = pump(&mut engine, 480);
+    assert!(peak(&audio) > 0.01, "the note that began before is heard");
+    let expected = ticks_after(1_010_000);
+    assert!(
+        (engine.position() - expected).abs() < 1.0,
+        "{} vs {expected}",
+        engine.position()
+    );
+    assert_eq!(
+        engine.stats().resyncs,
+        0,
+        "starting in the right place is no correction"
+    );
+    no_allocations();
+}
+
+#[test]
+fn drift_is_put_right_with_a_jump() {
+    let song = Song::new(&[(0, 8, 60)]);
+    let mut engine = engine(&song);
+    let start = engine.now_micros();
+    engine.follow(0.0, start, true);
+    pump(&mut engine, 4800);
+
+    // A slightly better idea of when the anchor was changes nothing audible.
+    engine.follow(0.0, start - 10_000, false);
+    for _ in 0..10 {
+        pump(&mut engine, 480);
+    }
+    assert_eq!(engine.stats().resyncs, 0);
+    let drift = engine.drift_micros().unwrap();
+    assert!((-10_100..=-9_900).contains(&drift), "{drift}");
+
+    // Too far off: after three buffers in a row, the playhead jumps.
+    engine.follow(0.0, start - 50_000, false);
+    pump(&mut engine, 480);
+    pump(&mut engine, 480);
+    assert_eq!(engine.stats().resyncs, 0, "not yet");
+    pump(&mut engine, 480);
+    assert_eq!(engine.stats().resyncs, 1);
+    assert_eq!(engine.drift_micros(), Some(0));
+    let expected = ticks_after(engine.now_micros() - (start - 50_000));
+    assert!(
+        (engine.position() - expected).abs() < 1.0,
+        "{} vs {expected}",
+        engine.position()
+    );
+
+    // A new anchor, as after a seek, is obeyed at once.
+    engine.follow(Tick::bars(2).0 as f64, engine.now_micros(), true);
+    pump(&mut engine, 480);
+    assert_eq!(engine.stats().resyncs, 2);
+    let expected = Tick::bars(2).0 as f64 + ticks_after(10_000);
+    assert!((engine.position() - expected).abs() < 1.0);
+    // And the same anchor again moves nothing.
+    engine.follow(Tick::bars(2).0 as f64, engine.now_micros() - 10_000, true);
+    pump(&mut engine, 480);
+    assert_eq!(engine.stats().resyncs, 2);
+    no_allocations();
+}
+
+#[test]
+fn a_followed_loop_wraps_where_the_anchor_says() {
+    let song = Song::new(&[(0, 1, 60)]);
+    let mut engine = engine(&song);
+    engine.set_loop(Some(TickRange::new(Tick::ZERO, Tick::bars(1))));
+    // Five seconds are ten beats: twice round the bar and two beats.
+    engine.follow(0.0, engine.now_micros() - 5_000_000, true);
+    pump(&mut engine, 48);
+    let expected = Tick::beats(2).0 as f64 + ticks_after(1_000);
+    assert!(
+        (engine.position() - expected).abs() < 1.0,
+        "{} vs {expected}",
+        engine.position()
+    );
+    // Round the loop a few more times, in step all the way.
+    for _ in 0..100 {
+        pump(&mut engine, 2000);
+        assert!(engine.drift_micros().unwrap().abs() < 100);
+    }
+    assert!(engine.position() < Tick::bars(1).0 as f64);
+    assert_eq!(engine.stats().resyncs, 0);
+
+    // An anchor behind the loop plays on, as free playback from there would.
+    engine.follow(Tick::bars(2).0 as f64, engine.now_micros() - 5_000_000, true);
+    pump(&mut engine, 48);
+    assert!(engine.position() > Tick::bars(4).0 as f64);
+    no_allocations();
+}
+
+#[test]
+fn following_ends_with_unfollow_or_stop() {
+    let song = Song::new(&[(0, 8, 60)]);
+    let mut engine = engine(&song);
+    // Cut loose before the start: the user sees a playing transport, so it plays.
+    engine.follow(0.0, engine.now_micros() + 1_000_000, true);
+    pump(&mut engine, 480);
+    assert_eq!(engine.position(), 0.0);
+    engine.unfollow();
+    assert!(engine.is_playing());
+    assert!(peak(&pump(&mut engine, 4800)) > 0.01);
+    assert!((engine.position() - ticks_after(100_000)).abs() < 1.0);
+    assert_eq!(engine.drift_micros(), None);
+
+    // Cut loose while playing: nothing happens, and the old anchor no longer pulls.
+    engine.follow(Tick::bars(1).0 as f64, engine.now_micros(), true);
+    pump(&mut engine, 480);
+    engine.unfollow();
+    pump(&mut engine, 480);
+    engine.seek(Tick::ZERO);
+    for _ in 0..10 {
+        pump(&mut engine, 480);
+    }
+    assert!((engine.position() - ticks_after(100_000)).abs() < 1.0);
+
+    engine.follow(Tick::bars(1).0 as f64, engine.now_micros(), true);
+    pump(&mut engine, 480);
+    engine.stop();
+    assert!(!engine.is_playing());
+    pump(&mut engine, 480);
+    let rest = engine.position();
+    pump(&mut engine, 4800);
+    assert_eq!(engine.position(), rest);
+    assert_eq!(engine.drift_micros(), None);
+    no_allocations();
+}
+
+#[test]
+fn a_real_time_manual_engine_keeps_time() {
+    let song = Song::new(&[(0, 8, 60)]);
+    let mut engine = Engine::manual(SR, true);
+    engine.set_project(&song.project);
+    let start = mdaw_engine::clock::now_micros();
+    engine.follow(0.0, start, true);
+    // Many small steps must not add up to lost time.
+    let mut now = start;
+    while now < start + 200_000 {
+        std::thread::sleep(std::time::Duration::from_micros(700));
+        engine.tick();
+        now = mdaw_engine::clock::now_micros();
+    }
+    let expected = ticks_after(now - start);
+    // Within a millisecond: the clock was read a moment after the audio was rendered.
+    assert!(
+        (engine.position() - expected).abs() < ticks_after(1_000),
+        "{} vs {expected}",
+        engine.position()
+    );
+    assert_eq!(engine.stats().resyncs, 0);
+}
