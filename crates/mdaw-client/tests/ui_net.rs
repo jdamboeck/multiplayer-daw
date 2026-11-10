@@ -332,6 +332,113 @@ fn a_refused_edit_shows_a_notice_that_can_be_dismissed() {
 }
 
 #[test]
+fn a_track_is_checked_out_committed_and_heard_through_the_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = serve(dir.path(), "127.0.0.1:0");
+    let (mut ann, mut ben, track, clip) = with_a_clip(&server);
+
+    ann.get_by_label("Check out").click();
+    until(&mut ann, &mut ben, "ben sees the lock", |a, b| {
+        a.session.workspace(track).is_some() && b.session.checkout_owner(track).is_some()
+    });
+    assert!(shows(&ben, "Locked"));
+    assert!(shows(&ann, "Commit…"));
+
+    let id = ann.state_mut().session.ids().note();
+    let note = Note {
+        start: Tick::ZERO,
+        dur: Tick::beats(1),
+        pitch: 60,
+        vel: 100,
+    };
+    assert!(ann.state_mut().session.edit(vec![Op::NoteAdd {
+        track,
+        clip,
+        id,
+        note
+    }]));
+    ann.get_by_label("Commit…").click();
+    until(&mut ann, &mut ben, "the samples are rendered", |a, _| {
+        matches!(
+            a.session.commit_state(),
+            Some(mdaw_client::CommitState::Ready { .. })
+        )
+    });
+    assert!(shows(&ann, "What did you change?"));
+    assert!(shows(&ann, "Track alone"));
+    ann.get_by_label("Commit").click();
+    until(&mut ann, &mut ben, "ben has the note", |_, b| {
+        b.session.project().track(track).unwrap().content.clips[&clip]
+            .notes
+            .len()
+            == 1
+    });
+    settle(&mut ann, &mut ben);
+    assert!(!shows(&ann, "What did you change?"), "the dialog is gone");
+    assert!(shows(&ben, "Check out"), "the track is free again");
+
+    ben.get_by_label("Changelog").click();
+    ben.run_steps(3);
+    assert!(shows(&ben, "ann committed \"Track 1\""));
+    ben.get_by_label_contains("Track alone").click();
+    until(&mut ann, &mut ben, "the sample plays", |_, b| {
+        b.session.project().tracks.len() == 1
+            && b.session.log().iter().any(|e| {
+                b.session
+                    .samples(e.seq)
+                    .iter()
+                    .any(|s| b.session.sample_position(s.blob).is_some())
+            })
+    });
+}
+
+#[test]
+fn ending_someone_elses_checkout_asks_first_and_leaves_them_a_fork() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = serve(dir.path(), "127.0.0.1:0");
+    let (mut ann, mut ben, track, clip) = with_a_clip(&server);
+    ann.get_by_label("Check out").click();
+    until(&mut ann, &mut ben, "ben sees the lock", |a, b| {
+        a.session.workspace(track).is_some() && b.session.checkout_owner(track).is_some()
+    });
+    let id = ann.state_mut().session.ids().note();
+    let note = Note {
+        start: Tick::ZERO,
+        dur: Tick::beats(1),
+        pitch: 60,
+        vel: 100,
+    };
+    ann.state_mut().session.edit(vec![Op::NoteAdd {
+        track,
+        clip,
+        id,
+        note,
+    }]);
+
+    ben.get_by_label("Locked").click();
+    ben.run_steps(3);
+    ben.get_by_label("Cancel").click();
+    ben.run_steps(3);
+    assert!(
+        ben.state().session.checkout_owner(track).is_some(),
+        "nothing happened"
+    );
+    ben.get_by_label("Locked").click();
+    ben.run_steps(3);
+    ben.get_by_label("End the checkout").click();
+    until(&mut ann, &mut ben, "the checkout is over", |a, b| {
+        a.session.workspace(track).is_none() && b.session.checkout_owner(track).is_none()
+    });
+    assert!(shows(&ann, "ben ended your checkout"));
+    ann.get_by_label("Changelog").click();
+    ann.run_steps(3);
+    ann.get_by_label("Restore as new track").click();
+    ann.run_steps(3);
+    settle(&mut ann, &mut ben);
+    assert_eq!(ben.state().session.project().tracks.len(), 2);
+}
+
+#[test]
 fn play_in_one_window_plays_in_the_other_until_it_unlinks() {
     let dir = tempfile::tempdir().unwrap();
     let server = serve(dir.path(), "127.0.0.1:0");
@@ -444,4 +551,25 @@ fn screenshots() {
         .expect("render")
         .save(format!("{shots}/collab-ann.png"))
         .expect("save");
+
+    // Ann checks the track out and opens the commit dialog; ben sees the lock.
+    ann.drop_at(to);
+    ann.run_steps(2);
+    ann.get_by_label("Check out").click();
+    until(&mut ann, &mut ben, "ben sees the lock", |a, b| {
+        a.session.workspace(track).is_some() && b.session.checkout_owner(track).is_some()
+    });
+    ann.get_by_label("Commit…").click();
+    until(&mut ann, &mut ben, "the samples are rendered", |a, _| {
+        matches!(
+            a.session.commit_state(),
+            Some(mdaw_client::CommitState::Ready { .. })
+        )
+    });
+    for (h, name) in [(&mut ann, "checkout-ann"), (&mut ben, "checkout-ben")] {
+        h.render()
+            .expect("render")
+            .save(format!("{shots}/{name}.png"))
+            .expect("save");
+    }
 }

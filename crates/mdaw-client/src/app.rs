@@ -6,7 +6,7 @@ use egui::{Key, Modifiers};
 use mdaw_model::{ClipId, EntityRef, NoteId, Op, Tick, TickRange, TrackId};
 
 use crate::session::{Session, new_track};
-use crate::ui::{arrange, changelog, devices, piano_roll, transport};
+use crate::ui::{arrange, changelog, checkout, devices, piano_roll, transport};
 
 /// The view that keyboard commands such as Delete act on: the one clicked last.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -46,6 +46,10 @@ pub struct DawApp {
     pub(crate) rename: Option<(TrackId, String, bool)>,
     /// What the user is dragging in this frame; the views set it, the session shares it.
     pub(crate) editing: Option<EntityRef>,
+    /// The commit dialog, while open.
+    pub commit: Option<checkout::CommitDialog>,
+    /// A track whose checkout by someone else the user asked to end, awaiting confirmation.
+    pub confirm_force: Option<TrackId>,
 }
 
 impl DawApp {
@@ -66,6 +70,8 @@ impl DawApp {
             gestures: crate::ui::Gestures::default(),
             rename: None,
             editing: None,
+            commit: None,
+            confirm_force: None,
         }
     }
 
@@ -117,6 +123,7 @@ impl DawApp {
                 }
             });
         egui::CentralPanel::no_frame().show(ui, |ui| arrange::show(self, ui));
+        checkout::dialogs(self, ui.ctx());
 
         let editing = self.editing.take();
         self.session.set_editing(editing);
@@ -147,6 +154,17 @@ impl DawApp {
     pub fn apply_loop(&mut self) {
         let range = (self.loop_on && !self.loop_range.is_empty()).then_some(self.loop_range);
         self.session.set_loop(range);
+    }
+
+    /// Opens the commit dialog for this user's checkout of `track`, which stops edits to it
+    /// while the samples render.
+    pub fn open_commit(&mut self, track: TrackId) {
+        if self.session.commit_state().is_none() && !self.session.start_commit(track) {
+            return;
+        }
+        if self.commit.is_none() {
+            self.commit = Some(checkout::CommitDialog::default());
+        }
     }
 
     pub fn add_track(&mut self) {

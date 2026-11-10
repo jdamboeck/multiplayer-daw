@@ -1,58 +1,171 @@
-//! The changelog: edits that lost against someone else's concurrent edit, and a way back.
+//! The changelog: checkouts and commits with their samples, edits that lost against someone
+//! else's concurrent edit with a way back, and forks of checkouts that were ended.
 
 use egui::{Button, RichText, Ui};
 use mdaw_model::{ClipProp, EntityRef, MixProp, NoteProp, Op, Project, PropKey, ShellProp};
-use mdaw_proto::Superseded;
+use mdaw_proto::{ReleaseReason, Superseded};
 
+use super::checkout::sample_button;
 use super::{format_position, gain_to_db};
-use crate::session::Displaced;
+use crate::session::{Displaced, LogEntry, Logged};
 use crate::{DawApp, theme};
 
 pub fn toolbar(app: &mut DawApp, ui: &mut Ui) {
-    let text = match app.session.displaced().len() {
-        0 => "No overwritten edits".to_string(),
-        1 => "1 overwritten edit".to_string(),
-        n => format!("{n} overwritten edits"),
+    let count = app.session.displaced().len() + app.session.log().len();
+    let text = match count {
+        0 => "Nothing yet".to_string(),
+        1 => "1 entry".to_string(),
+        n => format!("{n} entries"),
     };
     ui.label(RichText::new(text).color(theme::TEXT_DIM));
 }
 
+/// One line of the changelog.
+enum Row {
+    Log(LogEntry),
+    Displaced(Displaced),
+}
+
+impl Row {
+    fn seq(&self) -> u64 {
+        match self {
+            Row::Log(entry) => entry.seq,
+            Row::Displaced(entry) => entry.seq,
+        }
+    }
+}
+
 pub fn show(app: &mut DawApp, ui: &mut Ui) {
-    if app.session.displaced().is_empty() {
+    let forks = app.session.forks().to_vec();
+    if app.session.displaced().is_empty() && app.session.log().is_empty() && forks.is_empty() {
         ui.centered_and_justified(|ui| {
-            let hint = "When two people change the same thing at the same moment, the last change wins.\n\
-                        The one that lost is listed here and can be brought back.";
+            let hint = "Commits of checked-out tracks are listed here, with samples to listen to.\n\
+                        When two people change the same thing at the same moment, the last change wins;\n\
+                        the one that lost is listed here too and can be brought back.";
             ui.label(RichText::new(hint).color(theme::TEXT_DIM));
         });
         return;
     }
     let project = app.session.project().clone();
-    let entries: Vec<Displaced> = app.session.displaced().iter().rev().cloned().collect();
+    let mut rows: Vec<Row> = app.session.log().iter().cloned().map(Row::Log).collect();
+    rows.extend(app.session.displaced().iter().cloned().map(Row::Displaced));
+    // Newest first; within one event, in the order recorded.
+    rows.reverse();
+    rows.sort_by_key(|row| std::cmp::Reverse(row.seq()));
+
     let mut restore = None;
+    let mut play = None;
+    let mut fork_action = None;
     egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
         ui.add_space(4.0);
-        for entry in &entries {
+        for (index, fork) in forks.iter().enumerate() {
             ui.horizontal(|ui| {
-                let possible = app.session.can_restore(&entry.lost);
-                let hint = if possible {
-                    "Make this change again, as your own edit."
-                } else {
-                    "Nothing to restore: the project already has this value, or what it applied to is gone."
-                };
                 if ui
-                    .add_enabled(possible, Button::new("Restore"))
-                    .on_hover_text(hint)
-                    .on_disabled_hover_text(hint)
+                    .button("Restore as new track")
+                    .on_hover_text("Adds the track as you had made it in your checkout")
                     .clicked()
                 {
-                    restore = Some(entry.lost.clone());
+                    fork_action = Some((index, true));
                 }
-                ui.label(describe(app, &project, entry));
+                if ui.button("Discard").clicked() {
+                    fork_action = Some((index, false));
+                }
+                let text = format!(
+                    "Your changes to \"{}\", kept when your checkout was ended",
+                    fork.shell.name
+                );
+                ui.label(RichText::new(text).color(theme::WARN));
+            });
+        }
+        if !forks.is_empty() {
+            ui.separator();
+        }
+        let mut last_seq = None;
+        for row in &rows {
+            // Samples belong to an event; show them with its first line only.
+            let first = last_seq != Some(row.seq());
+            last_seq = Some(row.seq());
+            ui.horizontal_wrapped(|ui| {
+                match row {
+                    Row::Displaced(entry) => {
+                        let possible = app.session.can_restore(&entry.lost);
+                        let hint = if possible {
+                            "Make this change again, as your own edit."
+                        } else {
+                            "Nothing to restore: the project already has this value, or what it applied to is gone."
+                        };
+                        if ui
+                            .add_enabled(possible, Button::new("Restore"))
+                            .on_hover_text(hint)
+                            .on_disabled_hover_text(hint)
+                            .clicked()
+                        {
+                            restore = Some(entry.lost.clone());
+                        }
+                        ui.label(describe(app, &project, entry));
+                    }
+                    Row::Log(entry) => {
+                        ui.label(describe_log(app, &project, entry));
+                    }
+                }
+                if first {
+                    for sample in crate::checkout::distinct(app.session.samples(row.seq())) {
+                        if sample_button(app, ui, &sample).clicked() {
+                            play = Some(sample);
+                        }
+                    }
+                }
             });
         }
     });
     if let Some(lost) = restore {
         app.session.restore(&lost);
+    }
+    if let Some(sample) = play {
+        app.session.play_sample(&sample);
+    }
+    match fork_action {
+        Some((index, true)) => {
+            app.session.restore_fork(index);
+        }
+        Some((index, false)) => app.session.discard_fork(index),
+        None => {}
+    }
+}
+
+/// One line about a checkout, commit or release.
+fn describe_log(app: &DawApp, project: &Project, entry: &LogEntry) -> String {
+    let who = app.session.user_name(entry.by);
+    let track = |id: &mdaw_model::TrackId| match project.track(*id) {
+        Some(track) => format!("\"{}\"", track.shell.name),
+        None => "a removed track".into(),
+    };
+    match &entry.what {
+        Logged::Checkout { track: id } => format!("{who} checked out {}", track(id)),
+        Logged::Commit {
+            track: id, summary, ..
+        } => {
+            if summary.is_empty() {
+                format!("{who} committed {}", track(id))
+            } else {
+                format!("{who} committed {}: {summary}", track(id))
+            }
+        }
+        Logged::Release {
+            track: id,
+            reason: ReleaseReason::Abandoned,
+        } => format!("{who} dropped the checkout of {}", track(id)),
+        Logged::Release {
+            track: id,
+            reason: ReleaseReason::Forced { owner },
+        } => {
+            let whose = if *owner == app.session.user() {
+                "your".to_string()
+            } else {
+                format!("{}'s", app.session.user_name(*owner))
+            };
+            format!("{who} ended {whose} checkout of {}", track(id))
+        }
     }
 }
 
