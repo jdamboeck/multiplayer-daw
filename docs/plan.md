@@ -20,7 +20,7 @@ Decided with the user: **egui** for the UI, and the plan covers the **whole prot
 | Checkpoint | Not built. |
 | Permissions | None. Anyone holding the session token is equal, including force-release. |
 | Determinism | Built-in synth is bit-exact per sample rate on x86-64 Linux and Windows, enforced by a golden-hash test. Each built-in carries a `dsp_version`; behaviour changes need a new version. |
-| Audio codec | FLAC (pure Rust: `flacenc` to encode, `symphonia` to decode). 16-bit for changelog samples, 24-bit for stems, both 48 kHz stereo. Opus is a later size optimisation. |
+| Audio codec | FLAC (pure Rust: `flacenc` to encode, `claxon` to decode; built in M4 after `symphonia` 0.5 refused to probe `flacenc` output that `ffprobe` reads fine). 16-bit for changelog samples, 24-bit for stems, both 48 kHz stereo. Opus is a later size optimisation. |
 | Server storage | SQLite (`rusqlite`, bundled) for events and snapshots; blobs on disk addressed by BLAKE3 hash. |
 | Audio I/O | cpal 0.18: `pipewire` and `jack` features on Linux, WASAPI on Windows. |
 | Plugin hosting | `clack-host` + `clack-extensions` 0.2 (both on crates.io). Spiked first; JUCE engine remains the fallback. |
@@ -42,7 +42,7 @@ Cargo workspace, edition 2024, working name `mdaw`.
 | `mdaw-proto` | Wire messages, events, framing codec. | `postcard`, `blake3` |
 | `mdaw-sync` | Client replica state machine (confirmed + pending = view), checkout workspace, undo. Pure: messages in, messages out. | model, proto |
 | `mdaw-dsp` | Built-in synth "Pocket", tempo-map compiler, graph `process`, offline render. No device I/O. | `libm` |
-| `mdaw-engine` | cpal stream, RT thread, transport, CLAP hosting, stem playback, preview bus, FLAC encode/decode. | `cpal`, `rtrb`, `clack-*`, `flacenc`, `symphonia`, `rubato`, `midir` |
+| `mdaw-engine` | cpal stream, RT thread, transport, CLAP hosting, stem playback, preview bus, FLAC encode/decode. | `cpal`, `rtrb`, `clack-*`, `flacenc`, `claxon`, `rubato`, `midir` |
 | `mdaw-net` | quinn setup, cert pinning, frame streams, blob transfer, clock sync. | `quinn`, `rustls`, `rcgen`, `tokio` |
 | `mdaw-server` | Binary: project actor, sequencing, persistence, blob store, leases, MIDI relay. | `rusqlite`, net, proto, model |
 | `mdaw-client` | Binary `mdaw`: egui app, controller, glue. Also exposes a headless client for tests. | `eframe`, sync, engine, net |

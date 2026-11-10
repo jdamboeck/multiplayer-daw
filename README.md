@@ -18,7 +18,11 @@ Prototype of a server/client DAW for collaborative editing. Working name.
   against a concurrent one.
 - **M3** done: shared clock and transport. Play, stop, seek and loop are for everyone at once, on the
   same sample as far as the clocks allow; a client can unlink to play on its own.
-- **M4** (checkout, commit and changelog samples) is next.
+- **M4** done: checkout, commit and changelog samples. A track can be checked out and worked on
+  alone, then committed with rendered samples that everyone can play from the changelog; tempo
+  changes during a checkout can be undone by the commit, and a checkout someone else ends leaves
+  its owner a fork.
+- **M5** (live MIDI) is next.
 
 ## Run
 

@@ -1,11 +1,11 @@
 # mdaw protocol
 
-What client and server say to each other, as built. Protocol version **2**. The types live in
+What client and server say to each other, as built. Protocol version **3**. The types live in
 `mdaw-proto` (`lib.rs` for events, `wire.rs` for messages, `transport.rs` for the transport and
 datagrams) and in `mdaw-model` (ops); this text explains the rules around them. It covers what
-exists after milestone M3: the state plane with live edits, and the shared clock and transport.
-Checkout and commit, blobs and live MIDI are in `docs/plan.md` and get their sections here when
-they are built.
+exists after milestone M4: the state plane with live edits, the shared clock and transport, and
+checkout and commit with blobs and changelog samples. Live MIDI is in `docs/plan.md` and gets its
+section here when it is built.
 
 ## Connection
 
@@ -15,9 +15,11 @@ they are built.
   fingerprint is in the join string.
 - Join string: `mdaw://<host>:<port>?fp=<64 hex digits>&token=<secret>`. The token is the session
   secret; everyone who holds it has the same rights.
-- The client opens one bidirectional stream, the control stream. Each direction is a sequence of
-  frames: a `u32` little-endian length, then that many bytes of postcard. Frames above 16 MiB are
-  an error and end the connection.
+- The first bidirectional stream the client opens is the control stream. Each direction is a
+  sequence of frames: a `u32` little-endian length, then that many bytes of postcard. Frames above
+  16 MiB are an error and end the connection.
+- Every further stream the client opens carries one blob (see "Blobs"). The server serves them
+  only after the `Welcome`.
 
 ## Joining
 
@@ -35,7 +37,7 @@ trims it, drops control characters, cuts it to 32 characters and calls an empty 
 The server answers with one of:
 
 ```
-Welcome { actor, user, session_secret, head_seq, sync, acked, peers, transport }
+Welcome { actor, user, session_secret, head_seq, sync, acked, peers, transport, history, stale }
 Refused(BadToken | ProtoVersion(server's) | Protocol)      // then the server closes
 ```
 
@@ -45,6 +47,10 @@ Refused(BadToken | ProtoVersion(server's) | Protocol)      // then the server cl
   `last_seq`.
 - `session_secret` proves on the next connection that the previous one was this client's.
 - `transport` is the shared transport as it is now (see "Clock and transport").
+- `history`, with a snapshot only: the last 200 events the changelog shows (everything but live
+  edits that displaced nothing), so a new client sees recent commits and their samples. Their
+  effect is in the snapshot already; the client does not apply them.
+- `stale`: the checkouts whose lease ran out (see "Checkout and commit").
 
 ### Resuming
 
@@ -214,6 +220,112 @@ Transport { state: TransportState, by: Option<ActorId> }    // server to everyon
   and are not sent. Linked again, the client takes up the shared state. A client whose
   connection is down, or that has no clock estimate yet, behaves as unlinked until it has both.
 
+## Checkout and commit
+
+A user can take a track's contents out of live editing, work on them alone, and hand the result
+in as one commit. While the checkout lasts, everyone else hears and sees the contents as they
+were, and cannot change them.
+
+```
+// client to server
+Checkout { track }                 LeaseRenew { track }
+Release { track }                  ForceRelease { track }
+Commit(CommitRequest { track, ops, project_fix, stem, entry })
+Attach { entry_seq, sample }
+
+// server to everyone, as events
+EventBody::Checkout { track }
+EventBody::Commit { track, ops, project_fix, stem, entry: ChangelogEntry }
+EventBody::Release { track, reason: Abandoned | Forced { owner } }
+EventBody::Attach { entry_seq, sample }
+
+// server to the asker, when a request is turned down
+Denied { request: Checkout(track) | Release(track) | ForceRelease(track) | Commit(track) | Attach(seq), reason }
+
+ChangelogEntry { summary, ranges: Vec<TickRange>, samples: Vec<Sample> }
+Sample { kind: Solo | InContext | Before | ProjectBase | ProjectCurrent, blob, range, ms }
+```
+
+Every client folds these events into its document with the same function as the server
+(`mdaw_proto::apply_event`): a `Checkout` sets the track's `checkout` to the event's user and
+seq, a `Commit` applies `ops` and then `project_fix`, sets the stem and clears the checkout, a
+`Release` clears the checkout. A checkout is owned by a user, not a connection, so it survives
+reconnects and restarts on both sides.
+
+The server's rules:
+
+- **Checkout** needs the track to exist and not be checked out.
+- **Live edits** of a checked-out track's contents are rejected for everyone, the owner included.
+  Its shell (name, colour) and position stay live. Removing the track is allowed to its owner
+  only.
+- **Commit** is accepted only from the owner. Its `ops` must all be content ops of that track,
+  its `project_fix` ops project-scope ops. Every blob it names must be on the server already: the
+  samples, the stem, the state of CLAP devices. A track that ends up with a CLAP device needs a
+  stem (M6). The contents could not change since the checkout, so a commit is a fast-forward.
+- **Release** ends the sender's own checkout and keeps the contents as they were.
+  **ForceRelease** ends anyone's; the event records whose it was.
+- **Attach** adds a sample to an earlier entry; the blob must be on the server.
+
+**Leases.** The owner's client sends `LeaseRenew` every 10 s. A checkout without one for 60 s is
+stale: the server sends everyone `Stale(tracks)` whenever that set changes, and clients show it.
+Nothing is released automatically. After a server restart every checkout gets a fresh lease.
+
+### What the client does
+
+- **Workspace.** On its user's `Checkout` event the client starts a workspace for the track: a
+  journal of ops and the tempo points at that moment. Edits of the track's contents go into the
+  journal instead of a transaction and are not sent; the view shows the confirmed contents with
+  the journal applied. Undo works across journal and live edits alike. The journal is written to
+  the profile (`projects/<server>/checkouts/`) after every change, and picked up again when the
+  client starts and finds the checkout still its own.
+- **Commit.** Starting a commit freezes the workspace. A worker thread renders the samples (see
+  below) and the client shows them in the commit dialog. On the user's decision it uploads the
+  blobs, sends `Commit` once all are stored, and sends it again on a new connection until the
+  `Commit` event arrives or the server says `Denied`. Cancelling the dialog unfreezes the
+  workspace.
+- **Tempo conflict.** If the tempo at any point inside the track's extent differs from the tempo
+  at checkout, the dialog offers *Commit as is* and *Commit and restore the old tempo*. The second
+  sends the ops that turn the current tempo points into the old ones as `project_fix`, applied in
+  the same event.
+- **Forced release.** When someone else ends the checkout, the journal applied to the old
+  contents is saved as a fork (`projects/<server>/forks/`). The changelog offers to add it to the
+  project as a new track. A dropped checkout (the owner's own `Release`) throws the journal away.
+- **Others' checkouts** are drawn dimmed with the owner's name, and edits of them are refused in
+  the client already. Anyone can end them, after a confirmation.
+- **Displaced edits.** When an event displaces an edit of this client's user (see "Concurrent
+  edits"), the client renders the track alone as it sounded with that edit and attaches it to the
+  event as a `Before` sample.
+
+### Samples
+
+Rendered offline at 48 kHz with the same graph as playback, then encoded as 16-bit stereo FLAC.
+The range is the union of the changed ranges grown to whole bars, at most 8 bars; without a
+changed range (mix or device edits), the 4 bars from the first bar with a note. A track without
+notes gets no samples. A commit carries:
+
+- `Solo`: the track alone, and `InContext`: all tracks, if every other track can be rendered here
+  (no CLAP devices; stems come with M6).
+- With a tempo conflict also `ProjectBase` (old tempo) and `ProjectCurrent` (tempo now), all
+  tracks. With the old tempo restored, `Solo` and `InContext` are rendered with it.
+
+Other clients download a sample when it is first played, decode it, resample it to the output
+rate, and play it on the engine's preview bus, beside the transport.
+
+## Blobs
+
+Audio and plugin state travel as blobs, named by the BLAKE3 hash of their bytes. Each transfer
+has a stream of its own, so a large upload never holds up the control stream:
+
+```
+BlobRequest::Put { hash, len }  ->  Send | Stored | Refused;  bytes, finish  ->  Stored | Refused
+BlobRequest::Get { hash }       ->  Found { len } + bytes | Missing
+```
+
+The server answers `Stored` at once if it has the blob, checks that uploaded bytes hash to the
+announced hash, and refuses blobs over 256 MiB. The client checks the hash of every download.
+Blobs are kept as files under `blobs/` in the data directory, written aside and renamed, and are
+never deleted.
+
 ## Server storage
 
 One SQLite database (`project.db`, WAL mode) in the data directory, next to the certificate
@@ -225,6 +337,8 @@ One SQLite database (`project.db`, WAL mode) in the data directory, next to the 
 | `snapshots(seq, data)` | The document every 1000 events, to shorten loading. |
 | `users(id, key, name)` | `UserId` per install key. |
 | `meta(key, value)` | Format version, session token, the key session secrets are derived from, actor counter. |
+
+Blobs are files in `blobs/`, named by their hash in hex.
 
 The format entry is `<store version>/<protocol version>`. A database with another format is not
 opened; the prototype has no migrations, so a breaking change means a new data directory.
