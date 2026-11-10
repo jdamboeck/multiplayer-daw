@@ -566,3 +566,29 @@ fn a_real_time_manual_engine_keeps_time() {
     );
     assert_eq!(engine.stats().resyncs, 0);
 }
+
+#[test]
+fn a_preview_plays_beside_the_transport_and_ends() {
+    let mut engine = Engine::manual(SR, false);
+    engine.set_project(&Project::default());
+    let audio: std::sync::Arc<[f32]> = vec![0.25f32; 1000 * 2].into();
+    let id = engine.preview(audio);
+    assert_eq!(engine.preview_position(id), Some(0.0));
+    let out = engine.pump(600).unwrap();
+    assert!(
+        out.iter().all(|s| *s == 0.25),
+        "the preview is heard while stopped"
+    );
+    assert_eq!(engine.preview_position(id), Some(600.0 / SR as f64));
+    let out = engine.pump(600).unwrap();
+    assert!(out[..800].iter().all(|s| *s == 0.25));
+    assert!(out[800..].iter().all(|s| *s == 0.0));
+    engine.tick();
+    assert_eq!(engine.preview_position(id), None, "over");
+
+    let id = engine.preview(vec![0.5f32; 4000].into());
+    engine.pump(10).unwrap();
+    engine.stop_preview();
+    assert!(engine.pump(10).unwrap().iter().all(|s| *s == 0.0));
+    assert_eq!(engine.preview_position(id), None);
+}

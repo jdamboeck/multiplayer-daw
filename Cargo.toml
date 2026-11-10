@@ -37,6 +37,8 @@ rcgen = "0.14"
 sha2 = "0.11"
 getrandom = "0.4"
 rusqlite = { version = "0.41", features = ["bundled"] }
+flacenc = { version = "0.5", default-features = false }
+claxon = "0.4"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

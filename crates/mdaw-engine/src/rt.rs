@@ -53,6 +53,13 @@ pub(crate) enum Command {
         key: u64,
     },
     Panic,
+    /// Play a piece of audio on its own, beside the transport: interleaved stereo at the
+    /// engine's rate. `None` stops what plays. The control side keeps a reference to the audio
+    /// until `Shared::preview_id` has moved past `id`, so the audio thread never frees it.
+    Preview {
+        id: u64,
+        audio: Option<Arc<[f32]>>,
+    },
 }
 
 /// What the audio thread publishes for everyone else.
@@ -77,6 +84,10 @@ pub(crate) struct Shared {
     pub drift_micros: AtomicI64,
     /// Jumps made to get back in step.
     pub resyncs: AtomicU64,
+    /// The `id` of the last preview command taken.
+    pub preview_id: AtomicU64,
+    /// Frames of the preview played so far, or `u64::MAX` once it is over or stopped.
+    pub preview_pos: AtomicU64,
 }
 
 pub(crate) struct RtCore {
@@ -97,6 +108,9 @@ pub(crate) struct RtCore {
     /// Buffers in a row that began with too much drift.
     adrift: u32,
     scratch: [f32; MAX_BLOCK * 2],
+    preview: Option<Arc<[f32]>>,
+    /// Next sample of `preview` to play.
+    preview_at: usize,
 }
 
 impl RtCore {
@@ -120,6 +134,8 @@ impl RtCore {
             start_in: None,
             adrift: 0,
             scratch: [0.0; MAX_BLOCK * 2],
+            preview: None,
+            preview_at: 0,
         }
     }
 
@@ -186,6 +202,12 @@ impl RtCore {
             } => self.graph.note_on(track, key, pitch, vel),
             Command::NoteOff { track, key } => self.graph.note_off(track, key),
             Command::Panic => self.graph.release_all_notes(),
+            Command::Preview { id, audio } => {
+                // Dropping the old audio frees nothing: the control side still holds it.
+                self.preview = audio;
+                self.preview_at = 0;
+                self.shared.preview_id.store(id, Relaxed);
+            }
         }
     }
 
@@ -299,6 +321,19 @@ impl RtCore {
             frames = frames.min((end - pos) as usize);
         }
         self.graph.process(pos, &mut self.scratch[..frames * 2]);
+        if let Some(preview) = &self.preview {
+            let left = preview.len().saturating_sub(self.preview_at).min(frames * 2);
+            for (out, sample) in self.scratch[..left]
+                .iter_mut()
+                .zip(&preview[self.preview_at..self.preview_at + left])
+            {
+                *out += sample;
+            }
+            self.preview_at += left;
+            if self.preview_at >= preview.len() {
+                self.preview = None;
+            }
+        }
         if self.playing {
             self.pos += frames as i64;
             if let Some((start, end)) = self.loop_samples
@@ -362,6 +397,11 @@ impl RtCore {
             // Positive floats order like their bit patterns.
             slot.fetch_max(value.to_bits(), Relaxed);
         }
+        let preview_pos = match self.preview {
+            Some(_) => (self.preview_at / 2) as u64,
+            None => u64::MAX,
+        };
+        shared.preview_pos.store(preview_pos, Relaxed);
         shared.callbacks.fetch_add(1, Relaxed);
         shared.frames.fetch_add(total, Relaxed);
     }

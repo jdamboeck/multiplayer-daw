@@ -84,6 +84,10 @@ pub struct Engine {
     waiting: Option<Project>,
     playing: bool,
     backend: Backend,
+    /// The `id` of the last preview sent.
+    preview_seq: u64,
+    /// Previews the audio thread may still hold, by `id`.
+    previews: Vec<(u64, Arc<[f32]>)>,
 }
 
 struct Parts {
@@ -208,6 +212,8 @@ impl Engine {
             waiting: None,
             playing: false,
             backend,
+            preview_seq: 0,
+            previews: Vec::new(),
         }
     }
 
@@ -236,6 +242,9 @@ impl Engine {
             drop(graph);
             self.graphs_in_flight = self.graphs_in_flight.saturating_sub(1);
         }
+        // The audio thread takes previews in order: older ones than its current are let go.
+        let taken = self.shared.preview_id.load(Relaxed);
+        self.previews.retain(|(id, _)| *id >= taken);
         self.flush();
         if let Backend::Manual { core, clock } = &mut self.backend
             && clock.real_time
@@ -369,6 +378,40 @@ impl Engine {
     /// Ends every sounding note.
     pub fn panic(&mut self) {
         self.send(Command::Panic);
+    }
+
+    /// Plays interleaved stereo at the engine's rate on its own, beside whatever else plays,
+    /// replacing an earlier preview. Returns an `id` for [`Engine::preview_position`].
+    pub fn preview(&mut self, audio: Arc<[f32]>) -> u64 {
+        self.preview_seq += 1;
+        let id = self.preview_seq;
+        self.previews.push((id, audio.clone()));
+        self.send(Command::Preview {
+            id,
+            audio: Some(audio),
+        });
+        id
+    }
+
+    pub fn stop_preview(&mut self) {
+        self.preview_seq += 1;
+        let id = self.preview_seq;
+        self.send(Command::Preview { id, audio: None });
+    }
+
+    /// How far preview `id` has played, in seconds. `None` once it is over, replaced or
+    /// stopped. A preview just started counts as at its beginning.
+    pub fn preview_position(&self, id: u64) -> Option<f64> {
+        if id != self.preview_seq {
+            return None;
+        }
+        if self.shared.preview_id.load(Relaxed) != id {
+            return Some(0.0);
+        }
+        match self.shared.preview_pos.load(Relaxed) {
+            u64::MAX => None,
+            frames => Some(frames as f64 / self.sample_rate as f64),
+        }
     }
 
     /// Playhead in ticks.
