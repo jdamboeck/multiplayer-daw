@@ -1,0 +1,16 @@
+[package]
+name = "mdaw-server"
+description = "Project server: sequencing, persistence, blob store and relays."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+mdaw-model.workspace = true
+mdaw-proto.workspace = true
+mdaw-net.workspace = true

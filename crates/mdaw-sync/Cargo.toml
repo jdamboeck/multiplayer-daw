@@ -1,0 +1,18 @@
+[package]
+name = "mdaw-sync"
+description = "Client replica state machine: confirmed + pending = view."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+mdaw-model.workspace = true
+mdaw-proto.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
