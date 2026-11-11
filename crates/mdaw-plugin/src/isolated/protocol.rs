@@ -33,7 +33,6 @@ pub enum Request {
         title: String,
     },
     CloseEditor,
-    Status,
     Quit,
 }
 
@@ -47,6 +46,7 @@ pub enum Reply {
     },
     Params(Vec<ParamInfo>, u32),
     State(Vec<u8>),
+    /// Unasked: the helper says how it is whenever that changes.
     Status {
         changed: bool,
         editor_open: bool,

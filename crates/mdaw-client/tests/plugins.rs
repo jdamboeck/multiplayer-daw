@@ -308,6 +308,15 @@ fn a_plugin_that_crashes_leaves_the_session_running_and_can_be_restarted() {
         .find(|p| p.id == TEST_SYNTH)
         .unwrap();
     assert!(session.add_plugin(track, &synth));
+    // A plugin in a helper starts on another thread; the window goes on meanwhile.
+    let asked = Instant::now();
+    session.frame();
+    assert!(
+        asked.elapsed() < Duration::from_millis(100),
+        "{:?}",
+        asked.elapsed()
+    );
+    assert_eq!(session.track_sound(track), TrackSound::Loading);
     until(&mut [&mut session], "the plugin runs", |s| {
         s[0].track_sound(track) == TrackSound::Live
     });

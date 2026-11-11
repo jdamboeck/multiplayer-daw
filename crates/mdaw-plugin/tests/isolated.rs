@@ -221,3 +221,16 @@ fn a_plugin_that_hangs_in_its_processing_is_ended() {
         "not before it has hung a while"
     );
 }
+
+#[test]
+fn letting_a_helper_go_does_not_wait_for_it() {
+    let mut host = host();
+    let synth = synth(&mut host, true);
+    let started = Instant::now();
+    drop(synth);
+    assert!(
+        started.elapsed() < Duration::from_millis(20),
+        "{:?}",
+        started.elapsed()
+    );
+}

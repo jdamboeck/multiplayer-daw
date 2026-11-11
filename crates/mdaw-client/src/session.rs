@@ -580,7 +580,12 @@ impl Session {
     /// Hosts plugins from now on: tracks with plugins installed here are heard live, the others
     /// from their stems. Without this, every track with plugins plays its stem.
     pub fn enable_plugins(&mut self, host: mdaw_plugin::Host) {
-        self.plugins.0.borrow_mut().set_host(Some(host));
+        let mut plugins = self.plugins.0.borrow_mut();
+        plugins.set_host(Some(host));
+        if let Some(waker) = &self.waker {
+            plugins.set_waker(waker.clone());
+        }
+        drop(plugins);
         self.engine.refresh();
     }
 
@@ -715,9 +720,7 @@ impl Session {
         if self.locked(track).is_some() {
             return;
         }
-        if let Some(instance) = self.plugins.0.borrow_mut().instance(track, device) {
-            instance.set_param(param, value);
-        }
+        self.plugins.0.borrow_mut().set_param(track, device, param, value);
     }
 
     /// Opens or closes a plugin's own window.

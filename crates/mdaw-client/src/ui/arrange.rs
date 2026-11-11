@@ -685,6 +685,7 @@ fn header(app: &mut DawApp, ui: &mut Ui, rect: Rect, clip: Rect, id: TrackId, tr
                 TrackSound::Silent => Some(("no sound here", theme::WARN)),
                 TrackSound::Crashed { stem: true } => Some(("plugin crashed, stem plays", theme::METER_HOT)),
                 TrackSound::Crashed { stem: false } => Some(("plugin crashed", theme::METER_HOT)),
+                TrackSound::Loading => Some(("loading plugin…", theme::TEXT_DIM)),
             };
             if let Some((label, color)) = sound {
                 text.text(

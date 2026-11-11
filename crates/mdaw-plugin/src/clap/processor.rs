@@ -8,6 +8,8 @@ use clack_host::events::{EventFlags, EventHeader, Pckn};
 use clack_host::prelude::*;
 use clack_host::utils::{BeatTime, Cookie, SecondsTime};
 use mdaw_dsp::{BlockTime, ExternalDevice};
+use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::mpsc::Sender;
 
@@ -37,6 +39,8 @@ pub struct ParamChange {
     pub id: ClapId,
     pub cookie: Cookie,
     pub value: f64,
+    /// Which reading of the plugin's parameters the cookie is from.
+    pub generation: u32,
 }
 
 /// The audio ports of one direction, with buffers for their channels.
@@ -70,6 +74,9 @@ pub struct ClapProcessor {
     events_in: EventBuffer,
     events_out: EventBuffer,
     params: rtrb::Consumer<ParamChange>,
+    /// The reading of the plugin's parameters that is current: cookies from an earlier one are
+    /// no longer the plugin's.
+    generation: Arc<AtomicU32>,
     /// Sounding notes: the graph's key, the pitch, and the note id given to the plugin.
     notes: [Option<(u64, u8, u32)>; NOTES],
     /// Note events for the next block, in the order of their offsets.
@@ -89,6 +96,7 @@ impl ClapProcessor {
         inputs: Ports,
         outputs: Ports,
         params: rtrb::Consumer<ParamChange>,
+        generation: Arc<AtomicU32>,
         max_block: usize,
     ) -> Self {
         Self {
@@ -99,6 +107,7 @@ impl ClapProcessor {
             events_in: EventBuffer::with_capacity(EVENTS as usize),
             events_out: EventBuffer::with_capacity(EVENTS as usize),
             params,
+            generation,
             notes: [None; NOTES],
             pending: [Pending::default(); PENDING],
             pending_len: 0,
@@ -278,13 +287,18 @@ impl ExternalDevice for ClapProcessor {
         let frames = left.len().min(self.max_block);
         // Parameters at the block's start, then the notes in time order.
         self.events_in.clear();
+        let generation = self.generation.load(Relaxed);
         while let Ok(change) = self.params.pop() {
             if self.events_in.len() >= EVENTS {
                 break;
             }
+            if change.generation != generation {
+                // Made before the plugin changed its parameters: its cookie may be gone.
+                continue;
+            }
             let event = ParamValueEvent::new(0, change.id, Pckn::match_all(), change.value);
-            // SAFETY: the cookie came from this plugin's `get_info` for this parameter, and the
-            // host never asks it to rescan its parameters.
+            // SAFETY: the cookie came from this plugin's `get_info` for this parameter, in the
+            // reading of its parameters that is still current.
             self.events_in.push(&unsafe { event.with_cookie(change.cookie) });
         }
         self.push_pending(frames);

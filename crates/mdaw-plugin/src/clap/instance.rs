@@ -10,6 +10,8 @@ use clack_extensions::render::RenderMode;
 use clack_host::prelude::*;
 use clack_host::utils::Cookie;
 use std::ffi::CString;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::mpsc::{Receiver, channel};
 use std::time::Instant;
@@ -25,6 +27,8 @@ pub struct ClapInstance {
     /// them. Values are read when asked for.
     params: Vec<(ParamInfo, Cookie)>,
     params_to_audio: rtrb::Producer<ParamChange>,
+    /// Counts the readings of the plugin's parameters, shared with the processor.
+    generation: Arc<AtomicU32>,
     back: Receiver<StoppedPluginAudioProcessor<MdawHost>>,
     /// The processor, until it is taken.
     processor: Option<Box<ClapProcessor>>,
@@ -95,12 +99,14 @@ impl ClapInstance {
             .map_err(|e| error(format!("activating {}: {e}", info.name)))?;
         let (to_audio, from_main) = rtrb::RingBuffer::new(PARAM_CHANGES);
         let (back_tx, back) = channel();
+        let generation = Arc::new(AtomicU32::new(0));
         let processor = ClapProcessor::new(
             stopped.into(),
             back_tx,
             Ports::new(&in_channels, in_main, settings.max_block),
             Ports::new(&out_channels, out_main, settings.max_block),
             from_main,
+            generation.clone(),
             settings.max_block,
         );
         let mut made = Self {
@@ -108,6 +114,7 @@ impl ClapInstance {
             instance,
             exts,
             params: Vec::new(),
+            generation,
             params_to_audio: to_audio,
             back,
             processor: Some(Box::new(processor)),
@@ -287,11 +294,14 @@ impl Instance for ClapInstance {
             return;
         };
         let id = ClapId::new(id);
-        if self
-            .params_to_audio
-            .push(ParamChange { id, cookie, value })
-            .is_ok()
-        {
+        let generation = self.generation.load(Relaxed);
+        let change = ParamChange {
+            id,
+            cookie,
+            value,
+            generation,
+        };
+        if self.params_to_audio.push(change).is_ok() {
             self.set_changed(true);
         }
     }
@@ -336,6 +346,8 @@ impl Instance for ClapInstance {
     fn idle(&mut self) {
         self.pump();
         if self.instance.access_handler(|m| m.params_changed.replace(false)) {
+            // The cookies of changes still on their way are from the old reading.
+            self.generation.fetch_add(1, Relaxed);
             self.params = self.param_infos();
         }
         if let (Some(editor), Some(gui)) = (self.editor.as_mut(), self.exts.gui) {

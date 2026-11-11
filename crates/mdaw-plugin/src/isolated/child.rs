@@ -71,6 +71,8 @@ fn run(mut out: File) -> ExitCode {
         let _ = requests.send(Request::Quit);
     });
     let mut running: Option<Running> = None;
+    // What the DAW was last told about the instance.
+    let mut told = (false, false, 0u32);
     loop {
         let request = match inbox.recv_timeout(MAIN_LOOP) {
             Ok(request) => Some(request),
@@ -88,6 +90,24 @@ fn run(mut out: File) -> ExitCode {
         }
         if let Some(running) = running.as_mut() {
             running.instance.idle();
+            // Said unasked, so that the DAW never has to wait for it.
+            let instance = &running.instance;
+            let now = (
+                instance.changed(),
+                instance.editor_open(),
+                instance.param_count() as u32,
+            );
+            if now != told {
+                told = now;
+                let status = Reply::Status {
+                    changed: now.0,
+                    editor_open: now.1,
+                    param_count: now.2,
+                };
+                if protocol::write(&mut out, &status).is_err() {
+                    break;
+                }
+            }
         }
     }
     if let Some(running) = running {
@@ -180,11 +200,6 @@ fn handle(running: &mut Option<Running>, request: Request) -> Reply {
             instance.close_editor();
             Reply::Done
         }
-        Request::Status => Reply::Status {
-            changed: instance.changed(),
-            editor_open: instance.editor_open(),
-            param_count: instance.param_count() as u32,
-        },
     }
 }
 

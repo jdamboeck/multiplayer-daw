@@ -10,11 +10,12 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::{Duration, Instant};
 
 use mdaw_dsp::{ExternalDevice, MAX_BLOCK, PluginRef, PluginSource};
 use mdaw_model::{BlobHash, DeviceId, DeviceKind, PluginFormat, Project, Stem, TrackId};
-use mdaw_plugin::{Host, Instance, ParamInfo, PluginInfo, Settings};
+use mdaw_plugin::{Host, Instance, ParamInfo, PluginInfo, Settings, Waker};
 
 /// A state saved from an instance: its hash and its bytes.
 pub type SavedState = (BlobHash, Arc<[u8]>);
@@ -40,7 +41,28 @@ pub enum TrackSound {
     Silent,
     /// A plugin crashed. The stem plays if there is one (`stem`), else the track is silent.
     Crashed { stem: bool },
+    /// A plugin is starting.
+    Loading,
 }
+
+/// An instance made on another thread, its settings loaded.
+struct Made {
+    instance: Box<dyn Instance + Send>,
+    baseline: Option<BlobHash>,
+    /// It was given settings kept aside, not the document's.
+    kept: bool,
+}
+
+/// An instance being made on another thread, for this state of the document.
+struct Starting {
+    state: Option<BlobHash>,
+    /// The plugin's name, for what is said if it fails.
+    name: String,
+    result: Receiver<Result<Made, String>>,
+}
+
+/// How long parameter values read for the panel are good for.
+const PARAMS_FRESH: Duration = Duration::from_millis(100);
 
 /// How often the settings of a plugin that changed are kept aside, for when it crashes.
 const KEEP_EVERY: Duration = Duration::from_secs(2);
@@ -81,6 +103,13 @@ pub struct Plugins {
     /// The settings of instances as last kept aside, to come back with after a crash.
     kept: HashMap<(TrackId, DeviceId), Arc<[u8]>>,
     kept_at: Instant,
+    /// Instances being made on other threads, and those made, waiting for the graph.
+    starting: HashMap<(TrackId, DeviceId), Starting>,
+    ready: HashMap<(TrackId, DeviceId), (Option<BlobHash>, Made)>,
+    /// Wakes the main loop from other threads.
+    waker: Option<Waker>,
+    /// Parameters as last read, for the panel.
+    params: HashMap<(TrackId, DeviceId), (Instant, Vec<ParamInfo>, usize)>,
 }
 
 impl Plugins {
@@ -98,12 +127,27 @@ impl Plugins {
             editable: HashSet::new(),
             kept: HashMap::new(),
             kept_at: Instant::now(),
+            starting: HashMap::new(),
+            ready: HashMap::new(),
+            waker: None,
+            params: HashMap::new(),
         }
+    }
+
+    /// Who to wake when a plugin has something for the main loop.
+    pub fn set_waker(&mut self, waker: Waker) {
+        if let Some(host) = self.host.as_mut() {
+            host.set_waker(waker.clone());
+        }
+        self.waker = Some(waker);
     }
 
     pub fn set_host(&mut self, host: Option<Host>) {
         self.close_all();
         self.host = host;
+        if let (Some(host), Some(waker)) = (self.host.as_mut(), self.waker.clone()) {
+            host.set_waker(waker);
+        }
         self.dirty = true;
     }
 
@@ -183,9 +227,19 @@ impl Plugins {
                 _ => gone.push((track, device)),
             }
         }
+        // Instances on their way for devices that are gone are let go when they come.
+        let exists = |key: &(TrackId, DeviceId)| {
+            project
+                .track(key.0)
+                .and_then(|t| t.content.device(key.1))
+                .is_some()
+        };
+        self.starting.retain(|key, _| exists(key));
+        self.ready.retain(|key, _| exists(key));
         for key in gone.iter().chain(&renew) {
             // What was kept aside is of another state than the document's now.
             self.kept.remove(key);
+            self.params.remove(key);
             if let Some(running) = self.running.remove(key)
                 && let Some(host) = self.host.as_mut()
             {
@@ -201,6 +255,34 @@ impl Plugins {
     pub fn idle(&mut self) -> Vec<((TrackId, DeviceId), String)> {
         for running in self.running.values_mut() {
             running.instance.idle();
+        }
+        let mut done = Vec::new();
+        for (key, starting) in &self.starting {
+            match starting.result.try_recv() {
+                Ok(result) => done.push((*key, Some(result))),
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => done.push((*key, None)),
+            }
+        }
+        for (key, result) in done {
+            let Some(starting) = self.starting.remove(&key) else {
+                continue;
+            };
+            match result {
+                Some(Ok(made)) => {
+                    self.ready.insert(key, (starting.state, made));
+                }
+                Some(Err(text)) => {
+                    self.crashed.insert(key, starting.name);
+                    self.failures.push((key, text));
+                }
+                None => {
+                    self.failures
+                        .push((key, format!("{} did not start.", starting.name)));
+                    self.crashed.insert(key, starting.name);
+                }
+            }
+            self.dirty = true;
         }
         let crashed: Vec<(TrackId, DeviceId)> = self
             .running
@@ -287,6 +369,12 @@ impl Plugins {
             let stem = t.stem.is_some_and(|s| self.stems.contains_key(&s.blob));
             return TrackSound::Crashed { stem };
         }
+        let loading = |d: &mdaw_model::Device| {
+            self.starting.contains_key(&(track, d.id)) || self.ready.contains_key(&(track, d.id))
+        };
+        if t.content.devices.iter().any(loading) {
+            return TrackSound::Loading;
+        }
         let live = t
             .content
             .devices
@@ -316,15 +404,41 @@ impl Plugins {
         device: DeviceId,
         limit: usize,
     ) -> Option<(Vec<ParamInfo>, usize)> {
+        // Read again only now and then: for a plugin in a helper each read is a message.
+        if let Some((at, params, count)) = self.params.get(&(track, device))
+            && at.elapsed() < PARAMS_FRESH
+            && params.len() >= limit.min(*count)
+        {
+            return Some((params.iter().take(limit).cloned().collect(), *count));
+        }
         let instance = self.instance(track, device)?;
-        Some((instance.params(limit), instance.param_count()))
+        let (params, count) = (instance.params(limit), instance.param_count());
+        self.params
+            .insert((track, device), (Instant::now(), params.clone(), count));
+        Some((params, count))
     }
 
-    /// Whether any instance runs here, and whether one has its window open.
+    /// Sets a parameter of a running instance, as a user turning its knob.
+    pub fn set_param(&mut self, track: TrackId, device: DeviceId, param: u32, value: f64) {
+        self.params.remove(&(track, device));
+        if let Some(instance) = self.instance(track, device) {
+            instance.set_param(param, value);
+        }
+    }
+
+    /// Whether the main loop has to run often for the plugins: some run on its thread (and with
+    /// their window open, very often), or some are starting and nobody wakes it when they are
+    /// done.
     pub fn activity(&self) -> (bool, bool) {
-        let running = !self.running.is_empty();
-        let editor = self.running.values().any(|r| r.instance.editor_open());
-        (running, editor)
+        let here = self.running.values().filter(|r| r.instance.needs_main_loop());
+        let (mut running, mut editor) = (false, false);
+        for r in here {
+            running = true;
+            editor |= r.instance.editor_open();
+        }
+        let unwoken = self.waker.is_none()
+            && (!self.starting.is_empty() || self.running.values().any(|r| !r.instance.needs_main_loop()));
+        (running || unwoken, editor)
     }
 
     /// Saves the state of a running instance if it changed since it was made or last saved, or
@@ -394,6 +508,76 @@ impl PluginSource for Plugins {
         let name = host
             .find(plugin.format, plugin.id)
             .map_or_else(|| plugin.id.to_string(), |p| p.name.clone());
+        let key = (track, device);
+        // Made on another thread, and now ready for the graph.
+        if let Some((made_for, made)) = self.ready.remove(&key) {
+            let mut instance: Box<dyn Instance> = made.instance;
+            if made_for == plugin.state
+                && let Some(processor) = instance.take_processor()
+            {
+                self.running.insert(
+                    key,
+                    Running {
+                        instance,
+                        state: plugin.state,
+                        unsaved: made.kept,
+                        baseline: made.baseline,
+                    },
+                );
+                return Some(processor);
+            }
+            if let Some(host) = self.host.as_mut() {
+                host.dispose(instance);
+            }
+        }
+        if self.starting.get(&key).is_some_and(|s| s.state == plugin.state) {
+            return None;
+        }
+        let host = self.host.as_mut()?;
+        // Plugins in helpers are started on another thread, several at once, and the graph
+        // goes on without them until they are there.
+        match host.create_later(plugin.format, plugin.id, settings) {
+            Some(Ok(creation)) => {
+                let (tx, result) = channel();
+                let settings_bytes = kept.clone().or(state.clone());
+                let (waker, called, kept_used) = (self.waker.clone(), name.clone(), kept.is_some());
+                std::thread::spawn(move || {
+                    let made = (|| {
+                        let mut instance = creation().map_err(|e| format!("{called} did not start: {e}."))?;
+                        if let Some(bytes) = &settings_bytes {
+                            instance
+                                .load_state(bytes)
+                                .map_err(|e| format!("{called} did not take its settings: {e}."))?;
+                        }
+                        let baseline = instance.save_state().ok().map(|b| mdaw_proto::blob_hash(&b));
+                        Ok(Made {
+                            instance,
+                            baseline,
+                            kept: kept_used,
+                        })
+                    })();
+                    let _ = tx.send(made);
+                    if let Some(waker) = waker {
+                        waker();
+                    }
+                });
+                self.starting.insert(
+                    key,
+                    Starting {
+                        state: plugin.state,
+                        name: name.clone(),
+                        result,
+                    },
+                );
+                return None;
+            }
+            Some(Err(err)) => {
+                self.crashed.insert(key, name.clone());
+                self.failures.push((key, format!("{name} did not start: {err}.")));
+                return None;
+            }
+            None => {}
+        }
         // A plugin that does not start, or will not take its settings, is not tried again on
         // every edit, and does not play with the wrong settings: like a crash, it waits for
         // Restart, and the stem plays.

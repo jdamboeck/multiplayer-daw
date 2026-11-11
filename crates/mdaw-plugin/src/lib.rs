@@ -73,6 +73,13 @@ pub(crate) fn error(what: impl fmt::Display) -> PluginError {
     PluginError(what.to_string())
 }
 
+/// Makes an instance on another thread: the long part of starting a plugin that runs in a
+/// process of its own.
+pub type Creation = Box<dyn FnOnce() -> Result<Box<dyn Instance + Send>, PluginError> + Send>;
+
+/// Called from other threads when a plugin has something for the main loop.
+pub type Waker = std::sync::Arc<dyn Fn() + Send + Sync>;
+
 /// One plugin format.
 pub trait Backend {
     fn format(&self) -> PluginFormat;
@@ -80,6 +87,13 @@ pub trait Backend {
     fn scan(&mut self) -> Vec<PluginInfo>;
     /// Makes a running instance of the plugin `id`, found by the last scan.
     fn create(&mut self, id: &str, settings: Settings) -> Result<Box<dyn Instance>, PluginError>;
+    /// As [`Backend::create`], to be run on another thread, if this backend can do that.
+    fn create_later(&mut self, _id: &str, _settings: Settings) -> Option<Result<Creation, PluginError>> {
+        None
+    }
+    /// Who to wake when one of its plugins has something for the main loop: crashed, changed
+    /// its settings, closed its window.
+    fn set_waker(&mut self, _waker: Waker) {}
 }
 
 /// A running plugin, on the thread that made it.
@@ -110,6 +124,11 @@ pub trait Instance {
     /// instance to hear it again.
     fn crashed(&self) -> bool {
         false
+    }
+    /// Whether the plugin needs this thread's main loop to run often (its window and timers live
+    /// here), or does that elsewhere and wakes it when it has something.
+    fn needs_main_loop(&self) -> bool {
+        true
     }
     /// What a plugin expects of the main loop: its timers, the callbacks it asked for, its
     /// window's events, taking back its processor. Call often, at least once per UI frame.
@@ -199,6 +218,32 @@ impl Host {
             .find(|b| b.format() == format)
             .ok_or_else(|| error(format!("no {} host", format.name())))?;
         backend.create(id, settings)
+    }
+
+    /// As [`Host::create`], to be run on another thread, if the plugin's backend can do that.
+    pub fn create_later(
+        &mut self,
+        format: PluginFormat,
+        id: &str,
+        settings: Settings,
+    ) -> Option<Result<Creation, PluginError>> {
+        if self.find(format, id).is_none() {
+            return Some(Err(PluginError(format!(
+                "{} plugin {id} is not installed",
+                format.name()
+            ))));
+        }
+        self.backends
+            .iter_mut()
+            .find(|b| b.format() == format)?
+            .create_later(id, settings)
+    }
+
+    /// Who to wake when a plugin has something for the main loop.
+    pub fn set_waker(&mut self, waker: Waker) {
+        for backend in &mut self.backends {
+            backend.set_waker(waker.clone());
+        }
     }
 
     /// Lets go of an instance. One whose processor is still out is kept until it is back.

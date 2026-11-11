@@ -3,22 +3,24 @@
 use super::protocol::{self, Reply, Request};
 use super::shm::{self, EVENTS, Event, NOTE_OFF, NOTE_ON, Shared};
 use crate::clap::plugin_files;
-use crate::{Backend, Instance, ParamInfo, PluginError, PluginFormat, PluginInfo, Settings, error};
+use crate::{
+    Backend, Creation, Instance, ParamInfo, PluginError, PluginFormat, PluginInfo, Settings, Waker, error,
+};
 use mdaw_dsp::{BlockTime, ExternalDevice, MAX_BLOCK};
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::process::{ChildStdin, Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::time::{Duration, Instant};
 
 /// How long a helper may take to answer the main thread before it counts as hung.
 const ANSWER: Duration = Duration::from_secs(5);
+/// The same for what can take long with a large plugin: starting, and its state.
+const LONG_ANSWER: Duration = Duration::from_secs(30);
 /// How long scanning one file may take.
 const SCAN: Duration = Duration::from_secs(20);
-/// How often an instance asks its helper how it is.
-const STATUS_EVERY: Duration = Duration::from_millis(50);
 /// What a helper gets for a block on top of the block's own length, for waking up.
 const SLACK: Duration = Duration::from_millis(2);
 /// How long an offline render waits for a block.
@@ -35,6 +37,7 @@ pub struct IsolatedBackend {
     builtin: bool,
     /// What was found, with the file it is in (`None`: built in).
     found: Vec<(PluginInfo, Option<PathBuf>)>,
+    waker: Option<Waker>,
 }
 
 impl IsolatedBackend {
@@ -45,6 +48,7 @@ impl IsolatedBackend {
             files: None,
             builtin,
             found: Vec::new(),
+            waker: None,
         }
     }
 
@@ -54,6 +58,7 @@ impl IsolatedBackend {
             files: Some(Vec::new()),
             builtin: true,
             found: Vec::new(),
+            waker: None,
         }
     }
 
@@ -124,8 +129,29 @@ impl Backend for IsolatedBackend {
             .iter()
             .find(|(p, _)| p.id == id)
             .ok_or_else(|| error(format!("CLAP plugin {id} is not installed")))?;
-        let instance = IsolatedInstance::start(&self.helper, file.as_deref(), id, settings)?;
+        let instance =
+            IsolatedInstance::start(&self.helper, file.as_deref(), id, settings, self.waker.clone())?;
         Ok(Box::new(instance))
+    }
+
+    fn create_later(&mut self, id: &str, settings: Settings) -> Option<Result<Creation, PluginError>> {
+        let Some((_, file)) = self.found.iter().find(|(p, _)| p.id == id) else {
+            return Some(Err(error(format!("CLAP plugin {id} is not installed"))));
+        };
+        let (helper, file, id, waker) = (
+            self.helper.clone(),
+            file.clone(),
+            id.to_string(),
+            self.waker.clone(),
+        );
+        Some(Ok(Box::new(move || {
+            let instance = IsolatedInstance::start(&helper, file.as_deref(), &id, settings, waker)?;
+            Ok(Box::new(instance) as Box<dyn Instance + Send>)
+        })))
+    }
+
+    fn set_waker(&mut self, waker: Waker) {
+        self.waker = Some(waker);
     }
 }
 
@@ -149,6 +175,14 @@ struct Helper {
     replies: Receiver<std::io::Result<Reply>>,
 }
 
+/// What the helper last said about itself, unasked.
+#[derive(Default)]
+struct Status {
+    changed: AtomicBool,
+    editor_open: AtomicBool,
+    param_count: AtomicU32,
+}
+
 /// An instance in a helper process.
 pub struct IsolatedInstance {
     info: PluginInfo,
@@ -160,17 +194,22 @@ pub struct IsolatedInstance {
     stuck_since: Arc<AtomicI64>,
     processor: Option<Box<IsolatedProcessor>>,
     has_editor: bool,
-    param_count: usize,
+    status: Arc<Status>,
+    /// A parameter was set from here since the helper last said it was unchanged.
     changed: bool,
-    editor_open: bool,
-    asked: Instant,
 }
 
 impl IsolatedInstance {
-    fn start(helper: &Path, file: Option<&Path>, id: &str, settings: Settings) -> Result<Self, PluginError> {
+    fn start(
+        helper: &Path,
+        file: Option<&Path>,
+        id: &str,
+        settings: Settings,
+        waker: Option<Waker>,
+    ) -> Result<Self, PluginError> {
         let path = block_path();
         let shared = Arc::new(Shared::create(&path).map_err(|e| error(format!("a shared block: {e}")))?);
-        let result = Self::spawn(helper, file, id, settings, &path, shared);
+        let result = Self::spawn(helper, file, id, settings, &path, shared, waker);
         // Both sides have it mapped, or it is of no use: the name can go.
         let _ = std::fs::remove_file(&path);
         result
@@ -183,6 +222,7 @@ impl IsolatedInstance {
         settings: Settings,
         path: &Path,
         shared: Arc<Shared>,
+        waker: Option<Waker>,
     ) -> Result<Self, PluginError> {
         let mut process = Command::new(helper)
             .arg("run")
@@ -195,19 +235,41 @@ impl IsolatedInstance {
         let (tx, replies) = channel();
         let dead = Arc::new(AtomicBool::new(false));
         let stuck_since = Arc::new(AtomicI64::new(0));
+        let status = Arc::new(Status::default());
         {
             // The helper's stdout ends the moment it does: whoever waits for its audio stops
-            // waiting at once.
-            let (dead, shared) = (dead.clone(), shared.clone());
+            // waiting at once. What it says about itself unasked is kept for the main thread,
+            // which is woken for it.
+            let (dead, shared, status) = (dead.clone(), shared.clone(), status.clone());
             std::thread::spawn(move || {
                 let mut stdout = BufReader::new(stdout);
+                let wake = || {
+                    if let Some(waker) = &waker {
+                        waker();
+                    }
+                };
                 loop {
                     let reply = protocol::read::<Reply>(&mut stdout);
-                    if reply.is_err() {
-                        dead.store(true, Ordering::Release);
-                        let done = &shared.block().done;
-                        done.fetch_add(1, Ordering::AcqRel);
-                        shm::wake(done);
+                    match &reply {
+                        Ok(Reply::Status {
+                            changed,
+                            editor_open,
+                            param_count,
+                        }) => {
+                            status.changed.store(*changed, Ordering::Release);
+                            status.editor_open.store(*editor_open, Ordering::Release);
+                            status.param_count.store(*param_count, Ordering::Release);
+                            wake();
+                            continue;
+                        }
+                        Ok(_) => {}
+                        Err(_) => {
+                            dead.store(true, Ordering::Release);
+                            let done = &shared.block().done;
+                            done.fetch_add(1, Ordering::AcqRel);
+                            shm::wake(done);
+                            wake();
+                        }
                     }
                     let end = reply.is_err();
                     if tx.send(reply).is_err() || end {
@@ -239,10 +301,8 @@ impl IsolatedInstance {
                 settings,
             ))),
             has_editor: false,
-            param_count: 0,
+            status,
             changed: false,
-            editor_open: false,
-            asked: Instant::now(),
         };
         let request = Request::Create {
             file: file.map(|f| f.display().to_string()),
@@ -250,7 +310,7 @@ impl IsolatedInstance {
             settings,
             shm: path.display().to_string(),
         };
-        match instance.ask(request) {
+        match instance.ask(request, LONG_ANSWER) {
             Some(Reply::Created {
                 info,
                 has_editor,
@@ -258,7 +318,7 @@ impl IsolatedInstance {
             }) => {
                 instance.info = info;
                 instance.has_editor = has_editor;
-                instance.param_count = param_count as usize;
+                instance.status.param_count.store(param_count, Ordering::Release);
                 Ok(instance)
             }
             Some(Reply::Error(e)) => Err(error(e)),
@@ -268,13 +328,13 @@ impl IsolatedInstance {
 
     /// Asks the helper and waits for the answer. `None`, and the helper is let go, if it does
     /// not answer in time or is gone.
-    fn ask(&mut self, request: Request) -> Option<Reply> {
+    fn ask(&mut self, request: Request, timeout: Duration) -> Option<Reply> {
         let helper = self.helper.as_mut()?;
         if protocol::write(&mut helper.stdin, &request).is_err() {
             self.lose();
             return None;
         }
-        match helper.replies.recv_timeout(ANSWER) {
+        match helper.replies.recv_timeout(timeout) {
             Ok(Ok(reply)) => Some(reply),
             Ok(Err(_)) | Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
                 self.lose();
@@ -286,7 +346,7 @@ impl IsolatedInstance {
     /// The helper crashed, hangs or is gone: it is ended, and the instance stays silent.
     fn lose(&mut self) {
         self.dead.store(true, Ordering::Release);
-        self.editor_open = false;
+        self.status.editor_open.store(false, Ordering::Release);
         if let Some(mut helper) = self.helper.take() {
             let _ = helper.process.kill();
             let _ = helper.process.wait();
@@ -308,7 +368,7 @@ impl Instance for IsolatedInstance {
     }
 
     fn save_state(&mut self) -> Result<Vec<u8>, PluginError> {
-        match self.ask(Request::SaveState) {
+        match self.ask(Request::SaveState, LONG_ANSWER) {
             Some(Reply::State(bytes)) => {
                 self.changed = false;
                 Ok(bytes)
@@ -319,7 +379,7 @@ impl Instance for IsolatedInstance {
     }
 
     fn load_state(&mut self, bytes: &[u8]) -> Result<(), PluginError> {
-        match self.ask(Request::LoadState(bytes.to_vec())) {
+        match self.ask(Request::LoadState(bytes.to_vec()), LONG_ANSWER) {
             Some(Reply::Done) => {
                 self.changed = false;
                 Ok(())
@@ -330,11 +390,12 @@ impl Instance for IsolatedInstance {
     }
 
     fn params(&mut self, limit: usize) -> Vec<ParamInfo> {
-        match self.ask(Request::Params {
+        let request = Request::Params {
             limit: limit.min(u32::MAX as usize) as u32,
-        }) {
+        };
+        match self.ask(request, ANSWER) {
             Some(Reply::Params(params, count)) => {
-                self.param_count = count as usize;
+                self.status.param_count.store(count, Ordering::Release);
                 params
             }
             _ => Vec::new(),
@@ -342,17 +403,17 @@ impl Instance for IsolatedInstance {
     }
 
     fn param_count(&self) -> usize {
-        self.param_count
+        self.status.param_count.load(Ordering::Acquire) as usize
     }
 
     fn set_param(&mut self, id: u32, value: f64) {
-        if let Some(Reply::Done) = self.ask(Request::SetParam { id, value }) {
+        if let Some(Reply::Done) = self.ask(Request::SetParam { id, value }, ANSWER) {
             self.changed = true;
         }
     }
 
     fn changed(&self) -> bool {
-        self.changed
+        self.changed || self.status.changed.load(Ordering::Acquire)
     }
 
     fn has_editor(&self) -> bool {
@@ -360,11 +421,12 @@ impl Instance for IsolatedInstance {
     }
 
     fn open_editor(&mut self, title: &str) -> Result<(), PluginError> {
-        match self.ask(Request::OpenEditor {
+        let request = Request::OpenEditor {
             title: title.to_string(),
-        }) {
+        };
+        match self.ask(request, LONG_ANSWER) {
             Some(Reply::Done) => {
-                self.editor_open = true;
+                self.status.editor_open.store(true, Ordering::Release);
                 Ok(())
             }
             Some(Reply::Error(e)) => Err(error(e)),
@@ -373,14 +435,14 @@ impl Instance for IsolatedInstance {
     }
 
     fn close_editor(&mut self) {
-        if self.editor_open {
-            self.ask(Request::CloseEditor);
+        if self.editor_open() {
+            self.ask(Request::CloseEditor, ANSWER);
         }
-        self.editor_open = false;
+        self.status.editor_open.store(false, Ordering::Release);
     }
 
     fn editor_open(&self) -> bool {
-        self.editor_open
+        self.status.editor_open.load(Ordering::Acquire)
     }
 
     fn idle(&mut self) {
@@ -397,25 +459,16 @@ impl Instance for IsolatedInstance {
         if stuck != 0 && mdaw_engine::clock::now_micros() - stuck > HUNG_MICROS {
             eprintln!("mdaw: {} stopped making sound and is ended", self.info.name);
             self.lose();
-            return;
-        }
-        if self.asked.elapsed() >= STATUS_EVERY {
-            self.asked = Instant::now();
-            if let Some(Reply::Status {
-                changed,
-                editor_open,
-                param_count,
-            }) = self.ask(Request::Status)
-            {
-                self.changed |= changed;
-                self.editor_open = editor_open;
-                self.param_count = param_count as usize;
-            }
         }
     }
 
     fn crashed(&self) -> bool {
         self.helper.is_none() || self.dead.load(Ordering::Acquire)
+    }
+
+    fn needs_main_loop(&self) -> bool {
+        // Its window and timers run in the helper, which says when it has something.
+        false
     }
 }
 
@@ -426,15 +479,18 @@ impl Drop for IsolatedInstance {
             return;
         };
         let _ = protocol::write(&mut helper.stdin, &Request::Quit);
-        let until = Instant::now() + Duration::from_millis(500);
-        while Instant::now() < until {
-            if !matches!(helper.process.try_wait(), Ok(None)) {
-                return;
+        // Waiting for it to finish is no business of the thread that let it go.
+        std::thread::spawn(move || {
+            let until = Instant::now() + Duration::from_millis(500);
+            while Instant::now() < until {
+                if !matches!(helper.process.try_wait(), Ok(None)) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(5));
             }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        let _ = helper.process.kill();
-        let _ = helper.process.wait();
+            let _ = helper.process.kill();
+            let _ = helper.process.wait();
+        });
     }
 }
 
