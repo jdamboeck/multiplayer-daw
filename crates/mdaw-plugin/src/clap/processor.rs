@@ -15,6 +15,21 @@ use std::sync::mpsc::Sender;
 const NOTES: usize = 128;
 /// Events one block can carry from the host.
 const EVENTS: u32 = 512;
+/// Note events waiting for the next block, at most.
+const PENDING: usize = 384;
+/// Places among them only note ends may take: a note that cannot start is a wrong note, one
+/// that cannot end is stuck.
+const KEPT_FOR_ENDS: usize = 128;
+
+/// A note start or end waiting for the next block.
+#[derive(Clone, Copy, Default)]
+struct Pending {
+    offset: u32,
+    on: bool,
+    pitch: u8,
+    vel: u8,
+    id: u32,
+}
 
 /// A parameter change from the main thread.
 #[derive(Clone, Copy)]
@@ -57,6 +72,9 @@ pub struct ClapProcessor {
     params: rtrb::Consumer<ParamChange>,
     /// Sounding notes: the graph's key, the pitch, and the note id given to the plugin.
     notes: [Option<(u64, u8, u32)>; NOTES],
+    /// Note events for the next block, in the order of their offsets.
+    pending: [Pending; PENDING],
+    pending_len: usize,
     next_note_id: u32,
     steady_time: u64,
     max_block: usize,
@@ -82,6 +100,8 @@ impl ClapProcessor {
             events_out: EventBuffer::with_capacity(EVENTS as usize),
             params,
             notes: [None; NOTES],
+            pending: [Pending::default(); PENDING],
+            pending_len: 0,
             next_note_id: 0,
             steady_time: 0,
             max_block,
@@ -89,13 +109,63 @@ impl ClapProcessor {
         }
     }
 
-    fn end(&mut self, slot: usize) {
-        if let Some((_, pitch, id)) = self.notes[slot].take()
-            && self.events_in.len() < EVENTS
-        {
-            let pckn = Pckn::new(0u16, 0u16, pitch as u16, id);
-            self.events_in.push(&NoteOffEvent::new(0, pckn, 0.0));
+    fn queue(&mut self, event: Pending) -> bool {
+        let room = if event.on {
+            PENDING - KEPT_FOR_ENDS
+        } else {
+            PENDING
+        };
+        if self.pending_len >= room {
+            return false;
         }
+        self.pending[self.pending_len] = event;
+        self.pending_len += 1;
+        true
+    }
+
+    /// Ends the note in `slot`. It counts as ended only once its end is queued.
+    fn end(&mut self, slot: usize, offset: u32) {
+        let Some((_, pitch, id)) = self.notes[slot] else {
+            return;
+        };
+        let event = Pending {
+            offset,
+            on: false,
+            pitch,
+            vel: 0,
+            id,
+        };
+        if self.queue(event) {
+            self.notes[slot] = None;
+        }
+    }
+
+    /// Puts the waiting notes into the block's events, in time order: a stable sort that does
+    /// not allocate, over a few events.
+    fn push_pending(&mut self, frames: usize) {
+        let pending = &mut self.pending[..self.pending_len];
+        for i in 1..pending.len() {
+            let mut j = i;
+            while j > 0 && pending[j - 1].offset > pending[j].offset {
+                pending.swap(j - 1, j);
+                j -= 1;
+            }
+        }
+        let last = frames.saturating_sub(1) as u32;
+        for event in &self.pending[..self.pending_len] {
+            if self.events_in.len() >= EVENTS {
+                break;
+            }
+            let time = event.offset.min(last);
+            let pckn = Pckn::new(0u16, 0u16, event.pitch as u16, event.id);
+            if event.on {
+                self.events_in
+                    .push(&NoteOnEvent::new(time, pckn, event.vel as f64 / 127.0));
+            } else {
+                self.events_in.push(&NoteOffEvent::new(time, pckn, 0.0));
+            }
+        }
+        self.pending_len = 0;
     }
 
     fn transport(time: &BlockTime) -> TransportEvent {
@@ -167,34 +237,37 @@ impl ClapProcessor {
 }
 
 impl ExternalDevice for ClapProcessor {
-    fn note_on(&mut self, key: u64, pitch: u8, vel: u8) {
+    fn note_on(&mut self, offset: u32, key: u64, pitch: u8, vel: u8) {
         if let Some(slot) = self.notes.iter().position(|n| n.is_some_and(|n| n.0 == key)) {
-            self.end(slot);
+            self.end(slot, offset);
         }
         let Some(slot) = self.notes.iter().position(Option::is_none) else {
             return;
         };
-        if self.events_in.len() >= EVENTS {
-            return;
-        }
         let id = self.next_note_id;
-        self.next_note_id = self.next_note_id.wrapping_add(1) & 0x7fff_ffff;
-        self.notes[slot] = Some((key, pitch, id));
-        let pckn = Pckn::new(0u16, 0u16, pitch.min(127) as u16, id);
-        self.events_in
-            .push(&NoteOnEvent::new(0, pckn, vel.clamp(1, 127) as f64 / 127.0));
+        let event = Pending {
+            offset,
+            on: true,
+            pitch: pitch.min(127),
+            vel: vel.clamp(1, 127),
+            id,
+        };
+        if self.queue(event) {
+            self.next_note_id = self.next_note_id.wrapping_add(1) & 0x7fff_ffff;
+            self.notes[slot] = Some((key, pitch, id));
+        }
     }
 
-    fn note_off(&mut self, key: u64) {
+    fn note_off(&mut self, offset: u32, key: u64) {
         if let Some(slot) = self.notes.iter().position(|n| n.is_some_and(|n| n.0 == key)) {
-            self.end(slot);
+            self.end(slot, offset);
         }
     }
 
     fn release_where(&mut self, filter: &dyn Fn(u64) -> bool) {
         for slot in 0..NOTES {
             if self.notes[slot].is_some_and(|n| filter(n.0)) {
-                self.end(slot);
+                self.end(slot, 0);
             }
         }
     }
@@ -203,6 +276,8 @@ impl ExternalDevice for ClapProcessor {
         // Plugin code is not ours to hold to the rules of the audio thread.
         let _foreign = mdaw_engine::alloc_guard::leave();
         let frames = left.len().min(self.max_block);
+        // Parameters at the block's start, then the notes in time order.
+        self.events_in.clear();
         while let Ok(change) = self.params.pop() {
             if self.events_in.len() >= EVENTS {
                 break;
@@ -212,6 +287,7 @@ impl ExternalDevice for ClapProcessor {
             // host never asks it to rescan its parameters.
             self.events_in.push(&unsafe { event.with_cookie(change.cookie) });
         }
+        self.push_pending(frames);
         if let Some(main) = self.inputs.main {
             let port = &mut self.inputs.buffers[main];
             match port.len() {

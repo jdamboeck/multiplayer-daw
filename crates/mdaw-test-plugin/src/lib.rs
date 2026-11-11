@@ -31,10 +31,14 @@ pub const LEVEL: u32 = 0;
 pub const BALANCE: u32 = 1;
 /// Parameter: how the plugin misbehaves on a note of [`CRASH_PITCH`], as a broken plugin would,
 /// for tests of hosts that must survive that. 0, the default: not at all. 1: its processing
-/// fails from then on. 2: it crashes the process.
+/// fails from then on. 2: it crashes the process. 3: it is slow. 4: it hangs.
 pub const MISBEHAVE: u32 = 2;
 pub const FAIL: f64 = 1.0;
 pub const CRASH: f64 = 2.0;
+/// Each block takes 50 ms from then on, as a plugin overloading the machine.
+pub const SLOW: f64 = 3.0;
+/// Its processing never returns, as a plugin caught in a loop.
+pub const HANG: f64 = 4.0;
 /// The note that sets off what [`MISBEHAVE`] asks for.
 pub const CRASH_PITCH: u8 = 0;
 const DEFAULT_LEVEL: f64 = 0.5;
@@ -70,7 +74,7 @@ impl Shared {
         let (cell, value) = match id {
             LEVEL => (&self.level, value.clamp(0.0, 1.0)),
             BALANCE => (&self.balance, value.clamp(-1.0, 1.0)),
-            MISBEHAVE => (&self.misbehave, value.round().clamp(0.0, 2.0)),
+            MISBEHAVE => (&self.misbehave, value.round().clamp(0.0, 4.0)),
             _ => return,
         };
         cell.store((value as f32).to_bits(), Relaxed);
@@ -139,6 +143,8 @@ struct Voice {
 
 pub struct Processor<'a> {
     shared: &'a Shared,
+    /// Told to be slow, and the note came.
+    slow: bool,
     sample_rate: f64,
     voices: [Option<Voice>; VOICES],
 }
@@ -152,6 +158,7 @@ impl<'a> PluginAudioProcessor<'a, Shared, MainThread<'a>> for Processor<'a> {
     ) -> Result<Self, PluginError> {
         Ok(Self {
             shared,
+            slow: false,
             sample_rate: config.sample_rate,
             voices: [None; VOICES],
         })
@@ -190,6 +197,10 @@ impl<'a> PluginAudioProcessor<'a, Shared, MainThread<'a>> for Processor<'a> {
                 Some(CoreEventSpace::NoteOn(e)) => {
                     if e.key() == Match::Specific(CRASH_PITCH as u16) {
                         match self.shared.get(MISBEHAVE).unwrap_or(0.0) {
+                            m if m >= HANG => loop {
+                                std::thread::sleep(std::time::Duration::from_secs(1));
+                            },
+                            m if m >= SLOW => self.slow = true,
                             m if m >= CRASH => std::process::abort(),
                             m if m >= FAIL => return Err(PluginError::Message("told to fail")),
                             _ => {}
@@ -208,6 +219,9 @@ impl<'a> PluginAudioProcessor<'a, Shared, MainThread<'a>> for Processor<'a> {
         }
         if done < frames {
             self.render(left, right, done, frames);
+        }
+        if self.slow {
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
         Ok(ProcessStatus::ContinueIfNotQuiet)
     }
@@ -338,7 +352,7 @@ impl PluginMainThreadParams for MainThread<'_> {
         let (id, name, min, max, default): (u32, &[u8], f64, f64, f64) = match index {
             0 => (LEVEL, b"Level", 0.0, 1.0, DEFAULT_LEVEL),
             1 => (BALANCE, b"Balance", -1.0, 1.0, 0.0),
-            2 => (MISBEHAVE, b"Misbehave on lowest note", 0.0, 2.0, 0.0),
+            2 => (MISBEHAVE, b"Misbehave on lowest note", 0.0, 4.0, 0.0),
             _ => return,
         };
         let flags = if id == MISBEHAVE {

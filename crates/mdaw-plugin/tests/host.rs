@@ -23,7 +23,7 @@ fn synth(host: &mut Host) -> Box<dyn Instance> {
 fn play(device: &mut dyn ExternalDevice, frames: usize) -> (Vec<f32>, Vec<f32>) {
     let (mut all_left, mut all_right) = (Vec::new(), Vec::new());
     for (key, pitch) in [(1, 60), (2, 64)] {
-        device.note_on(key, pitch, 100);
+        device.note_on(0, key, pitch, 100);
     }
     let mut done = 0;
     while done < frames + RATE as usize / 10 {
@@ -305,7 +305,7 @@ fn the_test_synth_misbehaves_only_when_told_and_a_failure_is_reported() {
     let mut synth = synth(&mut host);
     let mut device = synth.take_processor().unwrap();
     // By default the lowest note is a note like any other.
-    device.note_on(1, mdaw_test_plugin::CRASH_PITCH, 100);
+    device.note_on(0, 1, mdaw_test_plugin::CRASH_PITCH, 100);
     let mut block = (vec![0.0; BLOCK], vec![0.0; BLOCK]);
     device.process(&mut block.0, &mut block.1, &BlockTime::default());
     assert!(!synth.crashed());
@@ -314,7 +314,7 @@ fn the_test_synth_misbehaves_only_when_told_and_a_failure_is_reported() {
     // without a word.
     synth.set_param(mdaw_test_plugin::MISBEHAVE, mdaw_test_plugin::FAIL);
     device.process(&mut block.0, &mut block.1, &BlockTime::default());
-    device.note_on(2, mdaw_test_plugin::CRASH_PITCH, 100);
+    device.note_on(0, 2, mdaw_test_plugin::CRASH_PITCH, 100);
     device.process(&mut block.0, &mut block.1, &BlockTime::default());
     assert!(synth.crashed());
     device.retire();
@@ -352,7 +352,7 @@ fn probe_the_start_of_an_offline_render() {
             },
         );
     }
-    device.note_on(1, 48, 100);
+    device.note_on(0, 1, 48, 100);
     let mut left = Vec::new();
     for _ in 0..200 {
         let (mut l, mut r) = (vec![0.0; BLOCK], vec![0.0; BLOCK]);

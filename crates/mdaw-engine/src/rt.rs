@@ -14,6 +14,10 @@ const DRIFT_PATIENCE: u32 = 3;
 /// this is where seeks arrive, and nobody wants to wait for those.
 const FRESH_DRIFT_MICROS: i64 = 2_000;
 
+/// The part of an audio callback's time that plugins in other processes may use, in percent of
+/// the buffer's length. The rest is for everything else, and for the device.
+const DEADLINE_PERCENT: u64 = 60;
+
 /// A point of the timeline pinned to a moment of the engine's clock.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) struct Anchor {
@@ -395,6 +399,13 @@ impl RtCore {
         }
         self.steer(play_micros);
         let channels = channels.max(1);
+        // Plugins in other processes may take part of the callback, together; whatever they
+        // have not delivered by then goes without them.
+        let frames = (data.len() / channels) as u64;
+        let budget = frames * 1_000_000 * DEADLINE_PERCENT / 100 / self.graph.sample_rate().max(1) as u64;
+        self.graph.set_deadline(Some(
+            std::time::Instant::now() + std::time::Duration::from_micros(budget),
+        ));
         let mut peak = [0.0f32; 2];
         let mut total = 0u64;
         let gain = f32::from_bits(self.shared.output_gain.load(Relaxed));

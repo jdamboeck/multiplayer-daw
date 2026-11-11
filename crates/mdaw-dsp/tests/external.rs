@@ -23,11 +23,11 @@ struct Fake {
 }
 
 impl ExternalDevice for Fake {
-    fn note_on(&mut self, key: u64, pitch: u8, _vel: u8) {
+    fn note_on(&mut self, _offset: u32, key: u64, pitch: u8, _vel: u8) {
         self.sounding += 1;
         self.log.notes.lock().unwrap().push((key, pitch));
     }
-    fn note_off(&mut self, _key: u64) {
+    fn note_off(&mut self, _offset: u32, _key: u64) {
         self.sounding = self.sounding.saturating_sub(1);
     }
     fn release_where(&mut self, _filter: &dyn Fn(u64) -> bool) {
@@ -210,4 +210,49 @@ fn without_the_plugin_the_stem_plays_from_the_start_of_the_timeline() {
     source.stem = None;
     let mut graph = Compiler::new(RATE).build_with(&project, None, &mut source);
     assert_eq!(last_frame(&mut graph, 1000, 100), [0.0, 0.0]);
+}
+
+/// Records what it is given, for checking the timing of events.
+struct Recorder {
+    log: Arc<Mutex<Vec<String>>>,
+}
+
+impl ExternalDevice for Recorder {
+    fn note_on(&mut self, offset: u32, _key: u64, pitch: u8, _vel: u8) {
+        self.log.lock().unwrap().push(format!("on {pitch} at {offset}"));
+    }
+    fn note_off(&mut self, offset: u32, _key: u64) {
+        self.log.lock().unwrap().push(format!("off at {offset}"));
+    }
+    fn release_where(&mut self, _filter: &dyn Fn(u64) -> bool) {}
+    fn process(&mut self, left: &mut [f32], _right: &mut [f32], _time: &BlockTime) {
+        self.log.lock().unwrap().push(format!("process {}", left.len()));
+    }
+}
+
+struct RecorderSource(Arc<Mutex<Vec<String>>>);
+
+impl PluginSource for RecorderSource {
+    fn device(&mut self, _: TrackId, _: DeviceId, _: PluginRef<'_>) -> Option<Box<dyn ExternalDevice>> {
+        Some(Box::new(Recorder { log: self.0.clone() }))
+    }
+    fn stem(&mut self, _: &Stem) -> Option<Arc<[f32]>> {
+        None
+    }
+}
+
+#[test]
+fn a_plugin_gets_each_block_whole_with_its_notes_at_their_offsets() {
+    let (project, _, _) = project();
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let mut graph = Compiler::new(RATE).build_with(&project, None, &mut RecorderSource(log.clone()));
+    // The note of the second beat starts at sample 24 000 and lasts half a second.
+    let mut out = vec![0.0; 512 * 2];
+    graph.process(Some(24_000 - 100), &mut out);
+    graph.process(Some(48_000 - 300), &mut out);
+    assert_eq!(
+        *log.lock().unwrap(),
+        ["on 64 at 100", "process 512", "off at 300", "process 512"],
+        "one call per block, however many notes it holds"
+    );
 }

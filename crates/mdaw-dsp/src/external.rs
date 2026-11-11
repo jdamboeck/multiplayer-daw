@@ -15,15 +15,19 @@ pub struct BlockTime {
     pub seconds: f64,
     /// Tempo at the block's start.
     pub bpm: f64,
+    /// Until when the device may take, if it can be late at all (one in another process): the
+    /// audio callback's deadline. `None` offline, where there is no hurry.
+    pub deadline: Option<std::time::Instant>,
 }
 
 /// A device processed in the audio thread through this interface alone. Every method may run in
 /// the audio callback: none may allocate, lock or block.
 pub trait ExternalDevice: Send {
-    /// Starts a note. `key` identifies it for [`ExternalDevice::note_off`].
-    fn note_on(&mut self, key: u64, pitch: u8, vel: u8);
-    fn note_off(&mut self, key: u64);
-    /// Ends the sounding notes whose key matches.
+    /// Starts a note `offset` frames into the next block. `key` identifies it for
+    /// [`ExternalDevice::note_off`]. Notes come in the order of their offsets.
+    fn note_on(&mut self, offset: u32, key: u64, pitch: u8, vel: u8);
+    fn note_off(&mut self, offset: u32, key: u64);
+    /// Ends the sounding notes whose key matches, at the start of the next block.
     fn release_where(&mut self, filter: &dyn Fn(u64) -> bool);
     /// Processes one block of stereo in place: a device with audio input takes `left` and
     /// `right` as its input and replaces them with its output; one without adds its output to

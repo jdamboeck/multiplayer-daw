@@ -215,7 +215,7 @@ impl Plugins {
             };
             let name = running.instance.info().name.clone();
             self.crashed.insert(key, name.clone());
-            names.push((key, format!("{name} crashed.")));
+            names.push((key, format!("{name} crashed or stopped responding.")));
             self.dirty = true;
             if let Some(host) = self.host.as_mut() {
                 host.dispose(running.instance);

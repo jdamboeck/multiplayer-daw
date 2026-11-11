@@ -25,7 +25,8 @@ pub struct Event {
     pub kind: u32,
     pub pitch: u32,
     pub vel: u32,
-    pub _pad: u32,
+    /// Frames into the block.
+    pub offset: u32,
     pub key: u64,
 }
 
@@ -55,6 +56,7 @@ impl Block {
             tick: self.tick,
             seconds: self.seconds,
             bpm: self.bpm,
+            deadline: None,
         }
     }
 
@@ -103,6 +105,16 @@ impl Shared {
                 .len(std::mem::size_of::<Block>())
                 .map_mut(file)?
         };
+        // In memory for good, before the audio thread touches it: no page faults there. A
+        // system that does not allow it gets the faults once, up front.
+        // SAFETY: the mapping is live for the length given.
+        if unsafe { libc::mlock(map.as_ptr().cast(), map.len()) } != 0 {
+            let page = 4096;
+            for at in (0..map.len()).step_by(page) {
+                // SAFETY: in bounds of the mapping; a read is enough to fault the page in.
+                unsafe { std::ptr::read_volatile(map.as_ptr().add(at)) };
+            }
+        }
         Ok(Self { map })
     }
 

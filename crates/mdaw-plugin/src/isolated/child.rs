@@ -188,8 +188,19 @@ fn handle(running: &mut Option<Running>, request: Request) -> Reply {
     }
 }
 
+/// Asks for the scheduling of an audio thread, as the DAW's own has: run first, ahead of
+/// everything that is not. Quietly nothing where the system does not allow it.
+fn real_time() {
+    // SAFETY: plain calls about the calling thread.
+    unsafe {
+        let param = libc::sched_param { sched_priority: 20 };
+        libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_FIFO, &param);
+    }
+}
+
 /// Processes every block the DAW asks for, until told to stop.
 fn serve_audio(mut device: Box<dyn ExternalDevice>, shared: &Shared) {
+    real_time();
     let block = shared.block();
     // From the last block finished, not the last asked for: a block the DAW asked for before
     // this thread got going is still to be done.
@@ -206,8 +217,13 @@ fn serve_audio(mut device: Box<dyn ExternalDevice>, shared: &Shared) {
         let events = (block.events_len as usize).min(block.events.len());
         for event in &block.events[..events] {
             match event.kind {
-                NOTE_ON => device.note_on(event.key, event.pitch.min(127) as u8, event.vel.min(127) as u8),
-                NOTE_OFF => device.note_off(event.key),
+                NOTE_ON => device.note_on(
+                    event.offset,
+                    event.key,
+                    event.pitch.min(127) as u8,
+                    event.vel.min(127) as u8,
+                ),
+                NOTE_OFF => device.note_off(event.offset, event.key),
                 _ => {}
             }
         }

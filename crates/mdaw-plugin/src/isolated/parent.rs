@@ -9,7 +9,7 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::process::{ChildStdin, Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::time::{Duration, Instant};
 
@@ -23,6 +23,8 @@ const STATUS_EVERY: Duration = Duration::from_millis(50);
 const SLACK: Duration = Duration::from_millis(2);
 /// How long an offline render waits for a block.
 const OFFLINE_WAIT: Duration = Duration::from_secs(10);
+/// A helper whose audio has not come back for this long has hung there.
+const HUNG_MICROS: i64 = 2_000_000;
 
 /// CLAP plugins, each run in a helper process of its own: a plugin that crashes takes only
 /// its helper down.
@@ -153,6 +155,9 @@ pub struct IsolatedInstance {
     helper: Option<Helper>,
     /// Set once the helper is gone: the processor stops waiting for it.
     dead: Arc<AtomicBool>,
+    /// Since when the helper's audio has not come back, on the engine's clock; 0 while it
+    /// comes.
+    stuck_since: Arc<AtomicI64>,
     processor: Option<Box<IsolatedProcessor>>,
     has_editor: bool,
     param_count: usize,
@@ -189,6 +194,7 @@ impl IsolatedInstance {
         let stdout = process.stdout.take().expect("piped");
         let (tx, replies) = channel();
         let dead = Arc::new(AtomicBool::new(false));
+        let stuck_since = Arc::new(AtomicI64::new(0));
         {
             // The helper's stdout ends the moment it does: whoever waits for its audio stops
             // waiting at once.
@@ -225,7 +231,13 @@ impl IsolatedInstance {
                 replies,
             }),
             dead: dead.clone(),
-            processor: Some(Box::new(IsolatedProcessor::new(shared, dead, settings))),
+            stuck_since: stuck_since.clone(),
+            processor: Some(Box::new(IsolatedProcessor::new(
+                shared,
+                dead,
+                stuck_since,
+                settings,
+            ))),
             has_editor: false,
             param_count: 0,
             changed: false,
@@ -380,6 +392,13 @@ impl Instance for IsolatedInstance {
             self.lose();
             return;
         }
+        // Its window may still answer while its audio thread hangs in the plugin.
+        let stuck = self.stuck_since.load(Ordering::Acquire);
+        if stuck != 0 && mdaw_engine::clock::now_micros() - stuck > HUNG_MICROS {
+            eprintln!("mdaw: {} stopped making sound and is ended", self.info.name);
+            self.lose();
+            return;
+        }
         if self.asked.elapsed() >= STATUS_EVERY {
             self.asked = Instant::now();
             if let Some(Reply::Status {
@@ -423,6 +442,7 @@ impl Drop for IsolatedInstance {
 pub struct IsolatedProcessor {
     shared: Arc<Shared>,
     dead: Arc<AtomicBool>,
+    stuck_since: Arc<AtomicI64>,
     pending: [Event; EVENTS],
     pending_len: usize,
     /// Keys of the notes that sound, for `release_where`.
@@ -432,10 +452,16 @@ pub struct IsolatedProcessor {
 }
 
 impl IsolatedProcessor {
-    fn new(shared: Arc<Shared>, dead: Arc<AtomicBool>, settings: Settings) -> Self {
+    fn new(
+        shared: Arc<Shared>,
+        dead: Arc<AtomicBool>,
+        stuck_since: Arc<AtomicI64>,
+        settings: Settings,
+    ) -> Self {
         Self {
             shared,
             dead,
+            stuck_since,
             pending: [Event::default(); EVENTS],
             pending_len: 0,
             sounding: [None; 128],
@@ -444,40 +470,54 @@ impl IsolatedProcessor {
         }
     }
 
-    fn push(&mut self, kind: u32, key: u64, pitch: u8, vel: u8) {
-        if self.pending_len < EVENTS {
-            self.pending[self.pending_len] = Event {
-                kind,
-                pitch: pitch as u32,
-                vel: vel as u32,
-                _pad: 0,
-                key,
-            };
-            self.pending_len += 1;
+    /// Queues an event for the next block. Note starts leave room for note ends: a note that
+    /// cannot start is a wrong note, one that cannot end is stuck.
+    fn push(&mut self, kind: u32, offset: u32, key: u64, pitch: u8, vel: u8) -> bool {
+        let room = if kind == NOTE_ON {
+            EVENTS - EVENTS / 4
+        } else {
+            EVENTS
+        };
+        if self.pending_len >= room {
+            return false;
         }
+        self.pending[self.pending_len] = Event {
+            kind,
+            pitch: pitch as u32,
+            vel: vel as u32,
+            offset,
+            key,
+        };
+        self.pending_len += 1;
+        true
     }
 }
 
 impl ExternalDevice for IsolatedProcessor {
-    fn note_on(&mut self, key: u64, pitch: u8, vel: u8) {
-        self.push(NOTE_ON, key, pitch, vel);
-        if let Some(slot) = self.sounding.iter_mut().find(|s| s.is_none()) {
-            *slot = Some(key);
+    fn note_on(&mut self, offset: u32, key: u64, pitch: u8, vel: u8) {
+        // Only a note that can be ended later is started.
+        let Some(slot) = self.sounding.iter().position(|s| s.is_none()) else {
+            return;
+        };
+        if self.push(NOTE_ON, offset, key, pitch, vel) {
+            self.sounding[slot] = Some(key);
         }
     }
 
-    fn note_off(&mut self, key: u64) {
-        self.push(NOTE_OFF, key, 0, 0);
-        if let Some(slot) = self.sounding.iter_mut().find(|s| **s == Some(key)) {
-            *slot = None;
+    fn note_off(&mut self, offset: u32, key: u64) {
+        if let Some(slot) = self.sounding.iter().position(|s| *s == Some(key))
+            && self.push(NOTE_OFF, offset, key, 0, 0)
+        {
+            self.sounding[slot] = None;
         }
     }
 
     fn release_where(&mut self, filter: &dyn Fn(u64) -> bool) {
         for i in 0..self.sounding.len() {
-            if let Some(key) = self.sounding[i].filter(|k| filter(*k)) {
+            if let Some(key) = self.sounding[i].filter(|k| filter(*k))
+                && self.push(NOTE_OFF, 0, key, 0, 0)
+            {
                 self.sounding[i] = None;
-                self.push(NOTE_OFF, key, 0, 0);
             }
         }
     }
@@ -490,8 +530,13 @@ impl ExternalDevice for IsolatedProcessor {
         let asked = block.request.load(Ordering::Acquire);
         if block.done.load(Ordering::Acquire) != asked {
             // Still busy with a block it was late for: this one goes without it.
+            if self.stuck_since.load(Ordering::Relaxed) == 0 {
+                self.stuck_since
+                    .store(mdaw_engine::clock::now_micros().max(1), Ordering::Release);
+            }
             return;
         }
+        self.stuck_since.store(0, Ordering::Release);
         let frames = left.len().min(MAX_BLOCK);
         block.events[..self.pending_len].copy_from_slice(&self.pending[..self.pending_len]);
         block.events_len = self.pending_len as u32;
@@ -503,18 +548,24 @@ impl ExternalDevice for IsolatedProcessor {
         let seq = asked.wrapping_add(1);
         block.request.store(seq, Ordering::Release);
         shm::wake(&block.request);
-        let wait = if self.offline {
+        let started = Instant::now();
+        let own = if self.offline {
             OFFLINE_WAIT
         } else {
             SLACK + Duration::from_micros(frames as u64 * 1_000_000 / self.sample_rate as u64)
         };
-        let started = Instant::now();
+        // The callback's deadline is shared by every plugin in it: one that is late goes
+        // without its sound, so that the whole output is never late.
+        let until = match time.deadline {
+            Some(deadline) => deadline.min(started + own),
+            None => started + own,
+        };
         loop {
             let done = block.done.load(Ordering::Acquire);
             if done == seq {
                 break;
             }
-            let Some(left_over) = wait.checked_sub(started.elapsed()) else {
+            let Some(left_over) = until.checked_duration_since(Instant::now()) else {
                 // Late: the block goes without it.
                 return;
             };
@@ -522,6 +573,10 @@ impl ExternalDevice for IsolatedProcessor {
                 return;
             }
             shm::wait(&block.done, done, left_over);
+        }
+        // A helper that died as it was writing leaves no half-written block behind.
+        if self.dead.load(Ordering::Acquire) {
+            return;
         }
         left[..frames].copy_from_slice(&block.left[..frames]);
         right[..frames].copy_from_slice(&block.right[..frames]);
