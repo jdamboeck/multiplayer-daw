@@ -1,7 +1,7 @@
 name: ci
 on:
   push:
-    branches: [main, m1-local-daw]
+    branches: [main]
   pull_request:
 
 jobs:
