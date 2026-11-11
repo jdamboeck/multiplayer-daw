@@ -28,6 +28,8 @@ pub const ROW_BLACK: Color32 = Color32::from_rgb(26, 27, 30);
 pub const OUTSIDE: Color32 = Color32::from_rgba_premultiplied(0, 0, 0, 110);
 pub const METER: Color32 = Color32::from_rgb(110, 205, 125);
 pub const METER_HOT: Color32 = Color32::from_rgb(230, 90, 80);
+/// Background of the armed record button.
+pub const REC: Color32 = Color32::from_rgb(150, 38, 38);
 pub const WARN: Color32 = Color32::from_rgb(226, 178, 84);
 /// Background of a control that belongs to someone else's checkout.
 pub const WARN_DIM: Color32 = Color32::from_rgb(92, 72, 34);

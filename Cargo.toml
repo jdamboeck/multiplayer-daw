@@ -39,6 +39,7 @@ getrandom = "0.4"
 rusqlite = { version = "0.41", features = ["bundled"] }
 flacenc = { version = "0.5", default-features = false }
 claxon = "0.4"
+midir = "0.11"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 [workspace.lints.clippy]

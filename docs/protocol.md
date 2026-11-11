@@ -1,11 +1,11 @@
 # mdaw protocol
 
-What client and server say to each other, as built. Protocol version **3**. The types live in
+What client and server say to each other, as built. Protocol version **4**. The types live in
 `mdaw-proto` (`lib.rs` for events, `wire.rs` for messages, `transport.rs` for the transport and
-datagrams) and in `mdaw-model` (ops); this text explains the rules around them. It covers what
-exists after milestone M4: the state plane with live edits, the shared clock and transport, and
-checkout and commit with blobs and changelog samples. Live MIDI is in `docs/plan.md` and gets its
-section here when it is built.
+datagrams, `midi.rs` for live notes) and in `mdaw-model` (ops); this text explains the rules
+around them. It covers what exists after milestone M5: the state plane with live edits, the
+shared clock and transport, checkout and commit with blobs and changelog samples, and live notes
+with recording.
 
 ## Connection
 
@@ -234,6 +234,54 @@ Transport { state: TransportState, by: Option<ActorId> }    // server to everyon
   private: it starts as a copy of the shared one, and play, stop, seek and loop act on it alone
   and are not sent. Linked again, the client takes up the shared state. A client whose
   connection is down, or that has no clock estimate yet, behaves as unlinked until it has both.
+
+## Live notes
+
+What a player plays is heard by everyone else as it arrives, about one network delay late. It is
+sound, not an edit: it changes nothing in the document and is not stored. Recording turns it into
+an edit (see below).
+
+```
+Midi(MidiPacket)        // datagram, client to server, and server to the other clients
+MidiPacket { actor, track, stream_seq: u32, events: Vec<LiveEvent>, held: Vec<u8> }
+LiveEvent  { seq: u32, pitch: u8, vel: u8 }      // vel 1..=127 starts the note, 0 ends it
+```
+
+- **Streams.** A player's notes on one track are one stream. `stream_seq` counts its packets,
+  `LiveEvent::seq` its events; both start at 1 and only grow.
+- **Sending.** Every note start or end goes out at once in a packet that also repeats the two
+  events before it and lists every pitch the player still holds on the track (`held`). While
+  notes are held, the packet is repeated every 250 ms, and for 1 s after the last one ended, so a
+  release that got lost is made up for soon. With every note held a packet is about 150 bytes.
+- **Relaying.** The server passes each packet on from the connection's network task, without the
+  project thread. It sets `actor` to the sender's; what the client put there is ignored. It sends
+  the packet to every other connection except one whose user has the track checked out while
+  the sender is someone else: a checked-out track hears only its owner until the commit or the
+  release. The owner's own notes on the track are passed on as usual.
+- **Receiving.** A receiver keeps, per stream, the highest `stream_seq` and event `seq` seen and
+  the pitches it plays. A packet not newer than the last is dropped. Of a newer one it plays the
+  events it has not seen, in order; a start only if `held` still has the pitch, since a note that
+  ended in an event the packet no longer carries would only be cut off again. Then it ends every
+  pitch it plays that `held` does not list. A stream not heard from for 2 s is silenced, and so
+  is everything of a player who leaves, everything on a lost connection, and everything on a
+  track as soon as this user's checkout of it is in the log.
+- **Hearing.** Notes play into the track's instrument on arrival, through a ring straight into
+  the audio thread, without waiting for the UI. Each player's notes have their own voices, so
+  two players holding the same pitch do not end each other's notes. The player's own notes are
+  heard at once.
+
+### Recording
+
+Recording is local and lands as an ordinary transaction. While recording is armed, a client
+stamps each note its player starts or ends with its own clock, and turns that into a tick by
+the transport it follows: for the shared transport, the stamp plus the clock offset, put into
+`TransportState::position`. Notes played while the transport does not run are dropped. When the
+transport stops, or recording is disarmed, the take becomes one `Txn`: per track, `NoteAdd` into
+the clip that spans all of the take's notes on it, or else a `ClipAdd` named "Take" of whole bars
+holding them. Notes still held end where the playhead was last; a note held across the end of
+the loop lasts to that end. The take is one undo step and follows the usual rules: a track
+someone else has checked out refuses it, and on the client's own checkout it goes into the
+journal.
 
 ## Checkout and commit
 

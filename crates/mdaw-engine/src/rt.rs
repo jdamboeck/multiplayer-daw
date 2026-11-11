@@ -62,6 +62,21 @@ pub(crate) enum Command {
     },
 }
 
+/// A live note from any thread, through [`crate::LiveInput`].
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum LiveNote {
+    On {
+        track: TrackId,
+        key: u64,
+        pitch: u8,
+        vel: u8,
+    },
+    Off {
+        track: TrackId,
+        key: u64,
+    },
+}
+
 /// What the audio thread publishes for everyone else.
 #[derive(Default)]
 pub(crate) struct Shared {
@@ -93,6 +108,7 @@ pub(crate) struct Shared {
 pub(crate) struct RtCore {
     graph: Box<Graph>,
     commands: rtrb::Consumer<Command>,
+    live: rtrb::Consumer<LiveNote>,
     garbage: rtrb::Producer<Box<Graph>>,
     shared: Arc<Shared>,
     playing: bool,
@@ -117,12 +133,14 @@ impl RtCore {
     pub fn new(
         graph: Box<Graph>,
         commands: rtrb::Consumer<Command>,
+        live: rtrb::Consumer<LiveNote>,
         garbage: rtrb::Producer<Box<Graph>>,
         shared: Arc<Shared>,
     ) -> Self {
         Self {
             graph,
             commands,
+            live,
             garbage,
             shared,
             playing: false,
@@ -358,6 +376,17 @@ impl RtCore {
     ) {
         while let Ok(command) = self.commands.pop() {
             self.handle(command);
+        }
+        while let Ok(note) = self.live.pop() {
+            match note {
+                LiveNote::On {
+                    track,
+                    key,
+                    pitch,
+                    vel,
+                } => self.graph.note_on(track, key, pitch, vel),
+                LiveNote::Off { track, key } => self.graph.note_off(track, key),
+            }
         }
         self.steer(play_micros);
         let channels = channels.max(1);

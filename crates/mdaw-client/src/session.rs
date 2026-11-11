@@ -22,6 +22,8 @@ use mdaw_sync::{Ended, Gesture, Loopback, Replica, Workspace};
 
 use crate::checkout::{self, CommitPlan, Files, Fork, Rendered};
 use crate::link::{Link, LinkEvent, Waker, Who};
+use crate::live::Live;
+use crate::record::{Take, take_ops};
 use crate::theme;
 
 /// Actor that owns the IDs of the starter project, so they cannot collide with the user's.
@@ -197,6 +199,11 @@ pub struct Session {
     /// Forks being added back as a new track, by that track, until the server has it.
     restoring: Vec<(TrackId, Fork)>,
     lease_sent: Instant,
+    live: Live,
+    /// Recording is armed: notes this player plays while the transport runs are kept.
+    recording: bool,
+    /// The notes of the current run of the transport, while recording.
+    take: Take,
 }
 
 enum Backend {
@@ -275,7 +282,8 @@ impl Session {
     ///
     /// `waker` is called from another thread whenever [`Session::frame`] has something to do.
     pub fn join(join: JoinInfo, who: Who, engine: Engine, waker: Waker) -> Result<Self> {
-        let link = Link::connect(join, who, waker.clone())?;
+        let live = Live::new(engine.live_input()).with_waker(waker.clone());
+        let link = Link::connect(join, who, waker.clone(), live.clone())?;
         let deadline = Instant::now() + JOIN_TIMEOUT;
         let (epoch, welcome) = loop {
             let left = deadline.saturating_duration_since(Instant::now());
@@ -335,12 +343,14 @@ impl Session {
             user,
             engine,
         );
+        session.live = live;
         session.waker = Some(waker);
         session.absorb_history(history);
         Ok(session)
     }
 
     fn new(replica: Replica, backend: Backend, user: UserId, engine: Engine) -> Self {
+        let live = Live::new(engine.live_input());
         let mut session = Self {
             replica,
             backend,
@@ -369,6 +379,9 @@ impl Session {
             forks: Vec::new(),
             restoring: Vec::new(),
             lease_sent: Instant::now(),
+            live,
+            recording: false,
+            take: Take::default(),
         };
         session.replica.set_user(user);
         session.tempo = session.replica.view().tempo_map();
@@ -501,6 +514,121 @@ impl Session {
         self.engine.set_project(self.replica.view());
         self.sync_transport();
         self.engine.tick();
+        self.listen();
+        self.record();
+    }
+
+    /// Live notes: what this player plays, heard at once and sent to the others.
+    pub fn live(&self) -> &Live {
+        &self.live
+    }
+
+    /// Tells the live notes who is there and which tracks listen to them.
+    fn listen(&mut self) {
+        let Backend::Remote(remote) = &self.backend else {
+            return;
+        };
+        self.live
+            .set_present(remote.peers.iter().map(|p| p.actor).collect());
+        // A track this user has checked out hears nobody else until the commit.
+        let deaf = self
+            .replica
+            .confirmed()
+            .tracks
+            .iter()
+            .filter(|(_, t)| t.checkout.is_some_and(|c| c.user == self.user))
+            .map(|(&id, _)| id)
+            .collect();
+        self.live.set_deaf(deaf);
+    }
+
+    /// The names of the others who play on `track` right now.
+    pub fn players(&self, track: TrackId) -> Vec<String> {
+        let Backend::Remote(remote) = &self.backend else {
+            return Vec::new();
+        };
+        self.live
+            .players(track)
+            .into_iter()
+            .filter_map(|actor| remote.peers.iter().find(|p| p.actor == actor))
+            .map(|p| p.name.clone())
+            .collect()
+    }
+
+    /// Whether recording is armed.
+    pub fn is_recording(&self) -> bool {
+        self.recording
+    }
+
+    /// Arms or disarms recording. While armed, the notes this player plays while the transport
+    /// runs become one edit when it stops, or when recording is disarmed.
+    pub fn set_recording(&mut self, on: bool) {
+        if self.recording == on {
+            return;
+        }
+        if !on {
+            self.record();
+            self.finish_take();
+        }
+        self.recording = on;
+        self.live.set_capturing(on);
+    }
+
+    /// Notes in the take so far.
+    pub fn take_len(&self) -> usize {
+        self.take.len()
+    }
+
+    fn record(&mut self) {
+        if !self.recording {
+            return;
+        }
+        for played in self.live.take_played() {
+            if let Some(tick) = self.tick_at(played.micros) {
+                self.take.add(&played, tick);
+            }
+        }
+        match self.tick_at(clock::now_micros()) {
+            Some(tick) => {
+                let range = self.loop_range();
+                self.take.playhead(tick, range);
+            }
+            None => self.finish_take(),
+        }
+    }
+
+    fn finish_take(&mut self) {
+        let take = std::mem::take(&mut self.take);
+        if take.is_empty() {
+            return;
+        }
+        let notes = take.finish();
+        let project = self.replica.view().clone();
+        let ops = take_ops(&project, self.replica.ids(), &notes);
+        if !ops.is_empty() {
+            self.edit(ops);
+        }
+    }
+
+    /// Where the transport this client follows was, or is, at `micros` on
+    /// [`clock::now_micros`]. `None` unless it runs then.
+    fn tick_at(&self, micros: i64) -> Option<f64> {
+        if let Backend::Remote(remote) = &self.backend
+            && let Some(offset) = remote.sharing()
+        {
+            let server = micros + offset;
+            let transport = remote.transport;
+            return transport
+                .running(server)
+                .then(|| transport.position(server, &self.tempo));
+        }
+        if !self.engine.is_playing() {
+            return None;
+        }
+        // The private transport: back from where the playhead is now.
+        let ago = (clock::now_micros() - micros).max(0) as f64 / 1e6;
+        let now = self.tempo.tick_to_seconds(self.engine.position());
+        Some(self.tempo.seconds_to_tick((now - ago).max(0.0)))
     }
 
     /// Whether this client takes part in the shared transport. `None` without a server.

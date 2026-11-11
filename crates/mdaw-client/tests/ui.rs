@@ -567,3 +567,99 @@ fn screenshots() {
         .save(format!("{dir}/device.png"))
         .expect("save");
 }
+
+#[test]
+fn the_computer_keyboard_plays_the_selected_track() {
+    let mut h = harness();
+    let id = track(&h);
+    let held = |h: &App| h.state().session.live().held();
+
+    h.key_down(Key::A);
+    h.run_steps(2);
+    assert_eq!(held(&h), [(id, 60)], "A is middle C");
+    // Holding a key down does not start the note again.
+    h.key_down(Key::A);
+    h.key_down(Key::W);
+    h.run_steps(2);
+    assert_eq!(held(&h), [(id, 60), (id, 61)]);
+    h.key_up(Key::A);
+    h.key_up(Key::W);
+    h.run_steps(2);
+    assert!(held(&h).is_empty());
+
+    // X goes an octave up.
+    h.key_press(Key::X);
+    h.key_down(Key::K);
+    h.run_steps(2);
+    assert_eq!(held(&h), [(id, 84)]);
+    // A note ends where it started, even after the octave changed.
+    h.key_press(Key::Z);
+    h.key_up(Key::K);
+    h.run_steps(2);
+    assert!(held(&h).is_empty());
+
+    // With a modifier, a key is a shortcut and plays nothing.
+    h.key_down_modifiers(Modifiers::COMMAND, Key::A);
+    h.run_steps(2);
+    assert!(held(&h).is_empty());
+    h.key_up_modifiers(Modifiers::COMMAND, Key::A);
+
+    // Leaving the window lets go of everything.
+    h.key_down(Key::D);
+    h.run_steps(2);
+    assert_eq!(held(&h), [(id, 64)]);
+    h.event(egui::Event::WindowFocused(false));
+    h.run_steps(2);
+    assert!(held(&h).is_empty());
+
+    // Switched off, the keys play nothing.
+    let keys = h.get_by_label("Keys").rect().center();
+    click(&mut h, keys);
+    h.key_down(Key::A);
+    h.run_steps(2);
+    assert!(held(&h).is_empty());
+}
+
+#[test]
+fn typing_a_track_name_plays_nothing() {
+    let mut h = harness();
+    let name = header_name(&h, 0);
+    h.run_steps(30);
+    double_click(&mut h, name);
+    assert!(h.ctx.egui_wants_keyboard_input(), "the name is being edited");
+    h.key_down(Key::A);
+    h.run_steps(2);
+    assert!(h.state().session.live().held().is_empty());
+}
+
+#[test]
+fn what_is_played_while_recording_becomes_a_clip_when_playback_stops() {
+    let mut h = harness();
+    let rec = h.get_by_label("Rec").rect().center();
+    click(&mut h, rec);
+    assert!(h.state().session.is_recording());
+    h.key_press(Key::Space);
+    h.run_steps(2);
+    h.key_down(Key::A);
+    h.run_steps(5);
+    h.key_up(Key::A);
+    h.key_down(Key::D);
+    h.run_steps(2);
+    assert!(clips(&h).is_empty(), "nothing is written while playing");
+    h.key_press(Key::Space);
+    h.run_steps(2);
+    let written = clips(&h);
+    assert_eq!(written.len(), 1);
+    let take = &written[0].1;
+    assert_eq!(take.name, "Take");
+    let mut pitches: Vec<u8> = take.notes.values().map(|n| n.pitch).collect();
+    pitches.sort();
+    assert_eq!(
+        pitches,
+        [60, 64],
+        "the note still held when playback stopped is in it too"
+    );
+    h.key_up(Key::D);
+    undo(&mut h);
+    assert!(clips(&h).is_empty(), "the take is one undo step");
+}

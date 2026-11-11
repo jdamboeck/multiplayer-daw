@@ -657,13 +657,24 @@ fn header(app: &mut DawApp, ui: &mut Ui, rect: Rect, clip: Rect, id: TrackId, tr
             } else {
                 theme::TEXT
             };
-            text.text(
+            let written = text.text(
                 name.left_center(),
                 Align2::LEFT_CENTER,
                 &track.shell.name,
                 FontId::proportional(14.0),
                 color,
             );
+            // Who else plays on the track right now.
+            let players = app.session.players(id);
+            if !players.is_empty() {
+                text.text(
+                    pos2(written.right() + 8.0, name.center().y),
+                    Align2::LEFT_CENTER,
+                    format!("{} playing", players.join(", ")),
+                    FontId::proportional(12.0),
+                    theme::METER,
+                );
+            }
         }
 
         // Mute and delete.

@@ -5,8 +5,9 @@ use std::collections::BTreeSet;
 use egui::{Key, Modifiers};
 use mdaw_model::{ClipId, EntityRef, NoteId, Op, Tick, TickRange, TrackId};
 
+use crate::live::MidiWatch;
 use crate::session::{Session, new_track};
-use crate::ui::{arrange, changelog, checkout, devices, piano_roll, transport};
+use crate::ui::{arrange, changelog, checkout, devices, live, piano_roll, transport};
 
 /// The view that keyboard commands such as Delete act on: the one clicked last.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -52,6 +53,7 @@ pub struct DawApp {
     pub confirm_force: Option<TrackId>,
     /// The changelog lists the whole project rather than the selected track.
     pub changelog_all: bool,
+    pub live: live::LiveState,
 }
 
 impl DawApp {
@@ -75,6 +77,14 @@ impl DawApp {
             commit: None,
             confirm_force: None,
             changelog_all: false,
+            live: live::LiveState::default(),
+        }
+    }
+
+    /// Starts looking for MIDI inputs, so the user can pick one.
+    pub fn enable_midi(&mut self) {
+        if self.live.midi.is_none() {
+            self.live.midi = MidiWatch::start(self.session.live().clone()).ok();
         }
     }
 
@@ -96,6 +106,8 @@ impl DawApp {
             None => self.loop_on = false,
         }
         self.drop_stale_selection();
+        self.session.live().set_target(live::target(self));
+        live::keyboard(self, ui.ctx());
         self.shortcuts(ui.ctx());
         piano_roll::release_preview(self, ui.ctx());
 

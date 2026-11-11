@@ -4,6 +4,7 @@
 //! the server restarts. Time is the server's clock in microseconds; every client estimates how
 //! far its own clock is from it with [`Datagram::Ping`].
 
+use crate::midi::MidiPacket;
 use crate::wire::FrameError;
 use mdaw_model::{MAX_TICK, TempoMap, Tick, TickRange};
 use serde::{Deserialize, Serialize};
@@ -97,12 +98,14 @@ impl TransportState {
 }
 
 /// What travels in QUIC datagrams: unreliable, unordered, never retransmitted.
-#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub enum Datagram {
     /// Client to server. `t0` is the client's own clock and comes back unchanged.
     Ping { t0: i64 },
     /// The server's answer, with its clock at the moment it answered.
     Pong { t0: i64, server_micros: i64 },
+    /// Live notes. From a client to the server, which passes them on to the others.
+    Midi(MidiPacket),
 }
 
 impl Datagram {

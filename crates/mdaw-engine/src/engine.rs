@@ -1,18 +1,20 @@
-use crate::rt::{Anchor, Command, RtCore, Shared};
+use crate::rt::{Anchor, Command, LiveNote, RtCore, Shared};
 use crate::{alloc_guard, clock};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use mdaw_dsp::{Compiler, Graph};
 use mdaw_model::{Project, Tick, TickRange, TrackId};
 use std::collections::VecDeque;
 use std::fmt;
-use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Output latencies beyond this are taken for a misreport.
 const MAX_LATENCY: Duration = Duration::from_secs(1);
 /// Capacity of the command ring.
 const COMMANDS: usize = 1024;
+/// Capacity of the ring for live notes.
+const LIVE_NOTES: usize = 1024;
 /// Graphs that may be on their way to or from the audio thread at once.
 const MAX_GRAPHS_IN_FLIGHT: usize = 16;
 
@@ -27,7 +29,7 @@ impl fmt::Display for EngineError {
 
 impl std::error::Error for EngineError {}
 
-fn err(e: impl fmt::Display) -> EngineError {
+pub(crate) fn err(e: impl fmt::Display) -> EngineError {
     EngineError(e.to_string())
 }
 
@@ -88,11 +90,43 @@ pub struct Engine {
     preview_seq: u64,
     /// Previews the audio thread may still hold, by `id`.
     previews: Vec<(u64, Arc<[f32]>)>,
+    live: LiveInput,
+}
+
+/// Plays live notes from any thread, straight into the audio thread: a note played on a MIDI
+/// device or arriving from the network does not wait for the UI. Cheap to clone.
+#[derive(Clone)]
+pub struct LiveInput {
+    ring: Arc<Mutex<rtrb::Producer<LiveNote>>>,
+}
+
+impl LiveInput {
+    /// Starts a note on `track`. `key` identifies it for [`LiveInput::note_off`]; keys are
+    /// shared with [`Engine::note_on`]. False if the note was dropped because the audio thread
+    /// is far behind.
+    pub fn note_on(&self, track: TrackId, key: u64, pitch: u8, vel: u8) -> bool {
+        self.push(LiveNote::On {
+            track,
+            key,
+            pitch,
+            vel,
+        })
+    }
+
+    pub fn note_off(&self, track: TrackId, key: u64) -> bool {
+        self.push(LiveNote::Off { track, key })
+    }
+
+    fn push(&self, note: LiveNote) -> bool {
+        let mut ring = self.ring.lock().unwrap_or_else(|e| e.into_inner());
+        ring.push(note).is_ok()
+    }
 }
 
 struct Parts {
     core: RtCore,
     commands: rtrb::Producer<Command>,
+    live: LiveInput,
     garbage: rtrb::Consumer<Box<Graph>>,
     shared: Arc<Shared>,
 }
@@ -101,17 +135,22 @@ fn parts(sample_rate: u32) -> Parts {
     // Start the clock before the audio thread reads it.
     clock::now_micros();
     let (commands, command_rx) = rtrb::RingBuffer::new(COMMANDS);
+    let (live, live_rx) = rtrb::RingBuffer::new(LIVE_NOTES);
     let (garbage_tx, garbage) = rtrb::RingBuffer::new(MAX_GRAPHS_IN_FLIGHT + 1);
     let shared = Arc::new(Shared::default());
     let core = RtCore::new(
         Box::new(Graph::empty(sample_rate)),
         command_rx,
+        live_rx,
         garbage_tx,
         shared.clone(),
     );
     Parts {
         core,
         commands,
+        live: LiveInput {
+            ring: Arc::new(Mutex::new(live)),
+        },
         garbage,
         shared,
     }
@@ -147,6 +186,7 @@ impl Engine {
         let Parts {
             core,
             commands,
+            live,
             garbage,
             shared,
         } = parts(sample_rate);
@@ -162,6 +202,7 @@ impl Engine {
             sample_rate,
             description,
             commands,
+            live,
             garbage,
             shared,
             Backend::Device(stream),
@@ -176,6 +217,7 @@ impl Engine {
         let Parts {
             core,
             commands,
+            live,
             garbage,
             shared,
         } = parts(sample_rate);
@@ -188,13 +230,14 @@ impl Engine {
             },
         };
         let description = format!("no audio device, {sample_rate} Hz");
-        Self::assemble(sample_rate, description, commands, garbage, shared, backend)
+        Self::assemble(sample_rate, description, commands, live, garbage, shared, backend)
     }
 
     fn assemble(
         sample_rate: u32,
         description: String,
         commands: rtrb::Producer<Command>,
+        live: LiveInput,
         garbage: rtrb::Consumer<Box<Graph>>,
         shared: Arc<Shared>,
         backend: Backend,
@@ -214,7 +257,13 @@ impl Engine {
             backend,
             preview_seq: 0,
             previews: Vec::new(),
+            live,
         }
+    }
+
+    /// A handle that plays live notes from any thread.
+    pub fn live_input(&self) -> LiveInput {
+        self.live.clone()
     }
 
     pub fn sample_rate(&self) -> u32 {

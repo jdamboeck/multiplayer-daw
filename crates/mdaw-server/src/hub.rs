@@ -465,6 +465,11 @@ impl Hub {
         }
     }
 
+    /// The user behind a connected actor. A made-up one for an actor that is gone.
+    pub fn user_of(&self, actor: ActorId) -> UserId {
+        self.sessions.get(&actor).map_or(UserId(0), |s| s.user)
+    }
+
     pub fn peers(&self) -> Vec<Peer> {
         self.sessions
             .iter()

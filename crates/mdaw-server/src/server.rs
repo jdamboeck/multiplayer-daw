@@ -3,9 +3,10 @@
 use crate::blobs::Blobs;
 use crate::clock::Clock;
 use crate::hub::{Hub, Sink};
+use crate::relay::Relay;
 use crate::store::Store;
 use anyhow::{Context, Result, bail};
-use mdaw_model::ActorId;
+use mdaw_model::{ActorId, UserId};
 use mdaw_net::{Identity, JoinInfo, read_frame, read_frame_sized, write_frame};
 use mdaw_proto::{BlobAnswer, BlobRequest, ClientMsg, Datagram, Hello, MAX_BLOB, RefuseReason, ServerMsg};
 use quinn::{Connection, Endpoint, VarInt};
@@ -41,7 +42,7 @@ enum Command {
     Join {
         hello: Hello,
         sink: Sink,
-        reply: oneshot::Sender<Result<ActorId, RefuseReason>>,
+        reply: oneshot::Sender<Result<(ActorId, UserId), RefuseReason>>,
     },
     Msg {
         actor: ActorId,
@@ -105,11 +106,16 @@ impl Server {
             token,
         };
 
+        let relay = Relay::default();
+        relay.set_checkouts(hub.doc());
         let (commands, inbox) = std_mpsc::channel();
-        let hub = std::thread::Builder::new()
-            .name("mdaw-project".into())
-            .spawn(move || run_hub(hub, inbox))?;
-        runtime.spawn(accept(endpoint.clone(), commands.clone(), clock, blobs));
+        let hub = {
+            let relay = relay.clone();
+            std::thread::Builder::new()
+                .name("mdaw-project".into())
+                .spawn(move || run_hub(hub, inbox, relay))?
+        };
+        runtime.spawn(accept(endpoint.clone(), commands.clone(), clock, blobs, relay));
         Ok(Self {
             join,
             endpoint,
@@ -162,7 +168,7 @@ impl Drop for Server {
     }
 }
 
-fn run_hub(mut hub: Hub, inbox: std_mpsc::Receiver<Command>) {
+fn run_hub(mut hub: Hub, inbox: std_mpsc::Receiver<Command>, relay: Relay) {
     let mut ticked = std::time::Instant::now();
     loop {
         if ticked.elapsed() >= Duration::from_secs(1) {
@@ -174,25 +180,37 @@ fn run_hub(mut hub: Hub, inbox: std_mpsc::Receiver<Command>) {
             Err(std_mpsc::RecvTimeoutError::Timeout) => continue,
             Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
         };
+        let head = hub.head();
         match command {
             Command::Join { hello, sink, reply } => {
-                let _ = reply.send(hub.join(hello, sink));
+                let joined = hub.join(hello, sink).map(|actor| (actor, hub.user_of(actor)));
+                let _ = reply.send(joined);
             }
             Command::Msg { actor, msg, .. } => hub.handle(actor, msg),
             Command::Leave { actor } => hub.leave(actor),
             Command::Stop => break,
         }
+        if hub.head() != head {
+            relay.set_checkouts(hub.doc());
+        }
     }
 }
 
-async fn accept(endpoint: Endpoint, commands: std_mpsc::Sender<Command>, clock: Clock, blobs: Blobs) {
+async fn accept(
+    endpoint: Endpoint,
+    commands: std_mpsc::Sender<Command>,
+    clock: Clock,
+    blobs: Blobs,
+    relay: Relay,
+) {
     while let Some(incoming) = endpoint.accept().await {
         let commands = commands.clone();
         let blobs = blobs.clone();
+        let relay = relay.clone();
         tokio::spawn(async move {
             // A connection that fails is the client's to retry; the server has nothing to do.
             if let Ok(connection) = incoming.await {
-                let _ = serve(&connection, commands, clock, blobs).await;
+                let _ = serve(&connection, commands, clock, blobs, &relay).await;
                 connection.close(VarInt::from_u32(0), b"");
             }
         });
@@ -204,6 +222,7 @@ async fn serve(
     commands: std_mpsc::Sender<Command>,
     clock: Clock,
     blobs: Blobs,
+    relay: &Relay,
 ) -> Result<()> {
     let (mut send, mut recv) = connection.accept_bi().await?;
     let first = tokio::time::timeout(HELLO_TIMEOUT, read_frame::<ClientMsg>(&mut recv)).await??;
@@ -218,8 +237,8 @@ async fn serve(
     if commands.send(Command::Join { hello, sink, reply }).is_err() {
         bail!("the server is stopping");
     }
-    let actor = match joined.await? {
-        Ok(actor) => actor,
+    let (actor, user) = match joined.await? {
+        Ok(joined) => joined,
         Err(reason) => {
             write_frame(&mut send, &ServerMsg::Refused(reason)).await?;
             return finish(send).await;
@@ -253,13 +272,19 @@ async fn serve(
         }
         anyhow::Ok(())
     };
-    // Pings are answered right here, without a detour through the project thread: the less
-    // time passes between reading the clock and sending it, the better the clients' estimates.
-    let clock_service = async {
+    // Datagrams are handled right here, without a detour through the project thread. For
+    // pings: the less time passes between reading the clock and sending it, the better the
+    // clients' estimates. For live notes: every millisecond is heard.
+    relay.add(actor, user, connection.clone());
+    let datagrams = async {
         loop {
-            if let Some(Datagram::Ping { t0 }) = mdaw_net::read_datagram(connection).await? {
-                let server_micros = clock.micros();
-                mdaw_net::send_datagram(connection, &Datagram::Pong { t0, server_micros });
+            match mdaw_net::read_datagram(connection).await? {
+                Some(Datagram::Ping { t0 }) => {
+                    let server_micros = clock.micros();
+                    mdaw_net::send_datagram(connection, &Datagram::Pong { t0, server_micros });
+                }
+                Some(Datagram::Midi(packet)) => relay.forward(actor, packet),
+                Some(Datagram::Pong { .. }) | None => {}
             }
         }
     };
@@ -279,9 +304,10 @@ async fn serve(
     let result: Result<()> = tokio::select! {
         result = writer => result,
         result = reader => result,
-        result = clock_service => result,
+        result = datagrams => result,
         result = blob_service => result,
     };
+    relay.remove(actor);
     let _ = commands.send(Command::Leave { actor });
     result
 }

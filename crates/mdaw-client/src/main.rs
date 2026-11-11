@@ -175,8 +175,10 @@ fn main() -> ExitCode {
             DawApp::setup(&cc.egui_ctx);
             let _ = ctx.set(cc.egui_ctx.clone());
             let sync_log = std::env::var_os("MDAW_SYNC_LOG").is_some_and(|value| value != "0");
+            let mut app = DawApp::new(session);
+            app.enable_midi();
             Ok(Box::new(Shell {
-                app: DawApp::new(session),
+                app,
                 sync_logged: sync_log.then(Instant::now),
             }))
         }),

@@ -334,6 +334,24 @@ fn live_notes_sound_without_the_transport() {
 }
 
 #[test]
+fn live_notes_from_another_thread_reach_the_audio_thread() {
+    let song = Song::new(&[]);
+    let mut engine = engine(&song);
+    let live = engine.live_input();
+    std::thread::spawn(move || assert!(live.note_on(song.track, 5, 64, 110)))
+        .join()
+        .unwrap();
+    assert!(peak(&pump(&mut engine, 4800)) > 0.05);
+    let live = engine.live_input();
+    std::thread::spawn(move || assert!(live.note_off(song.track, 5)))
+        .join()
+        .unwrap();
+    pump(&mut engine, SR as usize);
+    assert_eq!(peak(&pump(&mut engine, 1000)), 0.0);
+    no_allocations();
+}
+
+#[test]
 fn a_stalled_audio_thread_does_not_lose_the_latest_document() {
     let mut song = Song::new(&[]);
     let mut engine = engine(&song);

@@ -4,6 +4,7 @@
 //! queues what it wants sent. When the connection breaks, the thread reconnects with growing
 //! pauses and asks the server to resume where it left off.
 
+use crate::live::{self, Live};
 use mdaw_engine::clock;
 use mdaw_model::BlobHash;
 use mdaw_net::{ClockEstimate, ClockSync, JoinInfo};
@@ -77,7 +78,8 @@ pub struct Link {
 
 impl Link {
     /// Starts connecting. The outcome arrives through [`Link::poll`].
-    pub fn connect(join: JoinInfo, who: Who, waker: Waker) -> std::io::Result<Self> {
+    /// Live notes go out and come in through `live`.
+    pub fn connect(join: JoinInfo, who: Who, waker: Waker, live: Live) -> std::io::Result<Self> {
         let (events_tx, events) = std_mpsc::channel();
         let (out, out_rx) = mpsc::unbounded_channel();
         let (stop, stop_rx) = watch::channel(false);
@@ -93,6 +95,7 @@ impl Link {
             stop: stop_rx,
             resume: None,
             epoch: 0,
+            live,
         };
         let thread = std::thread::Builder::new()
             .name("mdaw-link".into())
@@ -158,6 +161,7 @@ struct Task {
     resume: Option<Resume>,
     /// Counts the connections that got as far as a welcome.
     epoch: u64,
+    live: Live,
 }
 
 /// How one connection ended.
@@ -220,6 +224,7 @@ impl Task {
             _ = stopped(&mut self.stop) => return End::Stop,
         };
         let end = self.talk(&connection).await;
+        self.live.set_connection(None);
         let _ = tokio::time::timeout(CLOSE_TIMEOUT, mdaw_net::close(&endpoint, &connection)).await;
         end
     }
@@ -265,12 +270,14 @@ impl Task {
             return End::Stop;
         }
 
+        self.live.set_connection(Some(connection.clone()));
         let Task {
             events,
             waker,
             out,
             stop,
             resume,
+            live,
             ..
         } = self;
         let (events, waker) = (&*events, &*waker);
@@ -361,9 +368,19 @@ impl Task {
                             waker();
                         }
                     }
+                    // Straight to the engine, without waiting for the UI.
+                    Ok(Some(Datagram::Midi(packet))) => live.receive(&packet),
                     Ok(_) => {}
                     Err(_) => std::future::pending().await,
                 }
+            }
+        };
+        let live_notes = async {
+            let mut every = tokio::time::interval(live::TICK);
+            every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                every.tick().await;
+                live.tick();
             }
         };
         tokio::select! {
@@ -372,6 +389,7 @@ impl Task {
             _ = stopped(stop) => End::Stop,
             () = pinging => unreachable!(),
             () = timing => unreachable!(),
+            () = live_notes => unreachable!(),
         }
     }
 }

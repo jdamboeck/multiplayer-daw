@@ -3,8 +3,10 @@
 
 pub mod alloc_guard;
 pub mod clock;
-mod engine;
+pub(crate) mod engine;
 pub mod flac;
 mod rt;
 
-pub use engine::{Engine, EngineError, Stats};
+pub mod midi;
+
+pub use engine::{Engine, EngineError, LiveInput, Stats};

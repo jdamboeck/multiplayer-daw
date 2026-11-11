@@ -1,6 +1,7 @@
 //! What travels between client and server. The document itself lives in `mdaw-model`; this crate
 //! wraps its ops into transactions and into the events of the project's log.
 
+pub mod midi;
 mod transport;
 mod wire;
 
@@ -9,6 +10,7 @@ use mdaw_model::{
 };
 use serde::{Deserialize, Serialize};
 
+pub use midi::{LiveAction, LiveEvent, MidiIn, MidiOut, MidiPacket};
 pub use transport::{Datagram, MAX_LAG_MICROS, MAX_LEAD_MICROS, START_LEAD_MICROS, TransportState};
 pub use wire::{
     ALPN, BlobAnswer, BlobRequest, ClientMsg, CommitRequest, FrameError, Framed, Hello, MAX_BLOB, MAX_FRAME,
@@ -17,7 +19,7 @@ pub use wire::{
 };
 
 /// Bumped on every incompatible change to the wire format or to the meaning of an op.
-pub const PROTO_VERSION: u32 = 3;
+pub const PROTO_VERSION: u32 = 4;
 
 /// The hash a blob of these bytes is stored and named under.
 pub fn blob_hash(bytes: &[u8]) -> BlobHash {

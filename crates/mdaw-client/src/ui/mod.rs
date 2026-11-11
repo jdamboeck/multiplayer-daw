@@ -4,6 +4,7 @@ pub mod arrange;
 pub mod changelog;
 pub mod checkout;
 pub mod devices;
+pub mod live;
 pub mod piano_roll;
 pub mod transport;
 

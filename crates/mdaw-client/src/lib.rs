@@ -7,7 +7,9 @@
 mod app;
 pub mod checkout;
 mod link;
+pub mod live;
 pub mod profile;
+mod record;
 mod session;
 mod theme;
 pub mod ui;

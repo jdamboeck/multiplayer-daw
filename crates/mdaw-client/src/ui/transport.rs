@@ -39,6 +39,7 @@ pub fn show(app: &mut DawApp, ui: &mut Ui) {
         {
             app.stop();
         }
+        super::live::record_button(app, ui);
         let hint = "Repeat the loop region. Shift-drag in the ruler to set it.";
         if ui
             .toggle_value(&mut app.loop_on, "Loop")
@@ -138,6 +139,8 @@ pub fn show(app: &mut DawApp, ui: &mut Ui) {
             timing(app, ui);
         });
     });
+    ui.add_space(2.0);
+    super::live::show(app, ui);
     ui.add_space(3.0);
 }
 

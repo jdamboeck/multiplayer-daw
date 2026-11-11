@@ -5,6 +5,7 @@
 mod blobs;
 mod clock;
 mod hub;
+mod relay;
 mod sequencer;
 mod server;
 mod store;
