@@ -1,0 +1,70 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x86_64
+            exe: ""
+          - os: windows-latest
+            target: windows-x86_64
+            exe: ".exe"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+      - name: Linux audio and windowing headers
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libjack-jackd2-dev libpipewire-0.3-dev libclang-dev libx11-dev libxcb1-dev libxkbcommon-dev libwayland-dev
+      - run: cargo build --release --locked -p mdaw-client -p mdaw-server
+      - name: Package
+        shell: bash
+        run: |
+          name="mdaw-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir "$name"
+          cp "target/release/mdaw${{ matrix.exe }}" "target/release/mdaw-server${{ matrix.exe }}" README.md "$name/"
+          cp LICENSE* "$name/" 2>/dev/null || true
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            7z a "$name.zip" "$name" > /dev/null
+            echo "ASSET=$name.zip" >> "$GITHUB_ENV"
+          else
+            tar czf "$name.tar.gz" "$name"
+            echo "ASSET=$name.tar.gz" >> "$GITHUB_ENV"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ env.ASSET }}
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "mdaw ${GITHUB_REF_NAME#v}" \
+            --notes "Prototype build after milestone M5: live editing, shared transport, checkout and commit with changelog samples, and live MIDI. Unzip and run \`mdaw-server\`, then \`mdaw --join '<join string>' --name <you>\`. The Linux build needs PipeWire and ALSA libraries."

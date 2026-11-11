@@ -22,7 +22,15 @@ Prototype of a server/client DAW for collaborative editing. Working name.
   alone, then committed with rendered samples that everyone can play from the changelog; tempo
   changes during a checkout can be undone by the commit, and a checkout someone else ends leaves
   its owner a fork.
-- **M5** (live MIDI) is next.
+- **M5** done: live MIDI. Notes from the computer keyboard or a MIDI device are heard by everyone
+  as they arrive; recording turns them into a clip. A checked-out track hears only its owner.
+- **M6** (CLAP devices and stems) is next.
+
+## Downloads
+
+Releases on GitHub carry ready-made builds of the client (`mdaw`) and the server (`mdaw-server`)
+for Linux x86-64 and Windows x86-64. The Linux build needs PipeWire and ALSA libraries
+(`libpipewire-0.3`, `libasound2`), which desktop distributions have.
 
 ## Run
 
@@ -41,6 +49,9 @@ The pieces of the demo by hand, for another machine or a server that outlives it
 cargo run -p mdaw-server -- --data ./mdaw-data --host <name or address others reach you by>
 cargo run -p mdaw-client -- --join 'mdaw://...' --name Ann
 ```
+
+With the release builds, the same is `mdaw-server --data ./mdaw-data --host <name>` and
+`mdaw --join 'mdaw://...' --name Ann`.
 
 The server prints the join string. `cargo xtask server` and `cargo xtask client <name>` do the same
 with everything kept under `target/demo`; `cargo xtask help` lists the options.
