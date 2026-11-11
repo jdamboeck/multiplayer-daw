@@ -52,6 +52,11 @@ pub struct Hub {
     /// `last_txn` of connections that have ended, for when their clients resume.
     departed: HashMap<ActorId, Option<u64>>,
     snapshot_seq: u64,
+    /// Actors up to this one connected before the server last started.
+    earlier_run: ActorId,
+    /// The head of the log when the server started. Events after it that clients of the run
+    /// before had received may have been lost in a crash, and others written under their seq.
+    opened_at: u64,
     clock: Clock,
     /// The shared transport. Lives as long as the process.
     transport: TransportState,
@@ -69,7 +74,7 @@ impl Hub {
             Some(token) => String::from_utf8(token).context("stored token")?,
             None => {
                 let token = hex(&random::<16>()?);
-                store.set_meta("token", token.as_bytes())?;
+                store.set_meta_durably("token", token.as_bytes())?;
                 token
             }
         };
@@ -77,7 +82,7 @@ impl Hub {
             Some(key) => key.as_slice().try_into().ok().context("stored session key")?,
             None => {
                 let key = random::<32>()?;
-                store.set_meta("session_key", &key)?;
+                store.set_meta_durably("session_key", &key)?;
                 key
             }
         };
@@ -100,6 +105,7 @@ impl Hub {
             at = last;
         }
         let recent = store.events_after(head.saturating_sub(4096), 4096)?;
+        let earlier_run = store.last_actor()?;
         let clock = Clock::new();
         // After a restart every owner gets a full lease to come back.
         let leases = doc
@@ -121,6 +127,8 @@ impl Hub {
             blobs,
             leases,
             stale: Vec::new(),
+            earlier_run,
+            opened_at: head,
         })
     }
 
@@ -169,9 +177,10 @@ impl Hub {
         let actor = self.store.next_actor().expect("storing the actor counter");
         let head = self.seq.head();
 
-        let resume = hello
-            .resume
-            .filter(|r| r.session_secret == self.secret(r.prev_actor) && r.last_seq <= head);
+        let resume = hello.resume.filter(|r| {
+            let lost = r.prev_actor <= self.earlier_run && r.last_seq > self.opened_at;
+            r.session_secret == self.secret(r.prev_actor) && r.last_seq <= head && !lost
+        });
         let mut history = Vec::new();
         let (sync, acked) = match resume {
             Some(resume) => {

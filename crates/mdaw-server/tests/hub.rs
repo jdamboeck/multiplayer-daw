@@ -385,6 +385,60 @@ fn the_project_survives_a_restart() {
 }
 
 #[test]
+fn events_lost_in_a_crash_are_not_taken_for_their_replacements() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("project.db");
+    let mut hub = Hub::open(Store::open(&path).unwrap(), Blobs::in_memory()).unwrap();
+    let (ann, _, ann_welcome) = join(&mut hub, 1);
+    for n in 1..=5 {
+        hub.submit(ann, rename(n));
+    }
+    drop(hub);
+    // The machine went down before the last three events reached the disk.
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute("DELETE FROM events WHERE seq > 2", []).unwrap();
+    drop(db);
+
+    // After the restart, other events take the same seqs.
+    let mut hub = Hub::open(Store::open(&path).unwrap(), Blobs::in_memory()).unwrap();
+    assert_eq!(hub.head(), 2);
+    let (ben, _, _) = join(&mut hub, 2);
+    for n in 10..=13 {
+        hub.submit(ben, rename(n));
+    }
+    assert_eq!(hub.head(), 6);
+
+    // Ann had 5; the 3 to 5 she has are not the server's, so she starts over.
+    let resume = Resume {
+        prev_actor: ann,
+        session_secret: ann_welcome.session_secret,
+        last_seq: 5,
+    };
+    let (_, _, welcome) = rejoin(&mut hub, 1, Some(resume));
+    assert!(matches!(welcome.sync, SyncData::Snapshot(_)));
+
+    // A client of the earlier run that had only what survived catches up as usual.
+    let resume = Resume {
+        last_seq: 2,
+        ..resume
+    };
+    let (ann3, _, welcome) = rejoin(&mut hub, 1, Some(resume));
+    let SyncData::Events(events) = welcome.sync else {
+        panic!("expected events")
+    };
+    assert_eq!(events.len(), 4);
+
+    // And from now on, resuming within this run is as before.
+    let resume = Resume {
+        prev_actor: ann3,
+        session_secret: welcome.session_secret,
+        last_seq: 6,
+    };
+    let (_, _, welcome) = rejoin(&mut hub, 1, Some(resume));
+    assert!(matches!(welcome.sync, SyncData::Events(e) if e.is_empty()));
+}
+
+#[test]
 fn a_store_in_another_format_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("project.db");

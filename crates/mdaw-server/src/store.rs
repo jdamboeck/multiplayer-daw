@@ -69,6 +69,15 @@ impl Store {
             .optional()?)
     }
 
+    /// Like [`Store::set_meta`], but on disk before it returns, power loss or not. Events are
+    /// written with less care for speed: the last few may be gone after a crash of the machine.
+    pub fn set_meta_durably(&self, key: &str, value: &[u8]) -> Result<()> {
+        self.db.pragma_update(None, "synchronous", "FULL")?;
+        let result = self.set_meta(key, value);
+        self.db.pragma_update(None, "synchronous", "NORMAL")?;
+        result
+    }
+
     pub fn set_meta(&self, key: &str, value: &[u8]) -> Result<()> {
         self.db.execute(
             "INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT (key) DO UPDATE SET value = ?2",
@@ -165,14 +174,19 @@ impl Store {
         Ok(UserId(id))
     }
 
-    /// An actor ID never handed out before, across restarts.
+    /// An actor ID never handed out before, across restarts and crashes: entity IDs are minted
+    /// under it.
     pub fn next_actor(&self) -> Result<ActorId> {
-        let last = match self.meta("last_actor")? {
+        let next = self.last_actor()?.0.checked_add(1).context("out of actor IDs")?;
+        self.set_meta_durably("last_actor", &next.to_le_bytes())?;
+        Ok(ActorId(next))
+    }
+
+    /// The actor ID handed out last, `ActorId(0)` if none was.
+    pub fn last_actor(&self) -> Result<ActorId> {
+        Ok(ActorId(match self.meta("last_actor")? {
             Some(bytes) => u32::from_le_bytes(bytes.as_slice().try_into().context("stored actor counter")?),
             None => 0,
-        };
-        let next = last.checked_add(1).context("out of actor IDs")?;
-        self.set_meta("last_actor", &next.to_le_bytes())?;
-        Ok(ActorId(next))
+        }))
     }
 }

@@ -62,6 +62,12 @@ and the seq of the last event it received. If the secret fits and the log still 
 far (at most 5000 events, and at most 64 MiB of them), the server drops the old connection and
 answers with the missing events. Otherwise the answer carries a snapshot, as for a new client.
 
+Events are written to disk without waiting for each to land, so a crash of the machine can take
+the last few with it, and after the restart other events take their seqs. A client of the run
+before the restart (its `prev_actor` was handed out then) that claims events past the head the
+server started with gets a snapshot. Actor IDs, the token and the session key are written
+durably, so none of them is ever handed out twice.
+
 `acked` in the `Welcome` is the highest `client_txn_id` of the previous actor that the server has
 seen, sequenced or rejected. The client drops pending transactions up to that number that the
 catch-up did not confirm (they were rejected while it was away) and submits the rest again under
