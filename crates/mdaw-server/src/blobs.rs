@@ -4,7 +4,9 @@ use anyhow::{Context, Result};
 use mdaw_model::BlobHash;
 use mdaw_proto::blob_hash;
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// The project's blobs. Cheap to clone; all clones share the same store. Blobs are written
@@ -23,6 +25,12 @@ impl Blobs {
     pub fn open(dir: impl Into<PathBuf>) -> Result<Self> {
         let dir = dir.into();
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        // Halves of uploads that a crash interrupted.
+        for entry in std::fs::read_dir(&dir)?.filter_map(|e| e.ok()) {
+            if entry.path().extension().is_some_and(|x| x == "part") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
         Ok(Self(Inner::Disk(dir)))
     }
 
@@ -58,9 +66,21 @@ impl Blobs {
             Inner::Disk(dir) => {
                 let path = dir.join(hash.to_string());
                 if !path.is_file() {
-                    // Written aside and renamed, so a blob is either whole or not there.
-                    let part = dir.join(format!("{hash}.part"));
-                    std::fs::write(&part, bytes).context("writing a blob")?;
+                    // Written aside, on disk, then renamed: a blob is either whole or not there,
+                    // also after a crash. Each upload has a file of its own, as two of the same
+                    // blob can arrive at once.
+                    static UPLOADS: AtomicU64 = AtomicU64::new(0);
+                    let n = UPLOADS.fetch_add(1, Ordering::Relaxed);
+                    let part = dir.join(format!("{hash}.{n}.part"));
+                    let write = || -> std::io::Result<()> {
+                        let mut file = std::fs::File::create(&part)?;
+                        file.write_all(bytes)?;
+                        file.sync_all()
+                    };
+                    if let Err(err) = write() {
+                        let _ = std::fs::remove_file(&part);
+                        return Err(err).context("writing a blob");
+                    }
                     std::fs::rename(&part, &path).context("storing a blob")?;
                 }
             }

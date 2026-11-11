@@ -456,3 +456,40 @@ fn an_edit_too_large_to_send_is_taken_back_and_the_connection_stays() {
     settle(&mut [&mut ann, &mut ben]);
     assert_eq!(ben.project().tracks.len(), 1);
 }
+
+#[test]
+fn a_fork_the_server_refuses_to_add_stays_a_fork() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = server(dir.path());
+    let (mut ben, track, _) = leave_work_behind(&server, dir.path());
+    ben.force_release(track);
+    // The project is full: a thousand tracks.
+    let ids = ben.ids();
+    let more: Vec<Op> = (1..1000)
+        .map(|n| Op::TrackAdd {
+            id: ids.track(),
+            shell: TrackShell {
+                name: format!("t{n}"),
+                color: 0,
+            },
+            content: TrackContent::default(),
+            after: None,
+        })
+        .collect();
+    assert!(ben.edit(more));
+    settle(&mut [&mut ben]);
+    assert_eq!(ben.project().tracks.len(), 1000);
+
+    let mut ann = rejoin(&server, dir.path());
+    assert!(ann.restore_fork(0));
+    assert!(ann.forks().is_empty(), "out of sight while on its way");
+    until(&mut [&mut ann, &mut ben], "the fork is back", |s| {
+        s[0].forks().len() == 1
+    });
+    assert!(ann.notices().iter().any(|n| n.contains("could not be added")));
+    assert_eq!(
+        Files::new(dir.path().join("ann")).forks().len(),
+        1,
+        "still on disk"
+    );
+}

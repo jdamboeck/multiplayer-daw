@@ -192,6 +192,8 @@ pub struct Session {
     /// The sample playing, with its preview id.
     playing: Option<(BlobHash, u64)>,
     forks: Vec<Fork>,
+    /// Forks being added back as a new track, by that track, until the server has it.
+    restoring: Vec<(TrackId, Fork)>,
     lease_sent: Instant,
 }
 
@@ -362,6 +364,7 @@ impl Session {
             wanted: None,
             playing: None,
             forks: Vec::new(),
+            restoring: Vec::new(),
             lease_sent: Instant::now(),
         };
         session.replica.set_user(user);
@@ -480,6 +483,7 @@ impl Session {
         self.receive();
         self.poll_jobs();
         self.keep_workspaces();
+        self.settle_restores();
         self.share_presence();
         self.engine.set_project(self.replica.view());
         self.sync_transport();
@@ -1011,7 +1015,7 @@ impl Session {
         &self.forks
     }
 
-    /// Adds a fork to the project as a new track, and forgets it.
+    /// Adds a fork to the project as a new track, and forgets it once the server has the track.
     pub fn restore_fork(&mut self, index: usize) -> bool {
         let Some(fork) = self.forks.get(index).cloned() else {
             return false;
@@ -1036,8 +1040,34 @@ impl Session {
         if !self.edit(vec![op]) {
             return false;
         }
-        self.discard_fork(index);
+        // Kept, out of sight, until the server has the track: it could still refuse it.
+        let fork = self.forks.remove(index);
+        self.restoring.push((id, fork));
         true
+    }
+
+    /// Forgets forks whose track the server has accepted, and offers again those it refused.
+    fn settle_restores(&mut self) {
+        let (confirmed, view) = (self.replica.confirmed(), self.replica.view());
+        let mut back = Vec::new();
+        self.restoring.retain(|(id, fork)| {
+            if confirmed.track(*id).is_some() {
+                let _ = std::fs::remove_file(&fork.path);
+                false
+            } else if view.track(*id).is_none() {
+                back.push(fork.clone());
+                false
+            } else {
+                true
+            }
+        });
+        for fork in back {
+            notice(
+                &mut self.notices,
+                "The fork could not be added; it is still in the changelog.",
+            );
+            self.forks.push(fork);
+        }
     }
 
     pub fn discard_fork(&mut self, index: usize) {

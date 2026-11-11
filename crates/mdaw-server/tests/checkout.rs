@@ -352,6 +352,32 @@ fn blobs_are_stored_only_under_their_own_hash() {
 }
 
 #[test]
+fn uploads_of_one_blob_at_once_do_not_trip_over_each_other() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("blobs");
+    std::fs::create_dir_all(&path).unwrap();
+    // Left behind by a crash.
+    std::fs::write(path.join("x.part"), b"half").unwrap();
+    let blobs = Blobs::open(&path).unwrap();
+    assert!(!path.join("x.part").exists());
+
+    let bytes: Arc<[u8]> = vec![3u8; 4 << 20].into();
+    let hash = blob_hash(&bytes);
+    let uploads: Vec<_> = (0..8)
+        .map(|_| {
+            let (blobs, bytes) = (blobs.clone(), bytes.clone());
+            std::thread::spawn(move || blobs.put(&hash, &bytes).unwrap())
+        })
+        .collect();
+    for upload in uploads {
+        assert!(upload.join().unwrap());
+    }
+    assert_eq!(blobs.get(&hash).unwrap().as_deref(), Some(&bytes[..]));
+    let files: Vec<_> = std::fs::read_dir(&path).unwrap().collect();
+    assert_eq!(files.len(), 1, "no halves left");
+}
+
+#[test]
 fn commits_survive_a_restart_and_new_clients_see_them_in_the_history() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("project.db");
@@ -407,4 +433,53 @@ fn only_the_owner_renews_a_lease_and_nothing_is_stale_at_first() {
             .iter()
             .any(|m| matches!(m, ServerMsg::Stale(_) | ServerMsg::Denied { .. }))
     );
+}
+
+#[test]
+fn a_clip_does_not_grow_past_its_limit_one_note_at_a_time() {
+    let (mut hub, ann, _ben) = setup(Store::in_memory().unwrap());
+    let add = |n: u64| Op::NoteAdd {
+        track: TRACK,
+        clip: CLIP,
+        id: NoteId(EntityId(1 << 32 | (1000 + n))),
+        note: Note {
+            start: Tick(n as i64 % 3840),
+            dur: Tick(10),
+            pitch: 60,
+            vel: 100,
+        },
+    };
+    let txn = |id: u64, ops: Vec<Op>| Txn {
+        client_txn_id: id,
+        base_seq: 1,
+        ops,
+    };
+    let notes = |hub: &Hub| hub.doc().track(TRACK).unwrap().content.clips[&CLIP].notes.len();
+
+    // Over the limit in one transaction: none of it lands.
+    let t = txn(2, (0..50_001).map(add).collect());
+    hub.submit(ann.actor, t);
+    assert_eq!(notes(&hub), 0);
+    // Up to it, then one more.
+    let t = txn(3, (0..50_000).map(add).collect());
+    hub.submit(ann.actor, t);
+    assert_eq!(notes(&hub), 50_000);
+    ann.inbox.drain();
+    let t = txn(4, vec![add(60_000)]);
+    hub.submit(ann.actor, t);
+    assert_eq!(notes(&hub), 50_000);
+    let refused = ann.inbox.drain().into_iter().any(|m| {
+        matches!(
+            m,
+            ServerMsg::Rejected {
+                client_txn_id: 4,
+                reason: RejectReason::Invalid(_)
+            }
+        )
+    });
+    assert!(refused);
+    // Changing a note that is there is still fine.
+    let t = txn(5, vec![add(5)]);
+    hub.submit(ann.actor, t);
+    assert!(ann.inbox.drain().iter().any(|m| matches!(m, ServerMsg::Event(_))));
 }

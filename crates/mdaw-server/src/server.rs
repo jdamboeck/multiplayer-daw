@@ -11,13 +11,18 @@ use mdaw_proto::{BlobAnswer, BlobRequest, ClientMsg, Datagram, Hello, MAX_BLOB, 
 use quinn::{Connection, Endpoint, VarInt};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
 use std::thread::JoinHandle;
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
 /// Messages a client may have waiting to be written before it counts as too slow.
 const OUTBOX: usize = 4096;
+/// Messages of one client the project thread may have waiting.
+const QUEUED_PER_CLIENT: usize = 256;
+/// Blob transfers of one client at a time; each holds its blob in memory.
+const BLOBS_PER_CLIENT: usize = 4;
 
 /// How long a new connection has to say hello.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
@@ -40,6 +45,8 @@ enum Command {
     Msg {
         actor: ActorId,
         msg: ClientMsg,
+        /// One of the connection's places in the queue, free again when the message is handled.
+        _queued: OwnedSemaphorePermit,
     },
     Leave {
         actor: ActorId,
@@ -170,7 +177,7 @@ fn run_hub(mut hub: Hub, inbox: std_mpsc::Receiver<Command>) {
             Command::Join { hello, sink, reply } => {
                 let _ = reply.send(hub.join(hello, sink));
             }
-            Command::Msg { actor, msg } => hub.handle(actor, msg),
+            Command::Msg { actor, msg, .. } => hub.handle(actor, msg),
             Command::Leave { actor } => hub.leave(actor),
             Command::Stop => break,
         }
@@ -225,9 +232,20 @@ async fn serve(
         }
         anyhow::Ok(())
     };
+    // A client that sends faster than the project thread handles its messages waits here, and
+    // QUIC's flow control slows it down; the queue does not grow.
+    let queue = Arc::new(Semaphore::new(QUEUED_PER_CLIENT));
     let reader = async {
         while let Some(msg) = read_frame::<ClientMsg>(&mut recv).await? {
-            if commands.send(Command::Msg { actor, msg }).is_err() {
+            let queued = queue.clone().acquire_owned().await?;
+            if commands
+                .send(Command::Msg {
+                    actor,
+                    msg,
+                    _queued: queued,
+                })
+                .is_err()
+            {
                 break;
             }
         }
@@ -244,12 +262,15 @@ async fn serve(
         }
     };
     // Every further stream carries one blob. Only a client that was let in gets here.
+    let transfers = Arc::new(Semaphore::new(BLOBS_PER_CLIENT));
     let blob_service = async {
         loop {
             let (send, recv) = connection.accept_bi().await?;
+            let transfer = transfers.clone().acquire_owned().await?;
             let blobs = blobs.clone();
             tokio::spawn(async move {
                 let _ = blob_stream(send, recv, blobs).await;
+                drop(transfer);
             });
         }
     };

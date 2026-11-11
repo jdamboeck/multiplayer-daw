@@ -97,8 +97,10 @@ The server handles one transaction at a time:
 
 1. **Check.** Ops out of range, an empty transaction, a `base_seq` ahead of the log, content edits
    on a track that is checked out or carries a CLAP device, and adding a CLAP device outside a
-   commit are rejected. A rejected transaction changes nothing; its sender alone gets
-   `Rejected { client_txn_id, reason }`.
+   commit are rejected. So is a transaction that would take the project past its size limits
+   (1000 tracks, 10 000 tempo points, 10 000 clips and 32 devices per track, 50 000 notes per
+   clip, 4096 parameters per device), checked op by op against what is there. A rejected
+   transaction changes nothing; its sender alone gets `Rejected { client_txn_id, reason }`.
 2. **Apply** to the server's document. Applying is total: an op on something that no longer
    exists, or an add of an ID that exists, does nothing, on every replica alike.
 3. **Find what it displaced** (below).
@@ -106,6 +108,10 @@ The server handles one transaction at a time:
 
 Events are the only way the document changes. Every client applies them in `seq` order, so all
 replicas hold the same document.
+
+The project thread handles one message at a time. Each connection may have 256 messages waiting
+for it; past that, the server stops reading from it until there is room, and QUIC's flow control
+slows the client down.
 
 ### What the client does
 
@@ -342,8 +348,10 @@ BlobRequest::Get { hash }       ->  Found { len } + bytes | Missing
 
 The server answers `Stored` at once if it has the blob, checks that uploaded bytes hash to the
 announced hash, and refuses blobs over 256 MiB. The client checks the hash of every download.
-Blobs are kept as files under `blobs/` in the data directory, written aside and renamed, and are
-never deleted.
+Blobs are kept as files under `blobs/` in the data directory, each upload written to a file of its
+own, flushed to disk and then renamed, so a stored blob is whole even after a crash. Halves left
+by a crash are removed when the server starts. Blobs are never deleted. A client may have four
+transfers at a time; further streams wait.
 
 ## Server storage
 

@@ -344,6 +344,41 @@ impl Op {
         }
     }
 
+    /// Whether applying this op to `project` keeps it within the size limits. [`Op::validate`]
+    /// checks what an op carries; this checks what it adds to what is there, so that many small
+    /// ops cannot grow a clip or a track without end.
+    pub fn fits(&self, project: &Project) -> Result<(), Invalid> {
+        let content = |track: &TrackId| project.track(*track).map(|t| &t.content);
+        let full = match self {
+            Op::TrackAdd { id, .. } => !project.tracks.contains_key(id) && project.tracks.len() >= MAX_TRACKS,
+            Op::TempoPut { id, .. } => {
+                !project.tempo.contains_key(id) && project.tempo.len() >= MAX_TEMPO_POINTS
+            }
+            Op::ClipAdd { track, id, .. } => content(track)
+                .is_some_and(|c| !c.clips.contains_key(id) && c.clips.len() >= MAX_CLIPS_PER_TRACK),
+            Op::NoteAdd { track, clip, id, .. } => content(track)
+                .and_then(|c| c.clips.get(clip))
+                .is_some_and(|c| !c.notes.contains_key(id) && c.notes.len() >= MAX_NOTES_PER_CLIP),
+            Op::DeviceAdd { track, .. } => {
+                content(track).is_some_and(|c| c.devices.len() >= MAX_DEVICES_PER_TRACK)
+            }
+            Op::DeviceSetParam {
+                track,
+                id,
+                param,
+                value: Some(_),
+            } => content(track)
+                .and_then(|c| c.device(*id))
+                .is_some_and(|d| !d.params.contains_key(param) && d.params.len() >= MAX_PARAMS_PER_DEVICE),
+            _ => false,
+        };
+        if full {
+            Err(Invalid("the limit of the project's size is reached"))
+        } else {
+            Ok(())
+        }
+    }
+
     /// Range checks the server runs before sequencing. `apply` itself accepts anything.
     pub fn validate(&self) -> Result<(), Invalid> {
         match self {
@@ -429,6 +464,8 @@ pub fn fit_name(name: &str, suffix: &str) -> String {
 const MAX_PLUGIN_ID_BYTES: usize = 256;
 const MAX_NOTES_PER_CLIP: usize = 50_000;
 const MAX_CLIPS_PER_TRACK: usize = 10_000;
+const MAX_TRACKS: usize = 1000;
+const MAX_TEMPO_POINTS: usize = 10_000;
 const MAX_DEVICES_PER_TRACK: usize = 32;
 const MAX_PARAMS_PER_DEVICE: usize = 4096;
 const MAX_GAIN: f32 = 4.0;

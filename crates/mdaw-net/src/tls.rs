@@ -40,13 +40,7 @@ impl Identity {
             return Ok(Self { cert, key });
         }
         let identity = Self::generate()?;
-        std::fs::write(&key_path, &identity.key)
-            .with_context(|| format!("writing {}", key_path.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))?;
-        }
+        write_private(&key_path, &identity.key).with_context(|| format!("writing {}", key_path.display()))?;
         std::fs::write(&cert_path, &identity.cert)
             .with_context(|| format!("writing {}", cert_path.display()))?;
         Ok(identity)
@@ -154,5 +148,46 @@ impl ServerCertVerifier for Pinned {
 
     fn root_hint_subjects(&self) -> Option<&[DistinguishedName]> {
         None
+    }
+}
+
+/// Writes a file only its owner can read, from the first byte on.
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(path)?;
+    // A file that was there before keeps its mode on open.
+    #[cfg(unix)]
+    file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn only_the_owner_can_read_the_key() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        // A key file that was there with lax rights, and a directory others can read.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(dir.path().join("key.der"), b"old").unwrap();
+        std::fs::set_permissions(dir.path().join("key.der"), std::fs::Permissions::from_mode(0o644)).unwrap();
+        let identity = Identity::load_or_create(dir.path()).unwrap();
+        let mode = std::fs::metadata(dir.path().join("key.der"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(
+            Identity::load_or_create(dir.path()).unwrap().fingerprint(),
+            identity.fingerprint()
+        );
     }
 }

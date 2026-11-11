@@ -101,8 +101,12 @@ impl Sequencer {
         self.check(user, &txn)?;
         let seq = self.head + 1;
         let mut superseded = self.overwritten(user, &txn);
+        // On a copy, which costs nothing: a transaction that would grow the project past its
+        // limits leaves it as it was.
+        let mut doc = self.doc.clone();
         for op in &txn.ops {
-            let changed = apply(&mut self.doc, op).is_some();
+            op.fits(&doc).map_err(|e| RejectReason::Invalid(e.to_string()))?;
+            let changed = apply(&mut doc, op).is_some();
             if !changed && let Some(lost) = self.fell_into_removal(user, &txn, op) {
                 superseded.push(Superseded {
                     entity: lost.entity(),
@@ -114,6 +118,7 @@ impl Sequencer {
                 });
             }
         }
+        self.doc = doc;
         let event = Event {
             seq,
             actor,
@@ -197,7 +202,8 @@ impl Sequencer {
         let mut after = (*current.content).clone();
         {
             let mut doc = self.doc.clone();
-            for op in &commit.ops {
+            for op in commit.ops.iter().chain(&commit.project_fix) {
+                op.fits(&doc).map_err(|e| RejectReason::Invalid(e.to_string()))?;
                 apply(&mut doc, op);
             }
             if let Some(t) = doc.track(track) {
