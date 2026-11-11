@@ -319,3 +319,58 @@ fn the_test_synth_misbehaves_only_when_told_and_a_failure_is_reported() {
     assert!(synth.crashed());
     device.retire();
 }
+
+/// What the start of an offline render of an installed plugin looks like, as a commit renders
+/// it: notes from the very first frame. Run by hand with
+/// `MDAW_PROBE=<plugin id> cargo test -p mdaw-plugin --test host -- --ignored probe --nocapture`.
+#[test]
+#[ignore = "depends on the plugins installed here"]
+fn probe_the_start_of_an_offline_render() {
+    let Ok(id) = std::env::var("MDAW_PROBE") else {
+        return;
+    };
+    let mut host = Host::standard(false);
+    let mut instance = host.create(PluginFormat::Clap, &id, settings(true)).unwrap();
+    if let Ok(path) = std::env::var("MDAW_PROBE_STATE") {
+        instance.load_state(&std::fs::read(path).unwrap()).unwrap();
+    }
+    let mut device = instance.take_processor().unwrap();
+    let warm: usize = std::env::var("MDAW_PROBE_WARM")
+        .ok()
+        .and_then(|w| w.parse().ok())
+        .unwrap_or(0);
+    for _ in 0..warm {
+        let (mut l, mut r) = (vec![0.0; BLOCK], vec![0.0; BLOCK]);
+        device.process(
+            &mut l,
+            &mut r,
+            &BlockTime {
+                playing: false,
+                bpm: 120.0,
+                ..BlockTime::default()
+            },
+        );
+    }
+    device.note_on(1, 48, 100);
+    let mut left = Vec::new();
+    for _ in 0..40 {
+        let (mut l, mut r) = (vec![0.0; BLOCK], vec![0.0; BLOCK]);
+        device.process(
+            &mut l,
+            &mut r,
+            &BlockTime {
+                playing: true,
+                bpm: 120.0,
+                ..BlockTime::default()
+            },
+        );
+        left.extend(l);
+    }
+    // Peak and how often the sign changes (a noise measure), per 5 ms.
+    for (i, chunk) in left.chunks(240).take(30).enumerate() {
+        let peak = chunk.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        let flips = chunk.windows(2).filter(|w| (w[0] > 0.0) != (w[1] > 0.0)).count();
+        eprintln!("{:4} ms  peak {:.4}  sign changes {:3}", i * 5, peak, flips);
+    }
+    device.retire();
+}

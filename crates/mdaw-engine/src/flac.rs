@@ -224,3 +224,45 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod loud {
+    use super::*;
+
+    #[test]
+    fn a_loud_tone_survives_24_bits_exactly_from_its_first_sample() {
+        // A sawtooth near full scale, as a synth plays it, for two seconds.
+        let samples: Vec<f32> = (0..96_000)
+            .flat_map(|i| {
+                let x = ((i as f32 * 261.6 / 48_000.0).fract() * 2.0 - 1.0) * 0.85;
+                [x, x * 0.9]
+            })
+            .collect();
+        let audio = decode(&encode_bits(&samples, 48_000, 24).unwrap(), 10).unwrap();
+        let worst = audio
+            .samples
+            .iter()
+            .zip(&samples)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max);
+        assert!(worst < 1e-6, "worst error {worst}");
+    }
+
+    /// Prints how a FLAC file starts, 5 ms at a time. Run by hand with
+    /// `MDAW_PROBE_FLAC=<file> cargo test -p mdaw-engine --lib -- --ignored probe --nocapture`.
+    #[test]
+    #[ignore = "a tool for looking at a file"]
+    fn probe_a_file() {
+        let Ok(path) = std::env::var("MDAW_PROBE_FLAC") else {
+            return;
+        };
+        let audio = decode(&std::fs::read(path).unwrap(), 900).unwrap();
+        eprintln!("{} Hz, {} frames", audio.sample_rate, audio.frames());
+        for (i, chunk) in audio.samples.chunks(480).take(40).enumerate() {
+            let left: Vec<f32> = chunk.iter().step_by(2).copied().collect();
+            let peak = left.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+            let flips = left.windows(2).filter(|w| (w[0] > 0.0) != (w[1] > 0.0)).count();
+            eprintln!("{:4} ms  peak {:.4}  sign changes {:3}", i * 5, peak, flips);
+        }
+    }
+}

@@ -771,6 +771,19 @@ impl Session {
     /// Keeps the plugins in step with the document, fetches the state blobs and stems they need,
     /// and renders a stem a slice at a time.
     fn keep_plugins(&mut self) {
+        // Without a server every track is this user's to change; with one, those checked out.
+        let editable = self
+            .replica
+            .confirmed()
+            .tracks
+            .iter()
+            .filter(|(_, t)| match &self.backend {
+                Backend::Local(_) => true,
+                Backend::Remote(_) => t.checkout.is_some_and(|c| c.user == self.user),
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        self.plugins.0.borrow_mut().set_editable(editable);
         let renew = self.plugins.0.borrow_mut().follow(self.replica.view());
         for &(track, device) in &renew {
             self.engine.forget(track, device);

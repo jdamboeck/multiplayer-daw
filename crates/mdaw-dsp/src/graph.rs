@@ -227,6 +227,11 @@ impl Graph {
         }
     }
 
+    /// Whether a device of the graph is external, such as a plugin.
+    pub fn has_external(&self) -> bool {
+        self.tracks.iter().any(|t| t.stereo)
+    }
+
     /// A graph with no tracks.
     pub fn empty(sample_rate: u32) -> Self {
         Self::new(sample_rate, Arc::new(TempoMap::default()), 1.0, Vec::new())

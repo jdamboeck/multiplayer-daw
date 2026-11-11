@@ -9,6 +9,9 @@ use mdaw_model::{Project, Tick, TickRange, TrackId};
 pub const PRE_ROLL_SECONDS: u32 = 2;
 /// Extra time after the range for releases to ring out.
 pub const TAIL_SECONDS: u32 = 1;
+/// Silence external devices get to settle in before a render, in milliseconds: a plugin just
+/// made and loaded with a state may still be getting there in its first moments.
+pub const WARM_UP_MILLIS: u32 = 500;
 
 /// Renders part of a project to interleaved stereo `f32`.
 ///
@@ -80,6 +83,15 @@ impl OfflineRender {
         let end = graph.sample_at(range.end.max(Tick::ZERO).0 as f64).max(start);
         let pre_roll = start.min((PRE_ROLL_SECONDS * sample_rate) as i64);
         let tail = (TAIL_SECONDS * sample_rate) as usize;
+        if graph.has_external() {
+            let mut left = (WARM_UP_MILLIS * sample_rate / 1000) as usize;
+            let mut scratch = vec![0.0f32; block * 2];
+            while left > 0 {
+                let n = left.min(block);
+                graph.process(None, &mut scratch[..n * 2]);
+                left -= n;
+            }
+        }
         let pos = start - pre_roll;
         graph.chase(pos);
         Self {

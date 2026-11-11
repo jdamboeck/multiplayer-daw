@@ -52,6 +52,11 @@ struct Running {
     state: Option<BlobHash>,
     /// It was changed since `state`: its settings are not in the document.
     unsaved: bool,
+    /// What the instance's own save gave right after it was made, or when it was last saved:
+    /// a save that gives something else means its settings changed. Plugins do not always say
+    /// so themselves (Vital does not for its presets), and the same instance saves the same
+    /// settings the same way.
+    baseline: Option<BlobHash>,
 }
 
 pub struct Plugins {
@@ -70,6 +75,9 @@ pub struct Plugins {
     crashed: HashMap<(TrackId, DeviceId), String>,
     /// Failures to tell the user about at the next `idle`.
     failures: Vec<((TrackId, DeviceId), String)>,
+    /// Tracks this user may change the plugins of: their settings are kept aside, for after a
+    /// crash, and they are what a commit carries.
+    editable: HashSet<TrackId>,
     /// The settings of instances as last kept aside, to come back with after a crash.
     kept: HashMap<(TrackId, DeviceId), Arc<[u8]>>,
     kept_at: Instant,
@@ -87,6 +95,7 @@ impl Plugins {
             dirty: false,
             crashed: HashMap::new(),
             failures: Vec::new(),
+            editable: HashSet::new(),
             kept: HashMap::new(),
             kept_at: Instant::now(),
         }
@@ -226,14 +235,24 @@ impl Plugins {
     /// counts as unchanged; `unsaved` remembers that the document does not have them.
     fn keep_aside(&mut self) {
         for (key, running) in &mut self.running {
-            if !running.instance.changed() {
+            if !self.editable.contains(&key.0) && !running.instance.changed() {
                 continue;
             }
-            running.unsaved = true;
-            if let Ok(bytes) = running.instance.save_state() {
+            let Ok(bytes) = running.instance.save_state() else {
+                continue;
+            };
+            let hash = mdaw_proto::blob_hash(&bytes);
+            let kept = self.kept.get(key).map(|k| mdaw_proto::blob_hash(k));
+            if Some(hash) != running.baseline && Some(hash) != kept {
+                running.unsaved = true;
                 self.kept.insert(*key, bytes.into());
             }
         }
+    }
+
+    /// Sets the tracks whose plugins this user may change.
+    pub fn set_editable(&mut self, tracks: HashSet<TrackId>) {
+        self.editable = tracks;
     }
 
     /// Whether a device's plugin crashed and waits to be restarted.
@@ -314,12 +333,14 @@ impl Plugins {
         let Some(running) = self.running.get_mut(&(track, device)) else {
             return Ok(None);
         };
-        if running.state.is_some() && !running.unsaved && !running.instance.changed() {
-            return Ok(None);
-        }
+        // Saved and compared, whatever the plugin says about itself.
         let bytes: Arc<[u8]> = running.instance.save_state().map_err(|e| e.to_string())?.into();
         let hash = mdaw_proto::blob_hash(&bytes);
+        if running.state.is_some() && running.baseline == Some(hash) {
+            return Ok(None);
+        }
         running.state = Some(hash);
+        running.baseline = Some(hash);
         running.unsaved = false;
         self.kept.remove(&(track, device));
         self.states.insert(hash, bytes.clone());
@@ -396,12 +417,14 @@ impl PluginSource for Plugins {
         let Some(processor) = instance.take_processor() else {
             return fail(self, format!("{name} did not start."));
         };
+        let baseline = instance.save_state().ok().map(|b| mdaw_proto::blob_hash(&b));
         self.running.insert(
             (track, device),
             Running {
                 instance,
                 state: plugin.state,
                 unsaved: kept.is_some(),
+                baseline,
             },
         );
         Some(processor)
@@ -541,5 +564,46 @@ mod tests {
             1,
             "tried again on restart, and failed again"
         );
+    }
+
+    /// The test synth's state with this balance.
+    fn synth_state(balance: f32) -> Arc<[u8]> {
+        let mut bytes = b"MDTS".to_vec();
+        for value in [0.5f32, balance, 0.0] {
+            bytes.extend(value.to_le_bytes());
+        }
+        bytes.into()
+    }
+
+    #[test]
+    fn a_change_the_plugin_does_not_announce_is_still_committed() {
+        let mut plugins = Plugins::new(48_000);
+        plugins.set_host(Some(Host::test_synth_only()));
+        let mut ids = IdGen::new(ActorId(3));
+        let (track, device) = (ids.track(), ids.device());
+        let first = synth_state(0.0);
+        let hash = mdaw_proto::blob_hash(&first);
+        plugins.add_state(hash, first);
+        let plugin = PluginRef {
+            format: PluginFormat::Clap,
+            id: mdaw_plugin::TEST_SYNTH,
+            state: Some(hash),
+        };
+        let _processor = plugins.device(track, device, plugin).expect("it runs");
+        assert_eq!(plugins.capture(track, device).unwrap(), None, "nothing changed");
+
+        // Other settings, as a preset picked in the plugin's window: the plugin does not say
+        // that anything changed.
+        let instance = plugins.instance(track, device).unwrap();
+        instance.load_state(&synth_state(1.0)).unwrap();
+        assert!(!instance.changed());
+        let (new, bytes) = plugins
+            .capture(track, device)
+            .unwrap()
+            .expect("the change is found");
+        assert_ne!(new, hash);
+        assert_eq!(&bytes[..], &synth_state(1.0)[..]);
+        // And once captured, it is the new baseline.
+        assert_eq!(plugins.capture(track, device).unwrap(), None);
     }
 }
