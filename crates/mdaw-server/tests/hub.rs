@@ -673,3 +673,85 @@ fn the_transport_stops_when_the_last_client_leaves() {
     let (_, _, welcome) = join(&mut hub, 3);
     assert_eq!(welcome.transport, left);
 }
+
+/// Prints the tracks of a copy of a server's project. Run by hand with
+/// `MDAW_PROBE_DB=<copied project.db> cargo test -p mdaw-server --test hub -- --ignored probe --nocapture`.
+#[test]
+#[ignore = "a tool for looking at a project"]
+fn probe_a_project() {
+    let Ok(path) = std::env::var("MDAW_PROBE_DB") else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let hub = Hub::open(
+        Store::open(std::path::Path::new(&path)).unwrap(),
+        Blobs::open(dir.path().to_path_buf()).unwrap(),
+    )
+    .unwrap();
+    let store = Store::open(std::path::Path::new(&path)).unwrap();
+    for event in store.events_after(0, 100_000).unwrap() {
+        let kind = match &event.body {
+            EventBody::Txn { .. } => "txn",
+            EventBody::Checkout { .. } => "checkout",
+            EventBody::Commit { .. } => "commit",
+            EventBody::Release { .. } => "release",
+            EventBody::Attach { .. } => "attach",
+        };
+        let ops: Vec<String> = event
+            .ops()
+            .filter(|op| {
+                matches!(
+                    op,
+                    Op::DeviceSetState { .. } | Op::DeviceAdd { .. } | Op::DeviceRemove { .. }
+                )
+            })
+            .map(|op| format!("{op:?}").chars().take(120).collect())
+            .collect();
+        let stem = match &event.body {
+            EventBody::Commit { stem, .. } => format!("{:?}", stem.map(|s| s.blob)),
+            _ => String::new(),
+        };
+        if kind == "txn" {
+            let all: Vec<String> = event
+                .ops()
+                .map(|op| format!("{op:?}").chars().take(90).collect())
+                .collect();
+            eprintln!("  {} txn {:?}", event.seq, all);
+        }
+        if kind != "txn" || !ops.is_empty() {
+            eprintln!(
+                "{} {} {} {:?} {}",
+                event.seq,
+                event.wall_ts / 1000 % 86400,
+                kind,
+                ops,
+                stem
+            );
+        }
+    }
+    let doc = hub.doc();
+    eprintln!("master gain {}, tempo {:?}", doc.master_gain, doc.tempo);
+    for (id, track) in doc.ordered_tracks() {
+        let c = &track.content;
+        eprintln!(
+            "{:?} {:?}: gain {} pan {} mute {} stem {:?}",
+            id,
+            track.shell.name,
+            c.gain,
+            c.pan,
+            c.mute,
+            track.stem.map(|s| (s.blob, s.gain, s.len_samples))
+        );
+        for d in &c.devices {
+            eprintln!("    device {:?}", d.kind);
+        }
+        for clip in c.clips.values() {
+            let notes: Vec<_> = clip
+                .notes
+                .values()
+                .map(|n| (n.start.0, n.dur.0, n.pitch, n.vel))
+                .collect();
+            eprintln!("    clip at {} len {}: {:?}", clip.start.0, clip.length.0, notes);
+        }
+    }
+}

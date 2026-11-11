@@ -1528,10 +1528,31 @@ impl Session {
             return true;
         };
         let range = checkout::stem_range(&content);
+        // The stem is the track before its fader, pan and mute, and before the master: those
+        // apply where it plays, as they do to the plugins themselves.
+        let mut dry = doc.clone();
+        apply_all(
+            &mut dry,
+            &[
+                Op::MasterSetGain { gain: 1.0 },
+                Op::TrackSetMix {
+                    track,
+                    prop: mdaw_model::MixProp::Gain(1.0),
+                },
+                Op::TrackSetMix {
+                    track,
+                    prop: mdaw_model::MixProp::Pan(0.0),
+                },
+                Op::TrackSetMix {
+                    track,
+                    prop: mdaw_model::MixProp::Mute(false),
+                },
+            ],
+        );
         let mut plugins = self.plugins.0.borrow_mut();
         let mut source = plugins.offline(checkout::SAMPLE_RATE);
         let render = OfflineRender::new(
-            &doc,
+            &dry,
             Some(&[track]),
             range,
             checkout::SAMPLE_RATE,

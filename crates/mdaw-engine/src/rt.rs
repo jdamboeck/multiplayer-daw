@@ -103,6 +103,9 @@ pub(crate) struct Shared {
     pub preview_id: AtomicU64,
     /// Frames of the preview played so far, or `u64::MAX` once it is over or stopped.
     pub preview_pos: AtomicU64,
+    /// The listener's own volume, as `f32` bits: applied to everything this engine outputs,
+    /// and nowhere else.
+    pub output_gain: AtomicU32,
 }
 
 pub(crate) struct RtCore {
@@ -394,6 +397,7 @@ impl RtCore {
         let channels = channels.max(1);
         let mut peak = [0.0f32; 2];
         let mut total = 0u64;
+        let gain = f32::from_bits(self.shared.output_gain.load(Relaxed));
         for chunk in data.chunks_mut(MAX_BLOCK * channels) {
             let mut done = 0;
             let want = chunk.len() / channels;
@@ -402,8 +406,8 @@ impl RtCore {
                 let rendered = &self.scratch[..frames * 2];
                 let target = &mut chunk[done * channels..(done + frames) * channels];
                 for (out, stereo) in target.chunks_exact_mut(channels).zip(rendered.as_chunks::<2>().0) {
-                    let left = sanitize(stereo[0]);
-                    let right = sanitize(stereo[1]);
+                    let left = sanitize(stereo[0] * gain);
+                    let right = sanitize(stereo[1] * gain);
                     peak[0] = peak[0].max(left.abs());
                     peak[1] = peak[1].max(right.abs());
                     if channels == 1 {

@@ -9,6 +9,8 @@ use mdaw_engine::Engine;
 use mdaw_model::*;
 use mdaw_plugin::{Host, TEST_SYNTH};
 use mdaw_server::{Config, Server};
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -186,6 +188,13 @@ fn a_plugin_is_heard_live_where_it_is_installed_and_from_its_stem_elsewhere() {
     );
     // All to the right: a setting that only the plugin's state carries.
     ann.set_plugin_param(track, device, mdaw_test_plugin::BALANCE, 1.0);
+    // A fader and a master away from unity: they apply where the track plays, so the stem is
+    // rendered without them, or they would count twice.
+    assert!(ann.edit(vec![Op::TrackSetMix {
+        track,
+        prop: MixProp::Gain(0.5),
+    }]));
+    assert!(ann.edit(vec![Op::MasterSetGain { gain: 1.5 }]));
     let [left, right] = listen(&mut ann);
     assert!(
         right > 0.02 && left < 1e-4,
@@ -224,6 +233,7 @@ fn a_plugin_is_heard_live_where_it_is_installed_and_from_its_stem_elsewhere() {
         right > 0.02 && left < 1e-4,
         "ben hears the plugin: {left} {right}"
     );
+    let ben_heard = right;
 
     // Cat has no plugins: she hears the stem, which sounds the same.
     until(&mut [&mut ann, &mut ben, &mut cat], "cat has the stem", |s| {
@@ -232,6 +242,9 @@ fn a_plugin_is_heard_live_where_it_is_installed_and_from_its_stem_elsewhere() {
     assert!(!cat.plugin_running(track, device));
     let [left, right] = listen(&mut cat);
     assert!(right > 0.02 && left < 1e-3, "cat hears the stem: {left} {right}");
+    // As loud as the plugin itself, through the same fader and master.
+    let db = 20.0 * (right / ben_heard).log10();
+    assert!(db.abs() < 0.5, "the stem is {db:+.1} dB against the plugin");
 
     // A track with plugins is changed only through a checkout.
     let clip = *ben
@@ -459,4 +472,116 @@ fn a_commit_whose_render_goes_wrong_is_not_sent() {
         s[1].checkout_owner(track).is_none()
     });
     assert!(ben.project().track(track).unwrap().stem.is_some());
+}
+
+/// Renders a track with an installed plugin three ways and prints their levels: live, as the
+/// audio graph runs it; offline, as a commit renders its stem; and a stem file. Run by hand:
+/// `MDAW_PROBE_PLUGIN=<id> MDAW_PROBE_STATE=<state blob> MDAW_PROBE_STEM=<flac> cargo test -p
+/// mdaw-client --test plugins -- --ignored probe --nocapture`.
+#[test]
+#[ignore = "depends on the plugins installed here"]
+fn probe_levels_live_offline_and_stem() {
+    use mdaw_client::plugins::{Plugins, Shared};
+    use mdaw_dsp::{Compiler, OfflineRender};
+    let (Ok(id), Ok(state)) = (
+        std::env::var("MDAW_PROBE_PLUGIN"),
+        std::env::var("MDAW_PROBE_STATE"),
+    ) else {
+        return;
+    };
+    let state: Arc<[u8]> = if state == "none" {
+        Arc::from(&[][..])
+    } else {
+        std::fs::read(state).unwrap().into()
+    };
+    let hash = mdaw_proto::blob_hash(&state);
+    let mut ids = IdGen::new(ActorId(9));
+    let (track, clip, device) = (ids.track(), ids.clip(), ids.device());
+    let mut content = TrackContent::default();
+    content.devices.push_back(Device::new(
+        device,
+        DeviceKind::Plugin {
+            format: PluginFormat::Clap,
+            id: id.clone(),
+            state: (!state.is_empty()).then_some(hash),
+        },
+    ));
+    let notes = (0..8)
+        .map(|n| {
+            let note = Note {
+                start: Tick(n * 960),
+                dur: Tick(240),
+                pitch: 60,
+                vel: 100,
+            };
+            (ids.note(), note)
+        })
+        .collect();
+    let mut project = Project::default();
+    apply_all(
+        &mut project,
+        &[
+            Op::TrackAdd {
+                id: track,
+                shell: TrackShell {
+                    name: "t".into(),
+                    color: 0,
+                },
+                content,
+                after: None,
+            },
+            Op::ClipAdd {
+                track,
+                id: clip,
+                clip: Clip {
+                    start: Tick::bars(1),
+                    length: Tick::bars(2),
+                    name: "c".into(),
+                    notes,
+                },
+            },
+        ],
+    );
+    let rms = |s: &[f32]| (s.iter().map(|x| (*x as f64).powi(2)).sum::<f64>() / s.len().max(1) as f64).sqrt();
+    let report = |what: &str, audio: &[f32]| {
+        let peak = audio.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        eprintln!("{what:28} rms {:.4}  peak {:.4}", rms(audio), peak);
+    };
+    let range = TickRange::new(Tick::ZERO, Tick::bars(3));
+
+    let plugins = Shared(Rc::new(RefCell::new(Plugins::new(48_000))));
+    plugins.0.borrow_mut().set_host(Some(Host::standard(false)));
+    plugins.0.borrow_mut().add_state(hash, state.clone());
+
+    // Offline, as a commit renders it.
+    let audio = {
+        let mut p = plugins.0.borrow_mut();
+        let mut source = p.offline(48_000);
+        let mut render = OfflineRender::new(&project, Some(&[track]), range, 48_000, 256, &mut source);
+        let (_instances, failures) = source.finish();
+        assert!(failures.is_empty(), "{failures:?}");
+        while !render.step(usize::MAX) {}
+        render.finish()
+    };
+    report("offline (the stem's render)", &audio);
+
+    // Live: the graph with a running instance, block by block, as the audio thread does.
+    let mut source = plugins.clone();
+    let mut graph = Compiler::new(48_000).build_with(&project, None, &mut source);
+    let mut live = Vec::new();
+    let mut pos = 0i64;
+    graph.chase(0);
+    while live.len() < audio.len() {
+        let mut out = vec![0.0f32; 256 * 2];
+        graph.process(Some(pos), &mut out);
+        live.extend(out);
+        pos += 256;
+        plugins.0.borrow_mut().idle();
+    }
+    report("live (the graph)", &live);
+
+    if let Ok(stem) = std::env::var("MDAW_PROBE_STEM") {
+        let decoded = mdaw_engine::flac::decode(&std::fs::read(stem).unwrap(), 900).unwrap();
+        report("stem file", &decoded.samples);
+    }
 }

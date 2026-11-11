@@ -330,7 +330,8 @@ fn probe_the_start_of_an_offline_render() {
         return;
     };
     let mut host = Host::standard(false);
-    let mut instance = host.create(PluginFormat::Clap, &id, settings(true)).unwrap();
+    let offline = std::env::var("MDAW_PROBE_LIVE").is_err();
+    let mut instance = host.create(PluginFormat::Clap, &id, settings(offline)).unwrap();
     if let Ok(path) = std::env::var("MDAW_PROBE_STATE") {
         instance.load_state(&std::fs::read(path).unwrap()).unwrap();
     }
@@ -353,7 +354,7 @@ fn probe_the_start_of_an_offline_render() {
     }
     device.note_on(1, 48, 100);
     let mut left = Vec::new();
-    for _ in 0..40 {
+    for _ in 0..200 {
         let (mut l, mut r) = (vec![0.0; BLOCK], vec![0.0; BLOCK]);
         device.process(
             &mut l,
@@ -366,6 +367,15 @@ fn probe_the_start_of_an_offline_render() {
         );
         left.extend(l);
     }
+    let rms =
+        |s: &[f32]| (s.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>() / s.len().max(1) as f64).sqrt();
+    eprintln!(
+        "offline {offline}: rms over {} ms: {:.4} ({:.1} dBFS), peak {:.4}",
+        left.len() * 1000 / RATE as usize,
+        rms(&left),
+        20.0 * rms(&left).log10(),
+        left.iter().fold(0.0f32, |m, s| m.max(s.abs()))
+    );
     // Peak and how often the sign changes (a noise measure), per 5 ms.
     for (i, chunk) in left.chunks(240).take(30).enumerate() {
         let peak = chunk.iter().fold(0.0f32, |m, s| m.max(s.abs()));

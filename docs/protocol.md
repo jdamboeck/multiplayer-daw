@@ -405,16 +405,19 @@ Track.stem: Option<Stem { blob, tempo_hash, len_samples, gain }>
 - **State.** The plugin's settings are its own state, an opaque blob; `id` names the plugin
   within its format. The device's `params` are not used for plugins. Turning a plugin's knobs,
   in its own window or in the generic controls, changes nothing in the document; at the commit
-  the owner's client saves the state of every plugin of the track whose state changed (the
-  plugin said so, or the host set a parameter) or that has none yet, uploads it, and adds a
-  `DeviceSetState` to the checkout's journal. A state is never compared byte for byte: plugins
-  save the same settings differently from instance to instance.
+  the owner's client saves the state of every plugin of the track, uploads it, and adds a
+  `DeviceSetState` to the checkout's journal, unless the save is the same as the one the same
+  instance gave right after it was made or last committed. Plugins do not always say that their
+  settings changed (Vital does not for presets), so a save is compared only with saves of the
+  same instance: different instances save the same settings differently.
 - **Stem.** The owner's client renders the track alone, from new instances in offline mode
   loaded with the states, from the start of the timeline to the end of the last clip plus one
-  second of tail, at 48 kHz, before faders and pan. It scales the audio so that its peak is at
+  second of tail, at 48 kHz, before the track's fader, pan and mute and before the project's
+  master volume, which apply where it plays. It scales the audio so that its peak is at
   most -1 dBFS (plugins play beyond full scale), encodes it as 24-bit stereo FLAC, and records
   the factor that undoes the scaling as `gain`, and the tempo map it was rendered with as
-  `tempo_hash`. The render runs on the UI thread, a slice per frame, because plugins expect
+  `tempo_hash`. The plugins get half a second of silence to settle first. The render runs on
+  the UI thread, a slice per frame, because plugins expect
   their main thread to be that one.
 - **Hearing a track with plugins.** Each client decides for itself. With every plugin of the
   track installed and its state at hand, it runs them, loaded with the committed state. Otherwise
@@ -423,6 +426,9 @@ Track.stem: Option<Stem { blob, tempo_hash, len_samples, gain }>
   neither, the track is silent. Live notes reach a track only where its plugins run.
 - **Downloads.** State blobs and stems are downloaded when a client needs them. A stem is decoded
   and resampled to the output rate off the UI thread; one longer than 15 minutes is not played.
+- **Listening volume.** The volume in each client's top bar is that listener's own: applied at
+  the end of that client's output, it is not part of the document, of stems or of samples.
+  (The document's master volume stays, at 1 unless an older project set it.)
 - **A client with no plugins** (`--no-plugins`) plays every such track from its stem.
 - **Crashes.** On Linux each plugin instance runs in a helper process (`mdaw-plugin-host`),
   also for scanning, one file at a time. The audio thread hands it each block through shared

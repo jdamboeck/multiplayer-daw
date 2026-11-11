@@ -140,6 +140,7 @@ fn parts(sample_rate: u32) -> Parts {
     let (live, live_rx) = rtrb::RingBuffer::new(LIVE_NOTES);
     let (garbage_tx, garbage) = rtrb::RingBuffer::new(MAX_GRAPHS_IN_FLIGHT + 1);
     let shared = Arc::new(Shared::default());
+    shared.output_gain.store(1.0f32.to_bits(), Relaxed);
     let core = RtCore::new(
         Box::new(Graph::empty(sample_rate)),
         command_rx,
@@ -494,6 +495,21 @@ impl Engine {
     /// Playhead in ticks.
     pub fn position(&self) -> f64 {
         f64::from_bits(self.shared.tick.load(Relaxed))
+    }
+
+    /// Sets the listener's own volume: applied to everything this engine plays, and to nothing
+    /// that is rendered or shared.
+    pub fn set_output_gain(&mut self, gain: f32) {
+        let gain = if gain.is_finite() {
+            gain.clamp(0.0, 4.0)
+        } else {
+            1.0
+        };
+        self.shared.output_gain.store(gain.to_bits(), Relaxed);
+    }
+
+    pub fn output_gain(&self) -> f32 {
+        f32::from_bits(self.shared.output_gain.load(Relaxed))
     }
 
     /// Output peak per channel since the last call.

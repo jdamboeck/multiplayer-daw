@@ -115,7 +115,7 @@ pub fn show(app: &mut DawApp, ui: &mut Ui) {
         }
 
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let mut db = gain_to_db(project.master_gain);
+            let mut db = gain_to_db(app.session.engine().output_gain());
             let response = ui
                 .add(
                     DragValue::new(&mut db)
@@ -124,10 +124,12 @@ pub fn show(app: &mut DawApp, ui: &mut Ui) {
                         .fixed_decimals(1)
                         .suffix(" dB"),
                 )
-                .on_hover_text("Master volume");
-            if let Some(gesture) = app.gestures.track(&mut app.session, &response) {
-                app.session
-                    .edit_gesture(vec![Op::MasterSetGain { gain: db_to_gain(db) }], gesture);
+                .on_hover_text(
+                    "Your listening volume. It is yours alone: it changes nothing in the project, \
+                     nobody else hears it, and it is not part of stems or samples.",
+                );
+            if response.changed() {
+                app.session.engine_mut().set_output_gain(db_to_gain(db));
             }
             meter(app, ui);
             ui.label(

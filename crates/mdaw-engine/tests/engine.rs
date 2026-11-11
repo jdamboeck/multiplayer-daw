@@ -612,3 +612,20 @@ fn a_preview_plays_beside_the_transport_and_ends() {
     assert!(engine.pump(10).unwrap().iter().all(|s| *s == 0.0));
     assert_eq!(engine.preview_position(id), None);
 }
+
+#[test]
+fn the_listening_volume_scales_what_is_heard() {
+    let song = Song::new(&[]);
+    let heard = |gain: f32| {
+        let mut engine = engine(&song);
+        engine.set_output_gain(gain);
+        engine.note_on(song.track, 1, 64, 110);
+        peak(&pump(&mut engine, 4800))
+    };
+    let (full, half) = (heard(1.0), heard(0.5));
+    assert!((half / full - 0.5).abs() < 1e-3, "{full} {half}");
+    let mut engine = engine(&song);
+    engine.set_output_gain(f32::NAN);
+    assert_eq!(engine.output_gain(), 1.0, "nonsense is unity");
+    no_allocations();
+}
