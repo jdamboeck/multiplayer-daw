@@ -289,7 +289,7 @@ mod linux {
         let mut rgb = Vec::with_capacity(pixels * 3);
         let mut colours = HashSet::new();
         let mut lit = 0usize;
-        for px in image.data.chunks_exact(4).take(pixels) {
+        for px in image.data.as_chunks::<4>().0.iter().take(pixels) {
             let (b, g, r) = (px[0], px[1], px[2]);
             rgb.extend_from_slice(&[r, g, b]);
             if r as u32 + g as u32 + b as u32 > 24 {

@@ -187,7 +187,7 @@ impl Graph {
             buf.fill(0.0);
             track.process(pos, buf);
             let [left, right] = track.compiled.gain;
-            for (frame, sample) in out.chunks_exact_mut(2).zip(buf.iter()) {
+            for (frame, sample) in out.as_chunks_mut::<2>().0.iter_mut().zip(buf.iter()) {
                 frame[0] += sample * left;
                 frame[1] += sample * right;
             }

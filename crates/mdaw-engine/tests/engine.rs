@@ -262,8 +262,10 @@ fn a_knob_turn_does_not_cut_notes_but_a_note_edit_does() {
     pump(&mut engine, 4800);
     let closed = pump(&mut engine, 4800);
     let roughness = |a: &[f32]| {
-        a.chunks_exact(2)
-            .zip(a.chunks_exact(2).skip(1))
+        let frames = a.as_chunks::<2>().0;
+        frames
+            .iter()
+            .zip(frames.iter().skip(1))
             .map(|(x, y)| (x[0] - y[0]).abs())
             .sum::<f32>()
     };

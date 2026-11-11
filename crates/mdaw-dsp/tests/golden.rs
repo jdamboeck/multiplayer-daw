@@ -231,7 +231,8 @@ fn tracks_render_separately_and_sum_to_the_mix() {
     assert!(worst < 1e-5, "mix differs from the sum of its tracks by {worst}");
 
     // The lead is panned left, the pad right.
-    let energy = |audio: &[f32], ch: usize| -> f32 { audio.chunks_exact(2).map(|f| f[ch] * f[ch]).sum() };
+    let energy =
+        |audio: &[f32], ch: usize| -> f32 { audio.as_chunks::<2>().0.iter().map(|f| f[ch] * f[ch]).sum() };
     assert!(energy(&lead, 0) > energy(&lead, 1) * 1.5);
     assert!(energy(&pad, 1) > energy(&pad, 0) * 1.5);
 }

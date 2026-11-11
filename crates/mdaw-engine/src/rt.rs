@@ -399,7 +399,7 @@ impl RtCore {
                 let frames = self.block(want - done);
                 let rendered = &self.scratch[..frames * 2];
                 let target = &mut chunk[done * channels..(done + frames) * channels];
-                for (out, stereo) in target.chunks_exact_mut(channels).zip(rendered.chunks_exact(2)) {
+                for (out, stereo) in target.chunks_exact_mut(channels).zip(rendered.as_chunks::<2>().0) {
                     let left = sanitize(stereo[0]);
                     let right = sanitize(stereo[1]);
                     peak[0] = peak[0].max(left.abs());

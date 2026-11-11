@@ -1,0 +1,5 @@
+# The same compiler and lints everywhere: CI does not move ahead of the developers' machines
+# when a new Rust comes out. Bump on purpose, and fix what the new lints find then.
+[toolchain]
+channel = "1.97.1"
+components = ["clippy", "rustfmt"]
