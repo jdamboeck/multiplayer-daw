@@ -40,6 +40,8 @@ const PRESENCE_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_DISPLACED: usize = 500;
 const MAX_LOG: usize = 500;
 const MAX_NOTICES: usize = 4;
+/// How often the work of a checkout is written to disk while it changes.
+const JOURNAL_EVERY: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Status {
@@ -158,9 +160,11 @@ pub struct Session {
     waker: Option<Waker>,
     /// Where checkouts and forks of this project are kept. `None`: nowhere.
     files: Option<Files>,
-    /// Journal lengths as last written, by track. A workspace missing here is new to the
+    /// `Workspace::changes` as last written, by track. A workspace missing here is new to the
     /// session: a journal from before may wait for it on disk.
-    saved: HashMap<TrackId, usize>,
+    saved: HashMap<TrackId, u64>,
+    /// When journals were last written; they are written at most every `JOURNAL_EVERY`.
+    saved_at: Instant,
     commit: Option<Commit>,
     jobs: (std_mpsc::Sender<Job>, std_mpsc::Receiver<Job>),
     /// Blobs not yet known to be on the server, with their bytes.
@@ -331,6 +335,7 @@ impl Session {
             waker: None,
             files: None,
             saved: HashMap::new(),
+            saved_at: Instant::now(),
             commit: None,
             jobs: std_mpsc::channel(),
             uploads: HashMap::new(),
@@ -764,7 +769,35 @@ impl Session {
     /// by the checkouts they belong to.
     pub fn set_files(&mut self, files: Files) {
         self.forks = files.forks();
-        self.files = Some(files);
+        let journals = files.journals();
+        self.files = Some(files.clone());
+        // Work of checkouts that ended while this client was not running.
+        for saved in journals {
+            let current = self
+                .replica
+                .workspace(saved.track)
+                .is_some_and(|w| w.base_seq == saved.base_seq);
+            if current {
+                continue;
+            }
+            files.remove_journal(saved.track);
+            if saved.journal.is_empty() {
+                continue;
+            }
+            let shell = self
+                .replica
+                .confirmed()
+                .track(saved.track)
+                .map(|t| t.shell.clone());
+            let text = format!(
+                "Your checkout of \"{}\" was ended while you were away. Your changes are kept as a fork \
+                 in the changelog.",
+                shell.as_ref().unwrap_or(&saved.base.shell).name
+            );
+            notice(&mut self.notices, &text);
+            let fork = saved.fork(shell, now_millis());
+            self.keep_fork(fork);
+        }
         self.saved.clear();
         self.keep_workspaces();
     }
@@ -1080,35 +1113,27 @@ impl Session {
         let tracks: Vec<TrackId> = self.replica.workspaces().map(|w| w.track).collect();
         for track in tracks {
             if !self.saved.contains_key(&track) {
-                // New to this session: the work may have been saved by an earlier run.
+                // New to this session: the work may have been saved by an earlier run of this
+                // same checkout. Work of an earlier checkout became a fork in `set_files`.
                 let earlier = self.files.as_ref().and_then(|f| f.load_journal(track));
-                if let Some((journal, base_tempo)) = earlier {
-                    let empty = self
-                        .replica
-                        .workspace(track)
-                        .is_some_and(|w| w.journal.is_empty());
-                    if empty && !journal.is_empty() {
-                        self.replica.restore_journal(track, journal, base_tempo);
-                        notice(
-                            &mut self.notices,
-                            "Picked up the changes of your checkout from before.",
-                        );
-                    }
-                }
-            }
-            let workspace = self.replica.workspace(track).expect("listed above");
-            let len = workspace.journal.len();
-            if self.saved.get(&track) != Some(&len) {
-                if let Some(files) = &self.files
-                    && let Err(err) = files.save_journal(workspace)
+                let workspace = self.replica.workspace(track).expect("listed above");
+                if let Some(earlier) = earlier
+                    && earlier.base_seq == workspace.base_seq
+                    && workspace.journal.is_empty()
+                    && !earlier.journal.is_empty()
                 {
+                    let base_tempo = earlier.base_tempo();
+                    self.replica.restore_journal(track, earlier.journal, base_tempo);
                     notice(
                         &mut self.notices,
-                        &format!("Could not save the checkout: {err:#}."),
+                        "Picked up the changes of your checkout from before.",
                     );
                 }
-                self.saved.insert(track, len);
+                self.saved.insert(track, 0);
             }
+        }
+        if self.saved_at.elapsed() >= JOURNAL_EVERY {
+            self.save_journals();
         }
 
         for (workspace, how) in self.replica.take_ended() {
@@ -1148,36 +1173,45 @@ impl Session {
         }
     }
 
-    /// Keeps the work of a checkout that ended without a commit.
+    /// Writes the journals that changed since they were last written.
+    fn save_journals(&mut self) {
+        self.saved_at = Instant::now();
+        for workspace in self.replica.workspaces() {
+            let changes = workspace.changes;
+            if self.saved.get(&workspace.track) == Some(&changes) {
+                continue;
+            }
+            if let Some(files) = &self.files
+                && let Err(err) = files.save_journal(workspace)
+            {
+                notice(
+                    &mut self.notices,
+                    &format!("Could not save the checkout: {err:#}."),
+                );
+            }
+            self.saved.insert(workspace.track, changes);
+        }
+    }
+
+    /// Keeps the work of a checkout that ended without a commit. It is rebuilt from the track
+    /// as it was when the checkout began, so it does not matter what became of the track.
     fn save_fork(&mut self, workspace: &Workspace) {
-        let confirmed = self.replica.confirmed();
-        // The contents are as they were at the checkout: nobody could change them since.
-        let Some(track) = confirmed.track(workspace.track) else {
-            return;
-        };
-        let mut project = Project::default();
-        let id = workspace.track;
-        apply(
-            &mut project,
-            &Op::TrackAdd {
-                id,
-                shell: track.shell.clone(),
-                content: (*track.content).clone(),
-                after: None,
-            },
+        let shell = self
+            .replica
+            .confirmed()
+            .track(workspace.track)
+            .map(|t| t.shell.clone());
+        let fork = checkout::fork_of(
+            workspace.track,
+            &workspace.base,
+            &workspace.journal,
+            shell,
+            now_millis(),
         );
-        apply_all(&mut project, &workspace.journal);
-        let Some(forked) = project.track(id) else { return };
-        let mut fork = Fork {
-            track: id,
-            shell: forked.shell.clone(),
-            content: (*forked.content).clone(),
-            saved: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0),
-            path: Default::default(),
-        };
+        self.keep_fork(fork);
+    }
+
+    fn keep_fork(&mut self, mut fork: Fork) {
         if let Some(files) = &self.files {
             match files.save_fork(&fork) {
                 Ok(path) => fork.path = path,
@@ -1534,6 +1568,20 @@ fn shared(backend: &mut Backend) -> Option<(&mut Remote, i64)> {
 fn same_playback(a: &TransportState, b: &TransportState) -> bool {
     let place = |s: &TransportState| (s.playing, s.anchor_tick, s.loop_range);
     place(a) == place(b) && (!a.playing || a.anchor_server_micros == b.anchor_server_micros)
+}
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+impl Drop for Session {
+    /// The last edits of a checkout may not be on disk yet.
+    fn drop(&mut self) {
+        self.save_journals();
+    }
 }
 
 fn notice(notices: &mut Vec<String>, text: &str) {

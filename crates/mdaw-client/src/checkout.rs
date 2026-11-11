@@ -6,8 +6,8 @@ use imbl::OrdMap;
 use mdaw_dsp::render_offline;
 use mdaw_engine::flac;
 use mdaw_model::{
-    Op, Project, TempoId, TempoPoint, TickRange, TrackContent, TrackId, TrackShell, affected_ranges, apply,
-    apply_all, listening_range,
+    Op, Project, TempoId, TempoPoint, TickRange, Track, TrackContent, TrackId, TrackShell, affected_ranges,
+    apply, apply_all, listening_range,
 };
 use mdaw_proto::{Sample, SampleKind, Superseded, blob_hash};
 use mdaw_sync::Workspace;
@@ -216,11 +216,55 @@ pub fn tempo_fix(current: &OrdMap<TempoId, TempoPoint>, wanted: &OrdMap<TempoId,
 }
 
 /// The work of a checkout, as kept on disk while it lasts.
+/// The work of a checkout as kept on disk while the checkout lasts, so that it survives the
+/// client going down.
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
-struct JournalFile {
-    track: TrackId,
-    base_tempo: Vec<(TempoId, TempoPoint)>,
-    journal: Vec<Op>,
+pub struct SavedCheckout {
+    pub track: TrackId,
+    /// Which checkout of the track this was: the server sequence number of its `Checkout`.
+    pub base_seq: u64,
+    /// The track when the checkout began, so the work can be rebuilt even if the track is gone.
+    pub base: Track,
+    pub base_tempo: Vec<(TempoId, TempoPoint)>,
+    pub journal: Vec<Op>,
+}
+
+impl SavedCheckout {
+    pub fn base_tempo(&self) -> OrdMap<TempoId, TempoPoint> {
+        self.base_tempo.iter().copied().collect()
+    }
+
+    /// The track as its owner had made it, for when the checkout ended without a commit.
+    /// `shell` is the track's current name and colour, if it still has them.
+    pub fn fork(&self, shell: Option<TrackShell>, saved: u64) -> Fork {
+        fork_of(self.track, &self.base, &self.journal, shell, saved)
+    }
+}
+
+/// `base` with `journal` applied, as a fork.
+pub fn fork_of(track: TrackId, base: &Track, journal: &[Op], shell: Option<TrackShell>, saved: u64) -> Fork {
+    let mut project = Project::default();
+    apply(
+        &mut project,
+        &Op::TrackAdd {
+            id: track,
+            shell: base.shell.clone(),
+            content: (*base.content).clone(),
+            after: None,
+        },
+    );
+    apply_all(&mut project, journal);
+    let content = project
+        .track(track)
+        .map(|t| (*t.content).clone())
+        .unwrap_or_else(|| (*base.content).clone());
+    Fork {
+        track,
+        shell: shell.unwrap_or_else(|| base.shell.clone()),
+        content,
+        saved,
+        path: PathBuf::new(),
+    }
 }
 
 /// What is left of a checkout someone else ended: the track as its owner had made it.
@@ -254,27 +298,48 @@ impl Files {
     }
 
     pub fn save_journal(&self, workspace: &Workspace) -> Result<()> {
-        let file = JournalFile {
+        let file = SavedCheckout {
             track: workspace.track,
+            base_seq: workspace.base_seq,
+            base: (*workspace.base).clone(),
             base_tempo: workspace.base_tempo.iter().map(|(k, v)| (*k, *v)).collect(),
             journal: workspace.journal.clone(),
         };
         write_atomic(&self.journal_path(workspace.track), &postcard::to_stdvec(&file)?)
     }
 
-    /// The journal of `track` saved earlier, with the tempo the checkout began with.
-    pub fn load_journal(&self, track: TrackId) -> Option<(Vec<Op>, OrdMap<TempoId, TempoPoint>)> {
+    /// The work saved earlier for `track`, whichever checkout of it that was.
+    pub fn load_journal(&self, track: TrackId) -> Option<SavedCheckout> {
         let bytes = std::fs::read(self.journal_path(track)).ok()?;
-        let file: JournalFile = postcard::from_bytes(&bytes).ok()?;
-        (file.track == track).then(|| (file.journal, file.base_tempo.into_iter().collect()))
+        let file: SavedCheckout = postcard::from_bytes(&bytes).ok()?;
+        (file.track == track).then_some(file)
+    }
+
+    /// Every checkout saved on disk.
+    pub fn journals(&self) -> Vec<SavedCheckout> {
+        let Ok(entries) = std::fs::read_dir(self.dir.join("checkouts")) else {
+            return Vec::new();
+        };
+        entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "journal"))
+            .filter_map(|path| postcard::from_bytes(&std::fs::read(path).ok()?).ok())
+            .collect()
     }
 
     pub fn remove_journal(&self, track: TrackId) {
         let _ = std::fs::remove_file(self.journal_path(track));
     }
 
+    /// Writes `fork` to a file of its own and returns the path.
     pub fn save_fork(&self, fork: &Fork) -> Result<PathBuf> {
-        let path = self.dir.join("forks").join(format!("{}.fork", fork.saved));
+        let dir = self.dir.join("forks");
+        let name = |n: u32| format!("{}-{:016x}-{n}.fork", fork.saved, fork.track.0.0);
+        let path = (0..)
+            .map(|n| dir.join(name(n)))
+            .find(|p| !p.exists())
+            .expect("a free name");
         write_atomic(&path, &postcard::to_stdvec(fork)?)?;
         Ok(path)
     }
@@ -294,7 +359,7 @@ impl Files {
                 Some(fork)
             })
             .collect();
-        forks.sort_by_key(|f| f.saved);
+        forks.sort_by(|a, b| (a.saved, &a.path).cmp(&(b.saved, &b.path)));
         forks
     }
 }
@@ -355,23 +420,46 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let files = Files::new(dir.path().to_path_buf());
         let track = TrackId(EntityId(5));
-        let workspace = Workspace {
+        let base = Track::new(
+            TrackShell {
+                name: "keys".into(),
+                color: 1,
+            },
+            TrackContent::default(),
+        );
+        let mut workspace = Workspace {
             track,
-            journal: vec![Op::TrackSetShell {
-                id: track,
-                prop: mdaw_model::ShellProp::Color(7),
+            base_seq: 3,
+            base: Arc::new(base),
+            journal: vec![Op::TrackSetMix {
+                track,
+                prop: mdaw_model::MixProp::Gain(0.5),
             }],
             base_tempo: tempo(&[(1, 0, 99)]),
             committing: false,
+            changes: 1,
         };
         files.save_journal(&workspace).unwrap();
-        let (journal, base_tempo) = files.load_journal(track).unwrap();
+        let saved = files.load_journal(track).unwrap();
         assert_eq!(
-            (journal, base_tempo),
-            (workspace.journal.clone(), workspace.base_tempo)
+            (&saved.journal, saved.base_tempo(), saved.base_seq),
+            (&workspace.journal, workspace.base_tempo.clone(), 3)
         );
+        assert_eq!(files.journals(), std::slice::from_ref(&saved));
+        // The work can be rebuilt from the file alone.
+        let fork = saved.fork(None, 9);
+        assert_eq!((fork.shell.name.as_str(), fork.content.gain), ("keys", 0.5));
         files.remove_journal(track);
         assert!(files.load_journal(track).is_none());
+        workspace.journal.clear();
+
+        // Two forks of the same moment are two files.
+        let path = files.save_fork(&fork).unwrap();
+        let again = files.save_fork(&fork).unwrap();
+        assert_ne!(path, again);
+        assert_eq!(files.forks().len(), 2);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(again).unwrap();
 
         let fork = Fork {
             track,

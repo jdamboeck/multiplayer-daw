@@ -273,11 +273,15 @@ Nothing is released automatically. After a server restart every checkout gets a 
 ### What the client does
 
 - **Workspace.** On its user's `Checkout` event the client starts a workspace for the track: a
-  journal of ops and the tempo points at that moment. Edits of the track's contents go into the
-  journal instead of a transaction and are not sent; the view shows the confirmed contents with
-  the journal applied. Undo works across journal and live edits alike. The journal is written to
-  the profile (`projects/<server>/checkouts/`) after every change, and picked up again when the
-  client starts and finds the checkout still its own.
+  journal of ops, the track and the tempo points at that moment, and the `seq` of the `Checkout`
+  event. Edits of the track's contents go into the journal instead of a transaction and are not
+  sent; the view shows the confirmed contents with the journal applied. A property written
+  again keeps only its last write in the journal (adding, removing and moving stay as they
+  were), so the journal grows with what changed, not with how long a drag took. Undo works
+  across journal and live edits alike. The journal is written to the profile
+  (`projects/<server>/checkouts/`) at most every half second while it changes and when the
+  session ends, and picked up again when the client starts and finds the same checkout (same
+  `seq`) still its own.
 - **Commit.** Starting a commit freezes the workspace. A worker thread renders the samples (see
   below) and the client shows them in the commit dialog. On the user's decision it uploads the
   blobs, sends `Commit` once all are stored, and sends it again on a new connection until the
@@ -287,9 +291,12 @@ Nothing is released automatically. After a server restart every checkout gets a 
   at checkout, the dialog offers *Commit as is* and *Commit and restore the old tempo*. The second
   sends the ops that turn the current tempo points into the old ones as `project_fix`, applied in
   the same event.
-- **Forced release.** When someone else ends the checkout, the journal applied to the old
-  contents is saved as a fork (`projects/<server>/forks/`). The changelog offers to add it to the
-  project as a new track. A dropped checkout (the owner's own `Release`) throws the journal away.
+- **Forced release.** When someone else ends the checkout, the journal applied to the track as
+  it was at checkout is saved as a fork (`projects/<server>/forks/`), whatever became of the
+  track since. A journal on disk whose checkout is no longer the client's when it starts (ended
+  while the client was not running) becomes a fork the same way. The changelog offers to add a
+  fork to the project as a new track, right below the track it came from. A dropped checkout
+  (the owner's own `Release`) throws the journal away.
 - **Others' checkouts** are drawn dimmed with the owner's name, and edits of them are refused in
   the client already. Anyone can end them, after a confirmation.
 - **Displaced edits.** When an event displaces an edit of this client's user (see "Concurrent

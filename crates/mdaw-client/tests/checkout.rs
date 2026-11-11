@@ -161,8 +161,11 @@ fn a_checkout_is_private_until_it_is_committed_with_samples() {
     assert_eq!(notes(&ann, track, clip), 3);
     assert_eq!(notes(&ben, track, clip), 1, "Ben hears the old content");
     // The work is on disk in case Ann's client goes down.
-    let (journal, _) = files.load_journal(track).unwrap();
-    assert_eq!(journal.len(), 2);
+    until(&mut [&mut ann, &mut ben], "the journal is on disk", |_| {
+        files
+            .load_journal(track)
+            .is_some_and(|saved| saved.journal.len() == 2)
+    });
 
     prepare_commit(&mut ann, &mut ben, track);
     ann.finish_commit("two more notes", false);
@@ -324,4 +327,80 @@ fn the_work_of_a_checkout_survives_a_restart_of_the_client() {
     until(&mut [&mut ann, &mut ben], "Ben has the commit", |s| {
         notes(s[1], track, clip) == 2
     });
+}
+
+fn server(dir: &std::path::Path) -> Server {
+    Server::start(Config {
+        data_dir: dir.join("server"),
+        listen: "127.0.0.1:0".parse().unwrap(),
+        host: None,
+    })
+    .unwrap()
+}
+
+/// Ann checks out the track, adds a note and closes her window; the work is on disk.
+fn leave_work_behind(server: &Server, dir: &std::path::Path) -> (Session, TrackId, ClipId) {
+    let mut ann = join(server, "ann");
+    let mut ben = join(server, "ben");
+    ann.set_files(Files::new(dir.join("ann")));
+    let (track, clip) = add_track(&mut ann);
+    settle(&mut [&mut ann, &mut ben]);
+    check_out(&mut ann, &mut ben, track);
+    let edit = note(1, ann.ids(), track, clip);
+    ann.edit(vec![edit]);
+    drop(ann);
+    (ben, track, clip)
+}
+
+fn rejoin(server: &Server, dir: &std::path::Path) -> Session {
+    let mut ann = join(server, "ann");
+    ann.set_files(Files::new(dir.join("ann")));
+    ann
+}
+
+#[test]
+fn a_checkout_ended_while_its_owner_is_away_becomes_a_fork() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = server(dir.path());
+    let (mut ben, track, clip) = leave_work_behind(&server, dir.path());
+    ben.force_release(track);
+    until(&mut [&mut ben], "the checkout is over", |s| {
+        s[0].checkout_owner(track).is_none()
+    });
+
+    let mut ann = rejoin(&server, dir.path());
+    assert_eq!(ann.forks().len(), 1, "the work is a fork");
+    assert_eq!(ann.forks()[0].content.clips[&clip].notes.len(), 2);
+    assert!(ann.notices().iter().any(|n| n.contains("while you were away")));
+    assert!(Files::new(dir.path().join("ann")).journals().is_empty());
+
+    // A new checkout of the same track starts empty.
+    check_out(&mut ann, &mut ben, track);
+    assert!(ann.workspace(track).unwrap().journal.is_empty());
+    assert_eq!(notes(&ann, track, clip), 1);
+    assert!(!ann.notices().iter().any(|n| n.contains("Picked up")));
+}
+
+#[test]
+fn the_fork_survives_the_removal_of_its_track() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = server(dir.path());
+    let (mut ben, track, clip) = leave_work_behind(&server, dir.path());
+    ben.force_release(track);
+    until(&mut [&mut ben], "the checkout is over", |s| {
+        s[0].checkout_owner(track).is_none()
+    });
+    assert!(ben.edit(vec![Op::TrackRemove { id: track }]));
+    settle(&mut [&mut ben]);
+
+    let mut ann = rejoin(&server, dir.path());
+    assert_eq!(ann.forks().len(), 1);
+    let fork = ann.forks()[0].clone();
+    assert_eq!(
+        (fork.shell.name.as_str(), fork.content.clips[&clip].notes.len()),
+        ("keys", 2)
+    );
+    assert!(ann.restore_fork(0));
+    settle(&mut [&mut ann, &mut ben]);
+    assert_eq!(ben.project().tracks.len(), 1, "back as a new track");
 }

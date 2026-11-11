@@ -1,10 +1,12 @@
 use imbl::OrdMap;
 use mdaw_model::{
-    ActorId, IdGen, Op, Project, PropKey, Scope, TempoId, TempoPoint, TrackId, UserId, apply, apply_all,
+    ActorId, IdGen, Op, Project, PropKey, Scope, TempoId, TempoPoint, Track, TrackId, UserId, apply,
+    apply_all,
 };
 use mdaw_proto::{Event, EventBody, ReleaseReason, SyncData, Txn, apply_event};
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
+use std::sync::Arc;
 
 /// Undo steps kept per client.
 const UNDO_LIMIT: usize = 500;
@@ -49,13 +51,47 @@ struct UndoEntry {
 #[derive(Clone, PartialEq, Debug)]
 pub struct Workspace {
     pub track: TrackId,
+    /// Server sequence number of the `Checkout` event: which checkout of the track this is.
+    pub base_seq: u64,
+    /// The track when the checkout began. Its contents stay so in the shared document while the
+    /// checkout lasts; the shell may change.
+    pub base: Arc<Track>,
     /// The edits so far, in order. They apply to the track's confirmed contents, which nobody
-    /// else can change while the checkout lasts.
+    /// else can change while the checkout lasts. A property written again keeps only its latest
+    /// write, so a long checkout grows with what changed, not with how often.
     pub journal: Vec<Op>,
     /// The tempo points when the checkout began: what the work was made against.
     pub base_tempo: OrdMap<TempoId, TempoPoint>,
     /// A commit of this workspace is on its way. No more edits are taken.
     pub committing: bool,
+    /// Counts the edits recorded, so that a change of the journal is seen even when its length
+    /// stays the same.
+    pub changes: u64,
+}
+
+impl Workspace {
+    fn new(track: TrackId, base_seq: u64, base: Arc<Track>, base_tempo: OrdMap<TempoId, TempoPoint>) -> Self {
+        Self {
+            track,
+            base_seq,
+            base,
+            journal: Vec::new(),
+            base_tempo,
+            committing: false,
+            changes: 0,
+        }
+    }
+
+    fn record(&mut self, op: Op) {
+        let (entity, prop) = (op.entity(), op.prop());
+        // Values are written whole, so only the last write of one counts. Adding, removing and
+        // moving depend on what is around them and stay as they were.
+        if !matches!(prop, PropKey::Existence | PropKey::Order) {
+            self.journal.retain(|o| o.entity() != entity || o.prop() != prop);
+        }
+        self.journal.push(op);
+        self.changes += 1;
+    }
 }
 
 /// How a checkout of this client's user came to an end.
@@ -154,6 +190,7 @@ impl Replica {
         };
         workspace.journal = journal;
         workspace.base_tempo = base_tempo;
+        workspace.changes += 1;
         self.rebuild();
         true
     }
@@ -295,7 +332,7 @@ impl Replica {
         for op in ops {
             match op.scope() {
                 Scope::TrackContent(track) if self.workspaces.contains_key(&track) => {
-                    self.workspaces.get_mut(&track).expect("checked").journal.push(op);
+                    self.workspaces.get_mut(&track).expect("checked").record(op);
                 }
                 _ => live.push(op),
             }
@@ -400,16 +437,15 @@ impl Replica {
             return false;
         };
         let changed = match &event.body {
-            EventBody::Checkout { track } if event.user == user => {
-                let workspace = Workspace {
-                    track: *track,
-                    journal: Vec::new(),
-                    base_tempo: self.confirmed.tempo.clone(),
-                    committing: false,
-                };
-                self.workspaces.insert(*track, workspace);
-                true
-            }
+            EventBody::Checkout { track } if event.user == user => match self.confirmed.track(*track) {
+                Some(base) => {
+                    let workspace =
+                        Workspace::new(*track, event.seq, base.clone(), self.confirmed.tempo.clone());
+                    self.workspaces.insert(*track, workspace);
+                    true
+                }
+                None => false,
+            },
             EventBody::Commit { track, .. } => self.end(*track, Ended::Committed),
             EventBody::Release { track, reason } => {
                 let how = match reason {
@@ -454,23 +490,21 @@ impl Replica {
             })
             .copied()
             .collect();
-        let new: Vec<TrackId> = confirmed
+        let new: Vec<(TrackId, u64, Arc<Track>)> = confirmed
             .tracks
             .iter()
-            .filter(|(id, t)| t.checkout.is_some_and(|c| c.user == user) && !self.workspaces.contains_key(id))
-            .map(|(id, _)| *id)
+            .filter(|(id, _)| !self.workspaces.contains_key(id))
+            .filter_map(|(id, t)| {
+                let checkout = t.checkout.filter(|c| c.user == user)?;
+                Some((*id, checkout.base_seq, t.clone()))
+            })
             .collect();
         let changed = !gone.is_empty() || !new.is_empty();
         for track in gone {
             self.end(track, Ended::Lost);
         }
-        for track in new {
-            let workspace = Workspace {
-                track,
-                journal: Vec::new(),
-                base_tempo: self.confirmed.tempo.clone(),
-                committing: false,
-            };
+        for (track, base_seq, base) in new {
+            let workspace = Workspace::new(track, base_seq, base, self.confirmed.tempo.clone());
             self.workspaces.insert(track, workspace);
         }
         changed

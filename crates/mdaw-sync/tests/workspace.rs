@@ -240,3 +240,59 @@ fn the_tempo_at_checkout_is_remembered() {
     assert_eq!(workspace.base_tempo[&TEMPO].milli_bpm, 120_000);
     assert_eq!(replica.confirmed().tempo[&TEMPO].milli_bpm, 140_000);
 }
+
+#[test]
+fn a_property_written_again_keeps_only_its_last_write_in_the_journal() {
+    let mut replica = ann();
+    replica
+        .on_event(&event(1, ANN, EventBody::Checkout { track: TRACK }))
+        .unwrap();
+    replica.submit(vec![add(1)]);
+    let pitch = |p: u8| Op::NoteSet {
+        track: TRACK,
+        clip: CLIP,
+        id: NoteId(EntityId(101)),
+        prop: NoteProp::Pitch(p),
+    };
+    // A drag: one write per frame.
+    for p in 61..=90 {
+        replica.submit(vec![pitch(p)]);
+    }
+    let workspace = replica.workspace(TRACK).unwrap();
+    assert_eq!(workspace.journal, [add(1), pitch(90)]);
+    assert_eq!(workspace.changes, 31, "every write counts as a change");
+    let note = replica.view().track(TRACK).unwrap().content.clips[&CLIP].notes[&NoteId(EntityId(101))];
+    assert_eq!(note.pitch, 90);
+}
+
+#[test]
+fn a_workspace_remembers_its_checkout_and_the_track_it_began_with() {
+    let mut replica = ann();
+    replica
+        .on_event(&event(1, ANN, EventBody::Checkout { track: TRACK }))
+        .unwrap();
+    replica.submit(vec![add(1)]);
+    let release = EventBody::Release {
+        track: TRACK,
+        reason: ReleaseReason::Forced { owner: ANN },
+    };
+    let seq = 2;
+    replica.on_event(&event(seq, BEN, release)).unwrap();
+    let removed = event(
+        seq + 1,
+        BEN,
+        EventBody::Txn {
+            client_txn_id: 2,
+            ops: vec![Op::TrackRemove { id: TRACK }],
+            superseded: vec![],
+        },
+    );
+    replica.on_event(&removed).unwrap();
+    let (workspace, _) = replica.take_ended().remove(0);
+    assert_eq!(workspace.base_seq, 1);
+    assert_eq!(
+        workspace.base.shell.name, "one",
+        "kept although the track is gone"
+    );
+    assert_eq!(workspace.journal, [add(1)]);
+}
