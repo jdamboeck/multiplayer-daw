@@ -493,3 +493,68 @@ fn a_fork_the_server_refuses_to_add_stays_a_fork() {
         "still on disk"
     );
 }
+
+#[test]
+fn an_edit_that_lost_gets_a_sample_of_how_it_sounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = server(dir.path());
+    let addr = server.local_addr().unwrap();
+    let mut ann = join(&server, "ann");
+    let mut ben = join(&server, "ben");
+    let (track, clip) = add_track(&mut ann);
+    settle(&mut [&mut ann, &mut ben]);
+    let id = *ann.project().track(track).unwrap().content.clips[&clip]
+        .notes
+        .keys()
+        .next()
+        .unwrap();
+
+    // Both change the same note while the server is away.
+    server.stop();
+    until(&mut [&mut ann, &mut ben], "both notice", |s| {
+        s.iter().all(|s| s.status() == Status::Reconnecting)
+    });
+    for (session, pitch) in [(&mut ann, 62), (&mut ben, 65)] {
+        let prop = NoteProp::Pitch(pitch);
+        assert!(session.edit(vec![Op::NoteSet {
+            track,
+            clip,
+            id,
+            prop
+        }]));
+    }
+    let _server = Server::start(Config {
+        data_dir: dir.path().join("server"),
+        listen: addr,
+        host: None,
+    })
+    .unwrap();
+
+    // The one whose edit lost renders the track as it was with it, for both changelogs.
+    until(&mut [&mut ann, &mut ben], "the sample is attached", |s| {
+        s.iter().all(|s| {
+            s.displaced()
+                .first()
+                .is_some_and(|d| s.samples(d.seq).iter().any(|x| x.kind == SampleKind::Before))
+        })
+    });
+    let entry = ann.displaced()[0].clone();
+    let sample = ann.samples(entry.seq)[0];
+    assert_eq!(sample.range, TickRange::new(Tick::ZERO, Tick::bars(1)));
+    // The winner downloads it and hears it.
+    let winner = if entry.lost.lost_user == ann.user() {
+        &mut ben
+    } else {
+        &mut ann
+    };
+    winner.play_sample(&sample);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !winner.sample_position(sample.blob).is_some_and(|at| at > 0.0) {
+        winner.frame();
+        winner.engine_mut().pump(4800);
+        assert!(Instant::now() < deadline, "the sample never played");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let heard = winner.engine_mut().pump(4800).unwrap();
+    assert!(heard.iter().any(|s| s.abs() > 0.01), "the sample has sound");
+}

@@ -398,3 +398,56 @@ fn two_audio_devices_stay_together() {
         assert!((worst as f64) < TOGETHER_MICROS, "off by up to {worst} µs");
     }
 }
+
+#[test]
+fn without_the_server_each_plays_alone_and_a_new_server_starts_stopped() {
+    let (dir, server) = serve();
+    let addr = server.local_addr().unwrap();
+    let (mut ann, mut ben) = (join(&server, "ann"), join(&server, "ben"));
+    let track = ann.ids().track();
+    let add = Op::TrackAdd {
+        id: track,
+        shell: TrackShell {
+            name: "t".into(),
+            color: 0,
+        },
+        content: TrackContent::default(),
+        after: None,
+    };
+    assert!(ann.edit(vec![add]));
+    ann.set_loop(Some(TickRange::new(Tick::ZERO, Tick::bars(1))));
+    settle(&mut [&mut ann, &mut ben]);
+    ann.play();
+    settle(&mut [&mut ann, &mut ben]);
+
+    // The server goes away: both play on, and each transport is its own.
+    server.stop();
+    until(&mut [&mut ann, &mut ben], "both notice", |s| {
+        s.iter().all(|s| s.status() == Status::Reconnecting)
+    });
+    assert!(ann.is_playing() && ben.is_playing());
+    assert!(ann.timing().is_none(), "no shared clock without the server");
+    ann.pause();
+    until(&mut [&mut ann, &mut ben], "a moment passes", |s| {
+        s[1].position() > 960.0
+    });
+    assert!(!ann.is_playing() && ben.is_playing(), "only ann stops");
+
+    // A new server knows nothing of the old transport: everyone stopped at the start, no loop.
+    let config = Config {
+        data_dir: dir.path().to_path_buf(),
+        listen: addr,
+        host: None,
+    };
+    let _server = Server::start(config).unwrap();
+    settle(&mut [&mut ann, &mut ben]);
+    for session in [&ann, &ben] {
+        assert!(!session.is_playing());
+        assert_eq!(session.position(), 0.0);
+        assert_eq!(session.loop_range(), None);
+        assert!(session.project().track(track).is_some(), "the document is kept");
+    }
+    ben.play();
+    settle(&mut [&mut ann, &mut ben]);
+    assert!(ann.is_playing() && ben.is_playing());
+}

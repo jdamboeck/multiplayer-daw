@@ -348,6 +348,142 @@ fn notes_add_move_resize_velocity_delete() {
     );
 }
 
+/// Where a track's name sits in its header.
+fn header_name(h: &App, row: usize) -> Pos2 {
+    let layout = h.state().arrange.layout.expect("the arrangement is laid out");
+    egui::pos2(layout.headers.left() + 30.0, layout.row_top(row) + 17.0)
+}
+
+fn playing(h: &App) -> bool {
+    h.state().session.engine().is_playing()
+}
+
+#[test]
+fn a_window_without_a_server_shows_no_server_controls() {
+    let h = harness();
+    for label in ["Link", "Check out"] {
+        assert!(h.query_by_label(label).is_none(), "{label} needs a server");
+    }
+    assert!(h.query_by_label_contains("clock").is_none());
+    assert!(h.query_by_label_contains("Online").is_none());
+}
+
+#[test]
+fn space_plays_the_loop_goes_round_and_stop_twice_goes_back_to_the_start() {
+    let mut h = with_open_clip();
+    let at = cell(&h, Tick::ZERO, 60);
+    click(&mut h, at);
+    // Shift-drag in the ruler sets the loop region to bar 1, and turns looping on.
+    let layout = h.state().arrange.layout.unwrap();
+    let ruler = |tick: Tick| egui::pos2(layout.axis.x(tick) + 3.0, layout.ruler.center().y);
+    h.event(egui::Event::ModifiersChanged(Modifiers::SHIFT));
+    drag(&mut h, ruler(Tick::ZERO), ruler(Tick::bars(1)));
+    h.event(egui::Event::ModifiersChanged(Modifiers::NONE));
+    assert!(h.state().loop_on);
+    assert_eq!(
+        h.state().loop_range,
+        mdaw_model::TickRange::new(Tick::ZERO, Tick::bars(1))
+    );
+    h.get_by_label("Loop").click();
+    h.run_steps(2);
+    assert!(!h.state().loop_on, "the button turns it off");
+    h.get_by_label("Loop").click();
+    h.run_steps(2);
+    assert!(h.state().loop_on);
+    let loop_end = h.state().loop_range.end.0 as f64;
+
+    h.key_press(Key::Space);
+    h.run_steps(2);
+    assert!(playing(&h));
+    // Twice round a loop of one bar at 120 bpm: 4 seconds.
+    for _ in 0..10 {
+        assert!(peak(&mut h, 24_000) >= 0.0);
+        let at = h.state().session.engine().position();
+        assert!(at < loop_end, "the playhead stays inside the loop, at {at}");
+    }
+    h.key_press(Key::Space);
+    h.run_steps(2);
+    assert!(!playing(&h), "space again pauses");
+    assert!(h.state().session.engine().position() > 0.0);
+
+    for _ in 0..2 {
+        h.get_by_label("Stop").click();
+        h.run_steps(2);
+    }
+    assert_eq!(h.state().session.engine().position(), 0.0);
+    assert!(h.query_by_label_contains("1.1.1").is_some());
+}
+
+#[test]
+fn a_track_is_renamed_from_its_header_and_silent_when_muted() {
+    let mut h = with_open_clip();
+    let at = cell(&h, Tick::ZERO, 60);
+    click(&mut h, at);
+
+    let name = header_name(&h, 0);
+    // A third click within egui's double-click time would make this a triple click.
+    h.run_steps(30);
+    double_click(&mut h, name);
+    h.key_press_modifiers(Modifiers::COMMAND, Key::A);
+    h.event(egui::Event::Text("Keys".into()));
+    h.key_press(Key::Enter);
+    h.run_steps(3);
+    let track = track(&h);
+    let renamed = |h: &App| {
+        h.state()
+            .session
+            .project()
+            .track(track)
+            .unwrap()
+            .shell
+            .name
+            .clone()
+    };
+    assert_eq!(renamed(&h), "Keys");
+
+    h.get_by_label("M").click();
+    h.run_steps(2);
+    h.key_press(Key::Space);
+    h.run_steps(2);
+    assert_eq!(peak(&mut h, 24_000), 0.0, "a muted track is silent");
+    h.get_by_label("M").click();
+    for label in ["Pause", "Stop", "Play"] {
+        h.run_steps(2);
+        h.get_by_label(label).click();
+    }
+    h.run_steps(2);
+    assert!(peak(&mut h, 24_000) > 0.01, "and sounds again");
+}
+
+#[test]
+fn undo_and_redo_go_one_gesture_at_a_time() {
+    let mut h = with_open_clip();
+    for beat in 0..3 {
+        let at = cell(&h, Tick::beats(beat), 60 + beat as u8);
+        click(&mut h, at);
+    }
+    assert_eq!(notes(&h).len(), 3);
+    let redo = |h: &mut App| {
+        h.key_press_modifiers(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z);
+        h.run_steps(2);
+    };
+    for left in [2, 1, 0] {
+        undo(&mut h);
+        assert_eq!(notes(&h).len(), left);
+    }
+    undo(&mut h);
+    assert!(clips(&h).is_empty(), "then the clip");
+    redo(&mut h);
+    assert_eq!((clips(&h).len(), notes(&h).len()), (1, 0));
+    for count in [1, 2, 3] {
+        redo(&mut h);
+        assert_eq!(notes(&h).len(), count);
+    }
+    let pitches: Vec<u8> = notes(&h).iter().map(|n| n.pitch).collect();
+    assert_eq!(pitches.len(), 3);
+    assert!(pitches.contains(&60) && pitches.contains(&62));
+}
+
 #[test]
 fn tracks_and_devices() {
     let mut h = harness();

@@ -490,6 +490,193 @@ fn play_in_one_window_plays_in_the_other_until_it_unlinks() {
     assert!(shows(&ben, "Play"));
 }
 
+/// Ann checks the track out and adds a note to it; Ben sees the lock.
+fn checked_out_with_a_note(ann: &mut App, ben: &mut App, track: TrackId, clip: ClipId) {
+    ann.get_by_label("Check out").click();
+    until(ann, ben, "ben sees the lock", |a, b| {
+        a.session.workspace(track).is_some() && b.session.checkout_owner(track).is_some()
+    });
+    let id = ann.state_mut().session.ids().note();
+    let note = Note {
+        start: Tick::beats(2),
+        dur: Tick::beats(1),
+        pitch: 64,
+        vel: 100,
+    };
+    assert!(ann.state_mut().session.edit(vec![Op::NoteAdd {
+        track,
+        clip,
+        id,
+        note
+    }]));
+    ann.run_steps(2);
+}
+
+fn note_count(h: &App, track: TrackId, clip: ClipId) -> usize {
+    h.state().session.project().track(track).unwrap().content.clips[&clip]
+        .notes
+        .len()
+}
+
+/// Opens the commit dialog and waits for the samples.
+fn open_commit(ann: &mut App, ben: &mut App) {
+    ann.get_by_label("Commit…").click();
+    until(ann, ben, "the samples are rendered", |a, _| {
+        matches!(
+            a.session.commit_state(),
+            Some(mdaw_client::CommitState::Ready { .. })
+        )
+    });
+    ann.run_steps(2);
+}
+
+#[test]
+fn a_track_someone_else_has_checked_out_is_locked_but_keeps_its_name_live() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = serve(dir.path(), "127.0.0.1:0");
+    let (mut ann, mut ben, track, clip) = with_a_clip(&server);
+    assert!(shows(&ann, "Check out") && shows(&ben, "Check out"));
+    checked_out_with_a_note(&mut ann, &mut ben, track, clip);
+    assert!(shows(&ann, "Commit…"));
+    assert!(shows(&ben, "Locked") && !shows(&ben, "Check out"));
+    assert_eq!(note_count(&ben, track, clip), 0, "Ben hears the old version");
+
+    // Ben can change neither the notes nor the mix, and is told why.
+    let id = ben.state_mut().session.ids().note();
+    let note = Note {
+        start: Tick::ZERO,
+        dur: Tick::beats(1),
+        pitch: 60,
+        vel: 100,
+    };
+    assert!(!ben.state_mut().session.edit(vec![Op::NoteAdd {
+        track,
+        clip,
+        id,
+        note
+    }]));
+    ben.get_by_label("M").click();
+    ben.run_steps(3);
+    assert!(!ben.state().session.project().track(track).unwrap().content.mute);
+    assert!(shows(&ben, "This track is checked out by ann."));
+
+    // Name and colour stay live.
+    let prop = mdaw_model::ShellProp::Name("Keys".into());
+    assert!(
+        ben.state_mut()
+            .session
+            .edit(vec![Op::TrackSetShell { id: track, prop }])
+    );
+    until(&mut ann, &mut ben, "ann has the new name", |a, _| {
+        a.session.project().track(track).unwrap().shell.name == "Keys"
+    });
+}
+
+#[test]
+fn the_commit_dialog_can_be_left_and_the_changes_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = serve(dir.path(), "127.0.0.1:0");
+    let (mut ann, mut ben, track, clip) = with_a_clip(&server);
+    checked_out_with_a_note(&mut ann, &mut ben, track, clip);
+
+    // While the dialog is open the track takes no edits.
+    open_commit(&mut ann, &mut ben);
+    assert!(shows(&ann, "What did you change?"));
+    let id = ann.state_mut().session.ids().note();
+    let note = Note {
+        start: Tick::ZERO,
+        dur: Tick::beats(1),
+        pitch: 60,
+        vel: 100,
+    };
+    let add = Op::NoteAdd {
+        track,
+        clip,
+        id,
+        note,
+    };
+    assert!(!ann.state_mut().session.edit(vec![add.clone()]));
+    ann.run_steps(2);
+    assert!(shows(&ann, "This track is being committed."));
+
+    // "Keep working" closes it, and the track takes edits again.
+    ann.get_by_label("Keep working").click();
+    ann.run_steps(3);
+    assert!(!shows(&ann, "What did you change?"));
+    assert!(shows(&ann, "Commit…"));
+    assert!(ann.state_mut().session.edit(vec![add]));
+    assert_eq!(note_count(&ann, track, clip), 2);
+
+    // "Drop changes" asks twice, then throws the work away.
+    open_commit(&mut ann, &mut ben);
+    ann.get_by_label("Drop changes").click();
+    ann.run_steps(3);
+    assert!(ann.state().session.workspace(track).is_some(), "not yet");
+    ann.get_by_label("Really drop them?").click();
+    until(&mut ann, &mut ben, "the checkout is over", |a, b| {
+        a.session.workspace(track).is_none() && b.session.checkout_owner(track).is_none()
+    });
+    assert!(!shows(&ann, "What did you change?"));
+    assert_eq!(note_count(&ann, track, clip), 0);
+    for h in [&mut ann, &mut ben] {
+        h.get_by_label("Changelog").click();
+        h.run_steps(3);
+    }
+    assert!(shows(&ann, "you dropped the checkout of \"Track 1\""));
+    assert!(shows(&ben, "ann dropped the checkout of \"Track 1\""));
+}
+
+#[test]
+fn a_tempo_change_during_a_checkout_is_a_choice_in_the_commit_dialog() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = serve(dir.path(), "127.0.0.1:0");
+    let (mut ann, mut ben, track, clip) = with_a_clip(&server);
+    checked_out_with_a_note(&mut ann, &mut ben, track, clip);
+
+    // Ben may change the tempo under it.
+    let tempo = |h: &App| h.state().session.project().tempo_map().milli_bpm_at(Tick::ZERO);
+    let id = *ben.state().session.project().tempo.keys().next().unwrap();
+    let point = mdaw_model::TempoPoint {
+        tick: Tick::ZERO,
+        milli_bpm: 90_000,
+    };
+    assert!(ben.state_mut().session.edit(vec![Op::TempoPut { id, point }]));
+    until(&mut ann, &mut ben, "ann has the new tempo", |a, _| {
+        a.session.project().tempo_map().milli_bpm_at(Tick::ZERO) == 90_000
+    });
+
+    open_commit(&mut ann, &mut ben);
+    for label in [
+        "The tempo under this track changed",
+        "Play: Old tempo",
+        "Play: Current tempo",
+        "Commit as is",
+        "Commit and restore the old tempo",
+    ] {
+        assert!(shows(&ann, label), "the dialog shows {label}");
+    }
+    ann.get_by_label("Commit as is").click();
+    until(&mut ann, &mut ben, "the commit lands", |_, b| {
+        b.session.checkout_owner(track).is_none()
+    });
+    settle(&mut ann, &mut ben);
+    assert_eq!(tempo(&ben), 90_000, "the tempo stays where Ben put it");
+    assert_eq!(note_count(&ben, track, clip), 1);
+
+    // The changelog follows the selected track, also when the selected one is deleted.
+    ann.get_by_label("Changelog").click();
+    ann.run_steps(3);
+    assert!(shows(&ann, "you committed \"Track 1\""));
+    ann.get_by_label("+ Track").click();
+    ann.run_steps(3);
+    assert!(shows(&ann, "Nothing has happened to \"Track 2\" yet"));
+    let second = ann.state().sel.track.unwrap();
+    ann.state_mut().remove_track(second);
+    ann.run_steps(3);
+    assert_eq!(ann.state().sel.track, Some(track));
+    assert!(shows(&ann, "you committed \"Track 1\""));
+}
+
 /// Writes PNGs of what collaboration looks like. Run with
 /// `MDAW_SHOTS=/some/dir cargo test -p mdaw-client --test ui_net -- --ignored screenshots`.
 #[test]

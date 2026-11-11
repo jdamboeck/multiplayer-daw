@@ -4,8 +4,8 @@
 use mdaw_client::{Session, Status, Who};
 use mdaw_engine::Engine;
 use mdaw_model::{
-    Clip, ClipId, Device, DeviceKind, EntityRef, Note, NoteId, NoteProp, Op, Project, Tick, TrackContent,
-    TrackId, TrackShell,
+    Clip, ClipId, ClipProp, Device, DeviceKind, EntityRef, MixProp, Note, NoteId, NoteProp, Op, Project,
+    Tick, TrackContent, TrackId, TrackShell,
 };
 use mdaw_server::{Config, Server};
 use std::net::SocketAddr;
@@ -375,6 +375,15 @@ fn edits_made_offline_to_the_same_thing_meet_when_the_server_is_back() {
     assert!(ann.restore(&lost));
     settle(&mut [&mut ann, &mut ben]);
     assert_eq!(pitch(ben.project(), at), Some(loser));
+    assert!(
+        !ann.can_restore(&lost) && !ben.can_restore(&lost),
+        "nothing left to restore"
+    );
+
+    // A restore is an edit of one's own: undo takes it back.
+    assert!(ann.undo());
+    settle(&mut [&mut ann, &mut ben]);
+    assert_eq!(pitch(ben.project(), at), Some(winner));
 }
 
 #[test]
@@ -468,4 +477,66 @@ fn joining_fails_with_a_reason() {
         .recv_timeout(Duration::from_secs(10))
         .expect("ann is woken for ben's edit");
     settle(&mut [&mut ann, &mut ben]);
+}
+
+#[test]
+fn undo_takes_back_only_ones_own_edits_and_brings_back_what_it_removed() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = serve(dir.path(), "127.0.0.1:0");
+    let (mut ann, mut ben) = (join(&server, "ann"), join(&server, "ben"));
+    let (track, clip, _) = add_track(&mut ann, "Lead");
+    settle(&mut [&mut ann, &mut ben]);
+
+    // Ben moves the clip, Ann turns the track down; Ann's undo takes back hers only.
+    assert!(ben.edit(vec![Op::ClipSet {
+        track,
+        id: clip,
+        prop: ClipProp::Start(Tick::bars(1)),
+    }]));
+    assert!(ann.edit(vec![Op::TrackSetMix {
+        track,
+        prop: MixProp::Gain(0.25),
+    }]));
+    settle(&mut [&mut ann, &mut ben]);
+    assert!(ann.undo());
+    settle(&mut [&mut ann, &mut ben]);
+    let lead = ben.project().track(track).unwrap().content.clone();
+    assert_eq!(lead.gain, 1.0);
+    assert_eq!(lead.clips[&clip].start, Tick::bars(1), "Ben's move stays");
+
+    // Ann removes the track Ben made; her undo brings it back, clip and all, for both.
+    let (theirs, their_clip, _) = add_track(&mut ben, "Bass");
+    settle(&mut [&mut ann, &mut ben]);
+    assert!(ann.edit(vec![Op::TrackRemove { id: theirs }]));
+    settle(&mut [&mut ann, &mut ben]);
+    assert!(ben.project().track(theirs).is_none());
+    assert!(ann.undo());
+    settle(&mut [&mut ann, &mut ben]);
+    let back = ben.project().track(theirs).expect("the track is back");
+    assert_eq!(back.shell.name, "Bass");
+    assert_eq!(back.content.clips[&their_clip].notes.len(), 1);
+}
+
+#[test]
+fn the_others_see_someone_leave() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = serve(dir.path(), "127.0.0.1:0");
+    let (mut ann, ben) = (join(&server, "ann"), join(&server, "ben"));
+    until(&mut [&mut ann], "ann sees ben", |s| s[0].peers().len() == 2);
+    drop(ben);
+    until(&mut [&mut ann], "ann sees ben leave", |s| s[0].peers().len() == 1);
+}
+
+#[test]
+fn joining_a_server_that_is_not_there_gives_up_with_a_reason() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = serve(dir.path(), "127.0.0.1:0");
+    let info = server.join_info().clone();
+    server.stop();
+    let started = Instant::now();
+    let error = Session::join(info, who("zed"), Engine::manual(48_000, false), Arc::new(|| {}))
+        .err()
+        .expect("nobody answers");
+    assert!(error.to_string().contains("could not join"), "{error}");
+    assert!(started.elapsed() < Duration::from_secs(15));
 }
