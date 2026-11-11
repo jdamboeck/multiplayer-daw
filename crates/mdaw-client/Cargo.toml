@@ -17,6 +17,7 @@ mdaw-sync.workspace = true
 mdaw-dsp.workspace = true
 mdaw-engine.workspace = true
 mdaw-net.workspace = true
+mdaw-plugin.workspace = true
 anyhow.workspace = true
 getrandom.workspace = true
 imbl.workspace = true
@@ -31,6 +32,7 @@ chrono.workspace = true
 [dev-dependencies]
 egui_kittest = { workspace = true, features = ["wgpu"] }
 mdaw-server.workspace = true
+mdaw-test-plugin = { path = "../mdaw-test-plugin" }
 tempfile.workspace = true
 
 [lib]

@@ -15,6 +15,7 @@ use super::{
     MAX_DB, MIN_DB, TimeAxis, db_to_gain, gain_to_db, paint_grid, paint_playhead, paint_ruler, snap_ceil,
     snap_floor, snap_round,
 };
+use crate::plugins::TrackSound;
 use crate::{DawApp, Focus, theme};
 
 pub const HEADER_W: f32 = 232.0;
@@ -664,15 +665,34 @@ fn header(app: &mut DawApp, ui: &mut Ui, rect: Rect, clip: Rect, id: TrackId, tr
                 FontId::proportional(14.0),
                 color,
             );
-            // Who else plays on the track right now.
+            // Who else plays on the track right now, and how it is heard here.
+            let mut x = written.right() + 8.0;
             let players = app.session.players(id);
             if !players.is_empty() {
-                text.text(
-                    pos2(written.right() + 8.0, name.center().y),
+                let shown = text.text(
+                    pos2(x, name.center().y),
                     Align2::LEFT_CENTER,
                     format!("{} playing", players.join(", ")),
                     FontId::proportional(12.0),
                     theme::METER,
+                );
+                x = shown.right() + 8.0;
+            }
+            let sound = match app.session.track_sound(id) {
+                TrackSound::Builtin | TrackSound::Live => None,
+                TrackSound::Stem { stale: false } => Some(("stem", theme::TEXT_DIM)),
+                TrackSound::Stem { stale: true } => Some(("stem, old tempo", theme::WARN)),
+                TrackSound::Silent => Some(("no sound here", theme::WARN)),
+                TrackSound::Crashed { stem: true } => Some(("plugin crashed, stem plays", theme::METER_HOT)),
+                TrackSound::Crashed { stem: false } => Some(("plugin crashed", theme::METER_HOT)),
+            };
+            if let Some((label, color)) = sound {
+                text.text(
+                    pos2(x, name.center().y),
+                    Align2::LEFT_CENTER,
+                    label,
+                    FontId::proportional(12.0),
+                    color,
                 );
             }
         }

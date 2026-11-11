@@ -253,12 +253,12 @@ pub enum RejectReason {
         track: TrackId,
         by: UserId,
     },
-    /// Tracks with CLAP devices are edited only through checkout.
-    ClapTrack {
+    /// Tracks with plugins are edited only through checkout.
+    PluginTrack {
         track: TrackId,
     },
-    /// CLAP devices are added only by a commit.
-    ClapOutsideCommit,
+    /// Plugins are added only by a commit.
+    PluginOutsideCommit,
     NoSuchTrack,
     /// The request needs the sender to own the track's checkout.
     NotOwner {
@@ -272,7 +272,7 @@ pub enum RejectReason {
     OutOfScope,
     /// A blob the request names was not uploaded.
     MissingBlob(BlobHash),
-    /// A track with CLAP devices must be committed with a stem.
+    /// A track with plugins must be committed with a stem.
     StemRequired,
     /// The entry to attach to is not in the log.
     NoSuchEntry,
@@ -284,8 +284,8 @@ impl fmt::Display for RejectReason {
             RejectReason::Invalid(why) => write!(f, "invalid edit: {why}"),
             RejectReason::FutureBase => write!(f, "the edit refers to events the server does not have"),
             RejectReason::CheckedOut { .. } => write!(f, "the track is checked out"),
-            RejectReason::ClapTrack { .. } => write!(f, "tracks with plugins are edited through checkout"),
-            RejectReason::ClapOutsideCommit => write!(f, "plugins are added through checkout"),
+            RejectReason::PluginTrack { .. } => write!(f, "tracks with plugins are edited through checkout"),
+            RejectReason::PluginOutsideCommit => write!(f, "plugins are added through checkout"),
             RejectReason::NoSuchTrack => write!(f, "the track does not exist any more"),
             RejectReason::NotOwner { .. } => write!(f, "the track is not checked out by you"),
             RejectReason::NotCheckedOut { .. } => write!(f, "the track is not checked out"),

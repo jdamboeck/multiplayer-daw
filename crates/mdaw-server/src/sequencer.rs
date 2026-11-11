@@ -58,8 +58,8 @@ impl Sequencer {
         }
         for op in &txn.ops {
             op.validate().map_err(|e| RejectReason::Invalid(e.to_string()))?;
-            if op.adds_clap_device() {
-                return Err(RejectReason::ClapOutsideCommit);
+            if op.adds_plugin() {
+                return Err(RejectReason::PluginOutsideCommit);
             }
             match op.scope() {
                 Scope::Project => {}
@@ -72,8 +72,8 @@ impl Sequencer {
                             by: checkout.user,
                         });
                     }
-                    if track.content.has_clap_device() {
-                        return Err(RejectReason::ClapTrack { track: id });
+                    if track.content.has_plugin() {
+                        return Err(RejectReason::PluginTrack { track: id });
                     }
                 }
                 Scope::TrackStructure(id) => {
@@ -194,7 +194,7 @@ impl Sequencer {
         }
         for op in &commit.project_fix {
             op.validate().map_err(|e| RejectReason::Invalid(e.to_string()))?;
-            if op.scope() != Scope::Project || op.adds_clap_device() {
+            if op.scope() != Scope::Project || op.adds_plugin() {
                 return Err(RejectReason::OutOfScope);
             }
         }
@@ -210,11 +210,11 @@ impl Sequencer {
                 after = (*t.content).clone();
             }
         }
-        if after.has_clap_device() && commit.stem.is_none() {
+        if after.has_plugin() && commit.stem.is_none() {
             return Err(RejectReason::StemRequired);
         }
         let states = after.devices.iter().filter_map(|d| match &d.kind {
-            DeviceKind::Clap { state, .. } => *state,
+            DeviceKind::Plugin { state, .. } => *state,
             DeviceKind::Builtin { .. } => None,
         });
         let blobs = commit

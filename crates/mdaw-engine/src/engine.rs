@@ -1,8 +1,8 @@
 use crate::rt::{Anchor, Command, LiveNote, RtCore, Shared};
 use crate::{alloc_guard, clock};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use mdaw_dsp::{Compiler, Graph};
-use mdaw_model::{Project, Tick, TickRange, TrackId};
+use mdaw_dsp::{Compiler, Graph, NoPlugins, PluginSource};
+use mdaw_model::{DeviceId, Project, Tick, TickRange, TrackId};
 use std::collections::VecDeque;
 use std::fmt;
 use std::sync::atomic::Ordering::Relaxed;
@@ -91,6 +91,8 @@ pub struct Engine {
     /// Previews the audio thread may still hold, by `id`.
     previews: Vec<(u64, Arc<[f32]>)>,
     live: LiveInput,
+    /// Where plugin devices and stems come from. `None`: nowhere.
+    plugins: Option<Box<dyn PluginSource>>,
 }
 
 /// Plays live notes from any thread, straight into the audio thread: a note played on a MIDI
@@ -258,6 +260,28 @@ impl Engine {
             preview_seq: 0,
             previews: Vec::new(),
             live,
+            plugins: None,
+        }
+    }
+
+    /// Where plugin devices and stems come from from now on. Builds the graph anew.
+    pub fn set_plugins(&mut self, plugins: Box<dyn PluginSource>) {
+        self.plugins = Some(plugins);
+        self.refresh();
+    }
+
+    /// Makes a device anew with the next graph instead of carrying it over, as when a plugin got
+    /// another state. Call [`Engine::refresh`] after.
+    pub fn forget(&mut self, track: TrackId, device: DeviceId) {
+        self.compiler.forget(track, device);
+    }
+
+    /// Builds the graph anew from the last document, as when a plugin or a stem has become
+    /// available.
+    pub fn refresh(&mut self) {
+        if let Some(project) = self.current.take().or_else(|| self.waiting.take()) {
+            self.waiting = Some(project);
+            self.flush();
         }
     }
 
@@ -332,7 +356,11 @@ impl Engine {
             let project = self.waiting.take().expect("checked above");
             // The compiler assumes each graph replaces the one built before it, so a graph is
             // only built when it can be sent.
-            let graph = Box::new(self.compiler.build(&project, None));
+            let graph = match &mut self.plugins {
+                Some(plugins) => self.compiler.build_with(&project, None, plugins.as_mut()),
+                None => self.compiler.build_with(&project, None, &mut NoPlugins),
+            };
+            let graph = Box::new(graph);
             match self.commands.push(Command::SetGraph(graph)) {
                 Ok(()) => {
                     self.graphs_in_flight += 1;

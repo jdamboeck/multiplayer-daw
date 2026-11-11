@@ -663,3 +663,70 @@ fn what_is_played_while_recording_becomes_a_clip_when_playback_stops() {
     undo(&mut h);
     assert!(clips(&h).is_empty(), "the take is one undo step");
 }
+
+#[test]
+fn a_plugin_is_added_from_the_device_tab_and_its_settings_shown() {
+    let mut session = Session::starter(Engine::manual(48_000, false));
+    session.enable_plugins(mdaw_plugin::Host::test_synth_only());
+    let app = DawApp::new(session);
+    let mut h = Harness::builder()
+        .with_size(vec2(1280.0, 800.0))
+        .with_step_dt(1.0 / 60.0)
+        .with_context_setup(DawApp::setup)
+        .build_ui_state(|ui, app: &mut DawApp| app.ui(ui), app);
+    h.run_steps(3);
+    let id = track(&h);
+
+    h.get_by_label("Device").click();
+    h.run_steps(2);
+    let add = h.get_by_label("Instrument…").rect().center();
+    click(&mut h, add);
+    let synth = h.get_by_label_contains("mdaw Test Synth").rect().center();
+    click(&mut h, synth);
+    h.run_steps(4);
+    let devices = |h: &App| {
+        h.state()
+            .session
+            .project()
+            .track(id)
+            .unwrap()
+            .content
+            .devices
+            .clone()
+    };
+    assert_eq!(devices(&h).len(), 1, "one instrument: the synth replaced Pocket");
+    assert!(
+        matches!(&devices(&h)[0].kind, mdaw_model::DeviceKind::Plugin { id, .. } if id == mdaw_plugin::TEST_SYNTH),
+        "a plugin device"
+    );
+    // Without a server there is nobody to check out from: the plugin is simply there, and runs.
+    assert!(
+        h.query_all_by_label_contains("Balance").count() > 0,
+        "its settings are shown"
+    );
+    assert!(
+        h.query_by_label("Open window").is_none(),
+        "the test synth has no window of its own"
+    );
+    // It is a device like the others: undo takes it away again, and Pocket is back.
+    undo(&mut h);
+    assert_eq!(h.query_all_by_label_contains("Balance").count(), 0);
+    assert!(matches!(
+        devices(&h)[0].kind,
+        mdaw_model::DeviceKind::Builtin { .. }
+    ));
+
+    // Pocket can be picked again from the same menu.
+    for choice in ["mdaw Test Synth", "Pocket (built in)"] {
+        let add = h.get_by_label("Instrument…").rect().center();
+        click(&mut h, add);
+        let item = h.get_by_label_contains(choice).rect().center();
+        click(&mut h, item);
+        h.run_steps(4);
+    }
+    assert_eq!(devices(&h).len(), 1);
+    assert!(matches!(
+        devices(&h)[0].kind,
+        mdaw_model::DeviceKind::Builtin { .. }
+    ));
+}

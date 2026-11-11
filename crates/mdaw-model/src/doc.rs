@@ -159,10 +159,12 @@ impl TrackContent {
         self.devices.iter().find(|d| d.id == id)
     }
 
-    pub fn has_clap_device(&self) -> bool {
+    /// Whether a device of the track is a plugin: then only a checkout edits it, and its
+    /// commits carry a stem.
+    pub fn has_plugin(&self) -> bool {
         self.devices
             .iter()
-            .any(|d| matches!(d.kind, DeviceKind::Clap { .. }))
+            .any(|d| matches!(d.kind, DeviceKind::Plugin { .. }))
     }
 
     /// From the start of the first clip to the end of the last.
@@ -219,11 +221,30 @@ impl Device {
 pub enum DeviceKind {
     /// Deterministic built-in: only params are synced and every client renders it.
     Builtin { kind: BuiltinKind, dsp_version: u16 },
-    /// Local plugin: opaque state blob, heard by others through the track's stem.
-    Clap {
-        plugin_id: String,
+    /// A plugin installed on the client's machine: its state is an opaque blob, and others who
+    /// lack the plugin hear the track through its stem.
+    Plugin {
+        format: PluginFormat,
+        /// The plugin's own identifier within its format, compared as an opaque string.
+        id: String,
         state: Option<BlobHash>,
     },
+}
+
+/// The plugin standards a device can come from. Only CLAP is hosted so far; another format
+/// is a new variant here and a new backend in `mdaw-plugin`, and nothing else in the document
+/// changes.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
+pub enum PluginFormat {
+    Clap,
+}
+
+impl PluginFormat {
+    pub fn name(self) -> &'static str {
+        match self {
+            PluginFormat::Clap => "CLAP",
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]

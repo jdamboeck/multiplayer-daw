@@ -42,7 +42,8 @@ Cargo workspace, edition 2024, working name `mdaw`.
 | `mdaw-proto` | Wire messages, events, framing codec. | `postcard`, `blake3` |
 | `mdaw-sync` | Client replica state machine (confirmed + pending = view), checkout workspace, undo. Pure: messages in, messages out. | model, proto |
 | `mdaw-dsp` | Built-in synth "Pocket", tempo-map compiler, graph `process`, offline render. No device I/O. | `libm` |
-| `mdaw-engine` | cpal stream, RT thread, transport, CLAP hosting, stem playback, preview bus, FLAC encode/decode. | `cpal`, `rtrb`, `clack-*`, `flacenc`, `claxon`, `rubato`, `midir` |
+| `mdaw-engine` | cpal stream, RT thread, transport, preview bus, FLAC encode/decode, MIDI input. | `cpal`, `rtrb`, `flacenc`, `claxon`, `midir` |
+| `mdaw-plugin` | Plugin hosting behind a format-neutral interface (`Backend`, `Instance`, `mdaw_dsp::ExternalDevice`); CLAP is the first backend. | `clack-*`, `x11rb`, `windows-sys` |
 | `mdaw-net` | quinn setup, cert pinning, frame streams, blob transfer, clock sync. | `quinn`, `rustls`, `rcgen`, `tokio` |
 | `mdaw-server` | Binary: project actor, sequencing, persistence, blob store, leases, MIDI relay. | `rusqlite`, net, proto, model |
 | `mdaw-client` | Binary `mdaw`: egui app, controller, glue. Also exposes a headless client for tests. | `eframe`, sync, engine, net |
@@ -202,12 +203,12 @@ Each milestone ends with a demo and its tests green on Linux; CI also builds and
 
 ### M6: CLAP devices and stems
 
-- Productionise the S1 host inside `mdaw-engine`: plugin scan and cache, instance lifecycle, params and state, GUI window, offline instance for rendering.
-- `Device::Clap` with the state blob uploaded on commit; the checkout-only rule and stem requirement enforced on the server.
-- Stem bounce on commit (full track, pre-fader, 24-bit FLAC, peak-scaled to -1 dBFS at most with the factor stored as `stem.gain`, rendered in a fresh offline instance), download and cached decode on other clients, resample with `rubato` when device rates differ, stale badge when `tempo_hash` differs.
+- Productionise the S1 host in its own crate, `mdaw-plugin`, behind a format-neutral interface so that VST3 can be added as a second backend: plugin scan, instance lifecycle, params and state, GUI window, offline instance for rendering. The audio graph sees plugins only as `ExternalDevice`.
+- `DeviceKind::Plugin { format, id, state }` with the state blob uploaded on commit; the checkout-only rule and stem requirement enforced on the server.
+- Stem bounce on commit (full track, pre-fader, 24-bit FLAC, peak-scaled to -1 dBFS at most with the factor stored as `stem.gain`, rendered in a fresh offline instance), download and cached decode on other clients, resampling (linear for now) when device rates differ, stale badge when `tempo_hash` differs.
 - Clients that have the same plugin render it live from the state blob; others play the stem.
 - `mdaw-test-plugin` drives headless host tests in CI.
-- **Demo:** A adds Vital to a track through checkout and commits. B, started with CLAP scanning disabled (`--no-clap`), hears the stem; started normally, B renders Vital itself.
+- **Demo:** A adds Vital to a track through checkout and commits. B, started with plugins disabled (`--no-plugins`, also `--no-clap`), hears the stem; started normally, B renders Vital itself.
 
 ## Verification
 

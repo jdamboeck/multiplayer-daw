@@ -4,8 +4,8 @@
 use mdaw_client::{Session, Status, Who};
 use mdaw_engine::Engine;
 use mdaw_model::{
-    Clip, ClipId, ClipProp, Device, DeviceKind, EntityRef, MixProp, Note, NoteId, NoteProp, Op, Project,
-    Tick, TrackContent, TrackId, TrackShell,
+    Clip, ClipId, ClipProp, EntityRef, MixProp, Note, NoteId, NoteProp, Op, Project, Tick, TrackContent,
+    TrackId, TrackShell,
 };
 use mdaw_server::{Config, Server};
 use std::net::SocketAddr;
@@ -242,16 +242,15 @@ fn a_refused_edit_is_taken_back_with_a_notice() {
     let server = serve(dir.path(), "127.0.0.1:0");
     let (mut ann, mut ben) = (join(&server, "ann"), join(&server, "ben"));
     let at = add_track(&mut ann, "Lead");
+    let bass = add_track(&mut ann, "Bass");
     settle(&mut [&mut ann, &mut ben]);
 
-    // Plugins enter a project only through a commit, which this is not.
-    let device = Device::new(
-        ann.ids().device(),
-        DeviceKind::Clap {
-            plugin_id: "org.example.synth".into(),
-            state: None,
-        },
-    );
+    // Ben takes the bass out of live editing. Ann has not heard of that yet when she edits it,
+    // together with the lead: the server turns down the whole edit.
+    ben.check_out(bass.0);
+    until(&mut [&mut ben], "ben's checkout is in the log", |s| {
+        s[0].workspace(bass.0).is_some()
+    });
     let (track, clip, id) = at;
     assert!(ann.edit(vec![
         Op::NoteSet {
@@ -260,10 +259,11 @@ fn a_refused_edit_is_taken_back_with_a_notice() {
             id,
             prop: NoteProp::Pitch(90)
         },
-        Op::DeviceAdd {
-            track,
-            device,
-            after: None
+        Op::NoteSet {
+            track: bass.0,
+            clip: bass.1,
+            id: bass.2,
+            prop: NoteProp::Pitch(90)
         },
     ]));
     assert_eq!(pitch(ann.project(), at), Some(90));
@@ -281,7 +281,7 @@ fn a_refused_edit_is_taken_back_with_a_notice() {
         Some(60),
         "nothing of the refused edit stays"
     );
-    assert!(ann.project().track(track).unwrap().content.devices.is_empty());
+    assert_eq!(pitch(ann.project(), bass), Some(60));
     assert_eq!(
         ben.project().track(track).unwrap().content.clips[&clip].notes[&id].vel,
         33

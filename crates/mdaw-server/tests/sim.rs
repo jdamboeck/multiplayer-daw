@@ -396,8 +396,9 @@ fn edit(view: &Project, ids: &mut IdGen, kind: u8, a: usize, b: u8) -> Vec<Op> {
         _ => {
             let device = Device::new(
                 ids.device(),
-                DeviceKind::Clap {
-                    plugin_id: "com.example".into(),
+                DeviceKind::Plugin {
+                    format: PluginFormat::Clap,
+                    id: "com.example".into(),
                     state: None,
                 },
             );

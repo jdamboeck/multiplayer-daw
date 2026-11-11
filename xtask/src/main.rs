@@ -19,6 +19,8 @@ Options:
   --fresh           Forget the demo project and all profiles first (demo, server).
   --listen <addr>   Where the server listens (default: 127.0.0.1:7464).
   --release         Use optimised builds.
+  --no-plugins      Clients load no plugins and play tracks with plugins from their stems.
+  --test-synth      Clients also offer the built-in test synth.
 
 The pieces can be mixed: `cargo xtask server` in one terminal and `cargo xtask client Ann` in
 others gives the same setup as `demo`, with a server that can be stopped and started alone.
@@ -31,6 +33,10 @@ struct Options {
     fresh: bool,
     release: bool,
     listen: String,
+    /// Clients load no plugins.
+    no_plugins: bool,
+    /// Clients offer the test synth.
+    test_synth: bool,
 }
 
 fn main() -> ExitCode {
@@ -41,11 +47,15 @@ fn main() -> ExitCode {
         fresh: false,
         release: false,
         listen: "127.0.0.1:7464".into(),
+        no_plugins: false,
+        test_synth: false,
     };
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--fresh" => options.fresh = true,
             "--release" => options.release = true,
+            "--no-plugins" | "--no-clap" => options.no_plugins = true,
+            "--test-synth" => options.test_synth = true,
             "--listen" => match args.next() {
                 Some(addr) => options.listen = addr,
                 None => return fail("--listen needs an address"),
@@ -87,7 +97,7 @@ fn demo(mut options: Options) -> Result<()> {
     let clients: Result<Vec<Child>> = options
         .names
         .iter()
-        .map(|name| start_client(name, &join, options.release))
+        .map(|name| start_client(name, &join, &options))
         .collect();
     let outcome = clients.and_then(|clients| {
         let mut failed = 0;
@@ -134,7 +144,7 @@ fn client(options: Options) -> Result<()> {
     let join = std::fs::read_to_string(&path)
         .map_err(|_| format!("no {}; start `cargo xtask server` first", path.display()))?;
     build(options.release)?;
-    let status = start_client(name, join.trim(), options.release)?
+    let status = start_client(name, join.trim(), &options)?
         .wait()
         .map_err(|err| format!("waiting for the client: {err}"))?;
     if status.success() {
@@ -172,9 +182,15 @@ fn binary(name: &str, release: bool) -> PathBuf {
 fn build(release: bool) -> Result<()> {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let mut command = Command::new(cargo);
-    command
-        .current_dir(root())
-        .args(["build", "-p", "mdaw-server", "-p", "mdaw-client"]);
+    command.current_dir(root()).args([
+        "build",
+        "-p",
+        "mdaw-server",
+        "-p",
+        "mdaw-client",
+        "-p",
+        "mdaw-plugin",
+    ]);
     // Cargo describes xtask itself to this process. Passed on, that description makes build
     // scripts that watch it (ring's does) rebuild on every switch between xtask and plain cargo.
     for (name, _) in std::env::vars_os() {
@@ -232,11 +248,19 @@ fn start_server(options: &Options) -> Result<(Child, String)> {
     Ok((server, join))
 }
 
-fn start_client(name: &str, join: &str, release: bool) -> Result<Child> {
+fn start_client(name: &str, join: &str, options: &Options) -> Result<Child> {
     let profile = demo_dir().join("profiles").join(name.to_lowercase());
-    Command::new(binary("mdaw", release))
+    let mut command = Command::new(binary("mdaw", options.release));
+    command
         .args(["--join", join, "--name", name, "--profile"])
-        .arg(profile)
+        .arg(profile);
+    if options.no_plugins {
+        command.arg("--no-plugins");
+    }
+    if options.test_synth {
+        command.arg("--test-synth");
+    }
+    command
         .spawn()
         .map_err(|err| format!("could not start a client: {err}"))
 }

@@ -5,7 +5,7 @@ use egui::{
     vec2,
 };
 use mdaw_dsp::pocket::{self, ParamInfo, Scale};
-use mdaw_model::{BuiltinKind, Device, DeviceKind, Op, TrackId};
+use mdaw_model::{BuiltinKind, Device, DeviceKind, Op, PluginFormat, TrackId};
 
 use crate::{DawApp, theme};
 
@@ -40,18 +40,195 @@ pub fn show(app: &mut DawApp, ui: &mut Ui) {
     };
     egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
         ui.add_space(4.0);
+        add_plugin(app, ui, track_id);
+        ui.separator();
         for device in &track.content.devices {
             ui.push_id(device.id.0.0, |ui| match &device.kind {
                 DeviceKind::Builtin {
                     kind: BuiltinKind::Pocket,
                     ..
                 } => pocket_panel(app, ui, track_id, device),
-                DeviceKind::Clap { plugin_id, .. } => {
-                    ui.label(format!("CLAP plugin {plugin_id}"));
-                }
+                DeviceKind::Plugin { format, id, .. } => plugin_panel(app, ui, track_id, device, *format, id),
             });
+            ui.separator();
         }
     });
+}
+
+/// Parameters shown in the panel; the plugin's own window has them all.
+const SHOWN_PARAMS: usize = 48;
+
+fn plugin_panel(
+    app: &mut DawApp,
+    ui: &mut Ui,
+    track: TrackId,
+    device: &Device,
+    format: PluginFormat,
+    id: &str,
+) {
+    let mine =
+        app.session.checkout_owner(track) == Some(app.session.user()) || app.session.linked().is_none();
+    let name = app
+        .session
+        .plugin_name(format, id)
+        .unwrap_or_else(|| id.to_string());
+    let running = app.session.plugin_running(track, device.id);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(&name).strong().size(15.0));
+        ui.label(RichText::new(format.name()).small().color(theme::TEXT_DIM));
+        if running && app.session.plugin_has_editor(track, device.id) {
+            let open = app.session.plugin_editor_open(track, device.id);
+            let label = if open { "Close window" } else { "Open window" };
+            if ui
+                .button(label)
+                .on_hover_text("The plugin's own window, with all of its controls")
+                .clicked()
+            {
+                app.session.toggle_plugin_editor(track, device.id);
+            }
+        }
+        let mut on = !device.bypass;
+        if ui.add_enabled(mine, egui::Checkbox::new(&mut on, "On")).changed() {
+            app.session.edit(vec![Op::DeviceSetBypass {
+                track,
+                id: device.id,
+                bypass: !on,
+            }]);
+        }
+        if ui
+            .add_enabled(mine, egui::Button::new("Remove"))
+            .on_hover_text("Take the plugin off the track")
+            .clicked()
+        {
+            app.session.edit(vec![Op::DeviceRemove { track, id: device.id }]);
+        }
+    });
+    if app.session.plugin_crashed(track, device.id) {
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!(
+                    "{name} crashed. The rest of mdaw goes on; the track plays its stem, if it has one."
+                ))
+                .color(theme::METER_HOT),
+            );
+            if ui
+                .button("Restart")
+                .on_hover_text("Start the plugin again, with the settings it had shortly before")
+                .clicked()
+            {
+                app.session.restart_plugin(track, device.id);
+            }
+        });
+        return;
+    }
+    if !running {
+        let why = if app.session.plugin_name(format, id).is_none() {
+            format!("{name} is not installed here. The track plays its stem: the sound of its last commit.")
+        } else {
+            "Starting the plugin…".to_string()
+        };
+        ui.label(RichText::new(why).color(theme::TEXT_DIM));
+        return;
+    }
+    if !mine {
+        ui.label(
+            RichText::new("Check out the track to change the plugin's settings.").color(theme::TEXT_DIM),
+        );
+    }
+    let (params, count) = app
+        .session
+        .plugin_params(track, device.id, SHOWN_PARAMS)
+        .unwrap_or_default();
+    egui::Grid::new(("params", device.id.0.0))
+        .num_columns(4)
+        .spacing(vec2(12.0, 4.0))
+        .show(ui, |ui| {
+            for (index, param) in params.iter().enumerate() {
+                let mut value = param.value;
+                let slider = egui::Slider::new(&mut value, param.min..=param.max)
+                    .show_value(true)
+                    .step_by(if param.stepped { 1.0 } else { 0.0 })
+                    .text(&param.name);
+                if ui.add_enabled(mine, slider).changed() {
+                    app.session.set_plugin_param(track, device.id, param.id, value);
+                }
+                if index % 2 == 1 {
+                    ui.end_row();
+                }
+            }
+        });
+    if count > params.len() {
+        let more = format!("And {} more in the plugin's window.", count - params.len());
+        ui.label(RichText::new(more).color(theme::TEXT_DIM));
+    }
+}
+
+/// The track's instrument, and effects to add after it.
+fn add_plugin(app: &mut DawApp, ui: &mut Ui, track: TrackId) {
+    if !app.session.plugins_enabled() {
+        ui.label(RichText::new("Plugins are switched off in this window.").color(theme::TEXT_DIM));
+        return;
+    }
+    let mine =
+        app.session.checkout_owner(track) == Some(app.session.user()) || app.session.linked().is_none();
+    let catalog = app.session.plugin_catalog();
+    let label = |plugin: &mdaw_plugin::PluginInfo| {
+        if plugin.vendor.is_empty() {
+            format!("{} ({})", plugin.name, plugin.format.name())
+        } else {
+            format!("{} - {} ({})", plugin.name, plugin.vendor, plugin.format.name())
+        }
+    };
+    let (instruments, effects): (Vec<_>, Vec<_>) = catalog.iter().partition(|p| p.instrument);
+    enum Pick {
+        Pocket,
+        Plugin(mdaw_plugin::PluginInfo),
+    }
+    let mut pick = None;
+    ui.horizontal(|ui| {
+        ui.add_enabled_ui(mine, |ui| {
+            ui.menu_button("Instrument…", |ui| {
+                ui.label(RichText::new("A track has one instrument; this one takes its place.").small());
+                if ui.button("Pocket (built in)").clicked() {
+                    pick = Some(Pick::Pocket);
+                    ui.close();
+                }
+                for plugin in &instruments {
+                    if ui.button(label(plugin)).on_hover_text(&plugin.location).clicked() {
+                        pick = Some(Pick::Plugin((*plugin).clone()));
+                        ui.close();
+                    }
+                }
+            });
+            if !effects.is_empty() {
+                ui.menu_button("Add effect…", |ui| {
+                    for plugin in &effects {
+                        if ui.button(label(plugin)).on_hover_text(&plugin.location).clicked() {
+                            pick = Some(Pick::Plugin((*plugin).clone()));
+                            ui.close();
+                        }
+                    }
+                });
+            }
+        });
+        if !mine {
+            // Said out loud: a greyed-out button does not tell why.
+            let why = match app.session.checkout_owner(track) {
+                Some(_) => "The track is checked out by someone else.",
+                None => "Plugins go onto a track while you have it checked out: click \"Check out\" first.",
+            };
+            ui.label(RichText::new(why).color(theme::TEXT_DIM));
+        }
+    });
+    match pick {
+        Some(Pick::Pocket) => {
+            app.session.use_pocket(track);
+        }
+        Some(Pick::Plugin(plugin)) => {
+            app.session.add_plugin(track, &plugin);
+        }
+        None => {}
+    }
 }
 
 fn pocket_panel(app: &mut DawApp, ui: &mut Ui, track: TrackId, device: &Device) {

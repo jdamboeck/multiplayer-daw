@@ -8,6 +8,7 @@ mod app;
 pub mod checkout;
 mod link;
 pub mod live;
+pub mod plugins;
 pub mod profile;
 mod record;
 mod session;

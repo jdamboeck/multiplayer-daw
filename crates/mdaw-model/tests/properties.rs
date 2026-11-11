@@ -68,8 +68,9 @@ fn device() -> impl Strategy<Value = Device> {
             kind: BuiltinKind::Pocket,
             dsp_version: 1
         }),
-        prop::option::of(any::<[u8; 32]>().prop_map(BlobHash)).prop_map(|state| DeviceKind::Clap {
-            plugin_id: "test.plugin".into(),
+        prop::option::of(any::<[u8; 32]>().prop_map(BlobHash)).prop_map(|state| DeviceKind::Plugin {
+            format: PluginFormat::Clap,
+            id: "test.plugin".into(),
             state
         }),
     ];
@@ -259,7 +260,7 @@ proptest! {
             Scope::Project => {}
             Scope::TrackStructure(t) | Scope::TrackContent(t) => prop_assert_eq!(entity.track(), Some(t)),
         }
-        let _ = (op.prop(), op.is_removal(), op.adds_clap_device(), op.blobs());
+        let _ = (op.prop(), op.is_removal(), op.adds_plugin(), op.blobs());
     }
 
     /// The diff reports exactly the tracks whose content changed.

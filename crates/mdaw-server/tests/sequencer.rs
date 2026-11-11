@@ -73,8 +73,9 @@ fn vel(vel: u8) -> Op {
 fn clap_device() -> Device {
     Device::new(
         DeviceId(EntityId(9)),
-        DeviceKind::Clap {
-            plugin_id: "com.example.synth".into(),
+        DeviceKind::Plugin {
+            format: PluginFormat::Clap,
+            id: "com.example.synth".into(),
             state: None,
         },
     )
@@ -167,7 +168,7 @@ fn a_refused_transaction_changes_nothing() {
                 }]
             )
         ),
-        Err(RejectReason::ClapOutsideCommit)
+        Err(RejectReason::PluginOutsideCommit)
     );
 }
 
@@ -222,7 +223,7 @@ fn a_track_with_a_clap_device_takes_no_live_content_edits() {
     let seq = Sequencer::new(doc, 0, vec![]);
     assert_eq!(
         seq.check(ANN.1, &txn(1, 0, vec![pitch(61)])),
-        Err(RejectReason::ClapTrack { track: TRACK })
+        Err(RejectReason::PluginTrack { track: TRACK })
     );
     assert_eq!(
         seq.check(ANN.1, &txn(1, 0, vec![Op::TrackRemove { id: TRACK }])),

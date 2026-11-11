@@ -176,7 +176,9 @@ impl RtCore {
                     let tick = self.graph.tick_at(self.pos);
                     self.pos = graph.sample_at(tick);
                 }
-                let old = std::mem::replace(&mut self.graph, graph);
+                let mut old = std::mem::replace(&mut self.graph, graph);
+                // Plugins that did not move to the new graph stop here, on the audio thread.
+                old.retire();
                 self.update_loop();
                 if let Err(rtrb::PushError::Full(old)) = self.garbage.push(old) {
                     // Freeing here would allocate-lock the audio thread. The control side

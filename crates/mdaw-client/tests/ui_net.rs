@@ -6,7 +6,7 @@ use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 use mdaw_client::{DawApp, Session, Status, Who};
 use mdaw_engine::Engine;
-use mdaw_model::{ClipId, Device, DeviceKind, EntityRef, Note, NoteProp, Op, Tick, TrackId};
+use mdaw_model::{ClipId, ClipProp, Device, DeviceKind, EntityRef, Note, NoteProp, Op, Tick, TrackId};
 use mdaw_server::{Config, Server};
 use std::path::Path;
 use std::sync::Arc;
@@ -312,21 +312,21 @@ fn a_lost_edit_is_listed_and_comes_back_with_one_click() {
 fn a_refused_edit_shows_a_notice_that_can_be_dismissed() {
     let dir = tempfile::tempdir().unwrap();
     let server = serve(dir.path(), "127.0.0.1:0");
-    let (mut ann, mut ben, track, _) = with_a_clip(&server);
+    let (mut ann, mut ben, track, clip) = with_a_clip(&server);
 
-    // Plugins enter a project only through a commit, which this is not.
-    let id = ann.state_mut().session.ids().device();
-    let device = Device::new(
-        id,
-        DeviceKind::Clap {
-            plugin_id: "org.example.synth".into(),
-            state: None,
-        },
-    );
-    assert!(ann.state_mut().session.edit(vec![Op::DeviceAdd {
+    // Ben takes the track out of live editing. Ann has not heard of that yet when she moves
+    // the clip: the server turns her edit down.
+    ben.state_mut().session.check_out(track);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while ben.state().session.workspace(track).is_none() {
+        ben.step();
+        assert!(Instant::now() < deadline, "the checkout never landed");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(ann.state_mut().session.edit(vec![Op::ClipSet {
         track,
-        device,
-        after: None
+        id: clip,
+        prop: ClipProp::Start(Tick::bars(1)),
     }]));
     settle(&mut ann, &mut ben);
     assert!(shows(&ann, "An edit was not accepted"));
@@ -717,8 +717,9 @@ fn screenshots() {
     let id = ben.state_mut().session.ids().device();
     let device = Device::new(
         id,
-        DeviceKind::Clap {
-            plugin_id: "org.example.synth".into(),
+        DeviceKind::Plugin {
+            format: mdaw_model::PluginFormat::Clap,
+            id: "org.example.synth".into(),
             state: None,
         },
     );
@@ -785,4 +786,37 @@ fn screenshots() {
         .expect("render")
         .save(format!("{shots}/changelog-ann.png"))
         .expect("save");
+}
+
+#[test]
+fn a_plugin_is_added_in_the_device_tab_once_the_track_is_checked_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = serve(dir.path(), "127.0.0.1:0");
+    let (mut ann, mut ben, track, _) = with_a_clip(&server);
+    ann.state_mut()
+        .session
+        .enable_plugins(mdaw_plugin::Host::test_synth_only());
+    ann.state_mut().sel.track = Some(track);
+    ann.get_by_label("Device").click();
+    ann.run_steps(3);
+
+    // Live, the button is off, and the window says why.
+    ann.get_by_label_contains("click \"Check out\" first");
+    let has_plugin = |app: &DawApp| app.session.project().track(track).unwrap().content.has_plugin();
+
+    ann.get_by_label("Check out").click();
+    until(&mut ann, &mut ben, "the checkout lands", |a, _| {
+        a.session.workspace(track).is_some()
+    });
+    assert!(ann.query_by_label_contains("click \"Check out\" first").is_none());
+    let add = ann.get_by_label("Instrument…").rect().center();
+    press(&mut ann, add);
+    ann.drop_at(add);
+    ann.run_steps(2);
+    let synth = ann.get_by_label_contains("mdaw Test Synth").rect().center();
+    press(&mut ann, synth);
+    ann.drop_at(synth);
+    ann.run_steps(4);
+    assert!(has_plugin(ann.state()), "the plugin is on ann's track");
+    assert!(!has_plugin(ben.state()), "and in her checkout only");
 }

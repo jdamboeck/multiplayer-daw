@@ -1,12 +1,14 @@
 //! One editing session: the replica, the thing that orders its edits, and the audio engine.
 
+use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
-use mdaw_dsp::pocket;
+use mdaw_dsp::{OfflineRender, pocket};
 use mdaw_engine::{Engine, clock, flac};
 use mdaw_model::{
     ActorId, BlobHash, BuiltinKind, Device, DeviceKind, EntityRef, IdGen, Op, Project, Scope, TempoMap,
@@ -23,6 +25,7 @@ use mdaw_sync::{Ended, Gesture, Loopback, Replica, Workspace};
 use crate::checkout::{self, CommitPlan, Files, Fork, Rendered};
 use crate::link::{Link, LinkEvent, Waker, Who};
 use crate::live::Live;
+use crate::plugins::{self, Plugins, TrackSound, Want};
 use crate::record::{Take, take_ops};
 use crate::theme;
 
@@ -47,6 +50,15 @@ const JOURNAL_EVERY: Duration = Duration::from_millis(500);
 /// Longest sample played from the changelog, in seconds. Samples rendered here are at most 8 bars
 /// and a second.
 const SAMPLE_MAX_SECS: u32 = 300;
+/// The longest stem accepted from others. Decoded, a second takes about 400 KB.
+const STEM_MAX_SECS: u32 = 900;
+/// How often the main loop runs at least while a plugin's own window is open: plugins draw from
+/// their timers, which run only then.
+const PLUGIN_WINDOW_PACE: Duration = Duration::from_millis(10);
+/// How often it runs at least while plugins run without a window, for the callbacks they ask for.
+const PLUGIN_PACE: Duration = Duration::from_millis(50);
+/// How long the bounce of a stem may hold up one frame of the UI.
+const BOUNCE_SLICE: Duration = Duration::from_millis(12);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Status {
@@ -129,6 +141,12 @@ struct Commit {
 /// Results of work done on other threads.
 enum Job {
     Plan(CommitPlan),
+    /// A downloaded stem, decoded at the engine's rate with its gain applied; `None` if it was
+    /// not one.
+    Stem {
+        hash: BlobHash,
+        audio: Option<Arc<[f32]>>,
+    },
     Before {
         entry_seq: u64,
         rendered: Rendered,
@@ -204,6 +222,22 @@ pub struct Session {
     recording: bool,
     /// The notes of the current run of the transport, while recording.
     take: Take,
+    plugins: plugins::Shared,
+    /// A stem being rendered for the commit, a slice per frame.
+    bounce: Option<Bounce>,
+}
+
+/// The offline render of a track with plugins, for its commit.
+struct Bounce {
+    track: TrackId,
+    render: OfflineRender,
+    /// The fresh plugin instances it renders with.
+    instances: Vec<Box<dyn mdaw_plugin::Instance>>,
+    confirmed: Project,
+    workspace: Workspace,
+    tempo_hash: u64,
+    /// The track has notes: a stem of it that is all silence is a broken render.
+    has_notes: bool,
 }
 
 enum Backend {
@@ -349,8 +383,10 @@ impl Session {
         Ok(session)
     }
 
-    fn new(replica: Replica, backend: Backend, user: UserId, engine: Engine) -> Self {
+    fn new(replica: Replica, backend: Backend, user: UserId, mut engine: Engine) -> Self {
         let live = Live::new(engine.live_input());
+        let plugins = plugins::Shared(Rc::new(RefCell::new(Plugins::new(engine.sample_rate()))));
+        engine.set_plugins(Box::new(plugins.clone()));
         let mut session = Self {
             replica,
             backend,
@@ -382,6 +418,8 @@ impl Session {
             live,
             recording: false,
             take: Take::default(),
+            plugins,
+            bounce: None,
         };
         session.replica.set_user(user);
         session.tempo = session.replica.view().tempo_map();
@@ -456,6 +494,26 @@ impl Session {
                 Scope::Project => continue,
                 Scope::TrackContent(track) | Scope::TrackStructure(track) => track,
             };
+            // With a server, plugins live in checkouts: everyone else hears a stem of them.
+            if let Backend::Remote(_) = &self.backend {
+                let mine = self.checkout_owner(track) == Some(self.user);
+                if op.adds_plugin() && !mine {
+                    notice(&mut self.notices, "Check out the track to add a plugin to it.");
+                    return false;
+                }
+                let has_plugin = self
+                    .replica
+                    .view()
+                    .track(track)
+                    .is_some_and(|t| t.content.has_plugin());
+                if matches!(op.scope(), Scope::TrackContent(_)) && has_plugin && !mine {
+                    notice(
+                        &mut self.notices,
+                        "A track with plugins is changed through a checkout: check it out first.",
+                    );
+                    return false;
+                }
+            }
             if let Some(why) = self.locked(track) {
                 notice(&mut self.notices, &format!("This track is {why}."));
                 return false;
@@ -514,8 +572,344 @@ impl Session {
         self.engine.set_project(self.replica.view());
         self.sync_transport();
         self.engine.tick();
+        self.keep_plugins();
         self.listen();
         self.record();
+    }
+
+    /// Hosts plugins from now on: tracks with plugins installed here are heard live, the others
+    /// from their stems. Without this, every track with plugins plays its stem.
+    pub fn enable_plugins(&mut self, host: mdaw_plugin::Host) {
+        self.plugins.0.borrow_mut().set_host(Some(host));
+        self.engine.refresh();
+    }
+
+    pub fn plugins_enabled(&self) -> bool {
+        self.plugins.0.borrow().has_host()
+    }
+
+    /// The plugins installed here.
+    pub fn plugin_catalog(&self) -> Vec<mdaw_plugin::PluginInfo> {
+        self.plugins.0.borrow().catalog().to_vec()
+    }
+
+    /// The name of a plugin if it is installed here.
+    pub fn plugin_name(&self, format: mdaw_model::PluginFormat, id: &str) -> Option<String> {
+        Some(self.plugins.0.borrow().installed(format, id)?.name.clone())
+    }
+
+    /// How a track is heard here: from its devices, its plugins, or its stem.
+    pub fn track_sound(&self, track: TrackId) -> TrackSound {
+        self.plugins.0.borrow().sound(self.replica.view(), track)
+    }
+
+    /// Whether a device makes its track's sound, as opposed to changing it. A plugin that is not
+    /// installed here counts as one.
+    fn is_instrument(&self, device: &mdaw_model::Device) -> bool {
+        match &device.kind {
+            DeviceKind::Builtin { .. } => true,
+            DeviceKind::Plugin { format, id, .. } => self
+                .plugins
+                .0
+                .borrow()
+                .installed(*format, id)
+                .is_none_or(|p| p.instrument),
+        }
+    }
+
+    /// The ops that make `device` the track's only instrument: the others go, it comes first.
+    fn replace_instrument(&mut self, track: TrackId, device: mdaw_model::Device) -> Vec<Op> {
+        let Some(content) = self.replica.view().track(track).map(|t| t.content.clone()) else {
+            return Vec::new();
+        };
+        let mut ops: Vec<Op> = content
+            .devices
+            .iter()
+            .filter(|d| self.is_instrument(d))
+            .map(|d| Op::DeviceRemove { track, id: d.id })
+            .collect();
+        ops.push(Op::DeviceAdd {
+            track,
+            device,
+            after: None,
+        });
+        ops
+    }
+
+    /// Puts a plugin on a track: an instrument in place of the track's instrument, an effect at
+    /// the end. Plugins go onto a track only while this user has it checked out.
+    pub fn add_plugin(&mut self, track: TrackId, plugin: &mdaw_plugin::PluginInfo) -> bool {
+        let device = mdaw_model::Device::new(
+            self.replica.ids().device(),
+            DeviceKind::Plugin {
+                format: plugin.format,
+                id: plugin.id.clone(),
+                state: None,
+            },
+        );
+        if plugin.instrument {
+            let ops = self.replace_instrument(track, device);
+            return self.edit(ops);
+        }
+        let after = self
+            .replica
+            .view()
+            .track(track)
+            .and_then(|t| t.content.devices.last().map(|d| d.id));
+        self.edit(vec![Op::DeviceAdd { track, device, after }])
+    }
+
+    /// Makes the built-in Pocket synth the track's instrument again.
+    pub fn use_pocket(&mut self, track: TrackId) -> bool {
+        let kind = DeviceKind::Builtin {
+            kind: BuiltinKind::Pocket,
+            dsp_version: pocket::DSP_VERSION,
+        };
+        let device = mdaw_model::Device::new(self.replica.ids().device(), kind);
+        let ops = self.replace_instrument(track, device);
+        self.edit(ops)
+    }
+
+    /// The first `limit` parameters of a plugin device running here, and how many it has.
+    pub fn plugin_params(
+        &mut self,
+        track: TrackId,
+        device: mdaw_model::DeviceId,
+        limit: usize,
+    ) -> Option<(Vec<mdaw_plugin::ParamInfo>, usize)> {
+        self.plugins.0.borrow_mut().params(track, device, limit)
+    }
+
+    /// Gives running plugins what they expect from the main loop: their timers, the callbacks
+    /// they asked for, their windows' events. Call as often as possible, also between frames
+    /// and while the window is hidden; [`Session::frame`] does it too.
+    pub fn pump_plugins(&mut self) {
+        let crashed = self.plugins.0.borrow_mut().idle();
+        for ((track, device), what) in crashed {
+            // Its processor is dead: the next graph does without it, and plays the stem.
+            self.engine.forget(track, device);
+            let text =
+                format!("{what} Its track plays its stem, if it has one; Restart is in the Device tab.");
+            notice(&mut self.notices, &text);
+        }
+        if self.plugins.0.borrow_mut().take_dirty() {
+            self.engine.refresh();
+        }
+    }
+
+    /// Whether a plugin device crashed and waits to be restarted.
+    pub fn plugin_crashed(&self, track: TrackId, device: mdaw_model::DeviceId) -> bool {
+        self.plugins.0.borrow().crashed(track, device)
+    }
+
+    /// Starts a crashed plugin again, with its last settings.
+    pub fn restart_plugin(&mut self, track: TrackId, device: mdaw_model::DeviceId) {
+        self.plugins.0.borrow_mut().restart(track, device);
+        self.engine.forget(track, device);
+        self.engine.refresh();
+    }
+
+    /// Sets a parameter of a plugin running here. Only the plugin's state changes; it reaches
+    /// the document with the commit.
+    pub fn set_plugin_param(&mut self, track: TrackId, device: mdaw_model::DeviceId, param: u32, value: f64) {
+        if self.locked(track).is_some() {
+            return;
+        }
+        if let Some(instance) = self.plugins.0.borrow_mut().instance(track, device) {
+            instance.set_param(param, value);
+        }
+    }
+
+    /// Opens or closes a plugin's own window.
+    pub fn toggle_plugin_editor(&mut self, track: TrackId, device: mdaw_model::DeviceId) {
+        let title = self
+            .replica
+            .view()
+            .track(track)
+            .map(|t| t.shell.name.clone())
+            .unwrap_or_default();
+        let mut plugins = self.plugins.0.borrow_mut();
+        let Some(instance) = plugins.instance(track, device) else {
+            return;
+        };
+        if instance.editor_open() {
+            instance.close_editor();
+        } else {
+            let title = format!("{} - {title}", instance.info().name);
+            if let Err(err) = instance.open_editor(&title) {
+                drop(plugins);
+                notice(
+                    &mut self.notices,
+                    &format!("The plugin's window did not open: {err}."),
+                );
+            }
+        }
+    }
+
+    pub fn plugin_editor_open(&self, track: TrackId, device: mdaw_model::DeviceId) -> bool {
+        self.plugins
+            .0
+            .borrow_mut()
+            .instance(track, device)
+            .is_some_and(|i| i.editor_open())
+    }
+
+    /// Whether a plugin running here has a window of its own.
+    pub fn plugin_has_editor(&self, track: TrackId, device: mdaw_model::DeviceId) -> bool {
+        self.plugins
+            .0
+            .borrow_mut()
+            .instance(track, device)
+            .is_some_and(|i| i.has_editor())
+    }
+
+    /// Whether a plugin device runs here.
+    pub fn plugin_running(&self, track: TrackId, device: mdaw_model::DeviceId) -> bool {
+        self.plugins.0.borrow_mut().instance(track, device).is_some()
+    }
+
+    /// Keeps the plugins in step with the document, fetches the state blobs and stems they need,
+    /// and renders a stem a slice at a time.
+    fn keep_plugins(&mut self) {
+        let renew = self.plugins.0.borrow_mut().follow(self.replica.view());
+        for &(track, device) in &renew {
+            self.engine.forget(track, device);
+        }
+        self.pump_plugins();
+        if let Backend::Remote(remote) = &self.backend
+            && remote.status == Status::Online
+        {
+            let wanted = self.plugins.0.borrow_mut().take_wanted(&self.fetching);
+            for (hash, _) in wanted {
+                self.fetching.insert(hash);
+                remote.link.get(hash);
+            }
+        }
+        if self.plugins.0.borrow_mut().take_dirty() || !renew.is_empty() {
+            self.engine.refresh();
+        }
+        self.step_bounce();
+    }
+
+    fn step_bounce(&mut self) {
+        let Some(bounce) = self.bounce.as_mut() else {
+            return;
+        };
+        let started = Instant::now();
+        let mut done = false;
+        while !done && started.elapsed() < BOUNCE_SLICE {
+            done = bounce.render.step(4096);
+        }
+        if !done {
+            if let Some(waker) = &self.waker {
+                waker();
+            }
+            return;
+        }
+        let bounce = self.bounce.take().expect("checked above");
+        let Bounce {
+            track,
+            render,
+            instances,
+            confirmed,
+            workspace,
+            tempo_hash,
+            has_notes,
+        } = bounce;
+        let audio: Arc<[f32]> = render.finish().into();
+        // The render's processors came back with the render; the instances can go, unless one
+        // crashed on the way, which would leave a hole in the stem.
+        let mut instances = instances;
+        for instance in &mut instances {
+            instance.idle();
+        }
+        let broken: Vec<String> = instances
+            .iter()
+            .filter(|i| i.crashed())
+            .map(|i| i.info().name.clone())
+            .collect();
+        drop(instances);
+        if !broken.is_empty() {
+            let text = format!(
+                "{} crashed while the commit was rendered. Nothing was committed; the track stays checked out.",
+                broken.join(", ")
+            );
+            notice(&mut self.notices, &text);
+            self.cancel_commit();
+            return;
+        }
+        if has_notes && audio.iter().all(|s| *s == 0.0) {
+            notice(
+                &mut self.notices,
+                "The track's notes rendered as silence, so its plugins did not play. Nothing was committed; the track stays checked out.",
+            );
+            self.cancel_commit();
+            return;
+        }
+        let rate = self.engine.sample_rate();
+        if self.commit.as_ref().is_some_and(|c| c.track == track) {
+            self.spawn(move || {
+                let stem = checkout::make_stem(&audio, tempo_hash, rate);
+                Job::Plan(checkout::plan_commit(&confirmed, &workspace, Some((stem, audio))))
+            });
+        }
+    }
+
+    /// Saves the states of the plugins on `track` that changed, into the checkout's journal,
+    /// and starts the bounce of its stem. False if the track cannot be committed from here.
+    fn start_bounce(&mut self, track: TrackId) -> bool {
+        let view = self.replica.view().clone();
+        let Some(content) = view.track(track).map(|t| t.content.clone()) else {
+            return false;
+        };
+        let mut ops = Vec::new();
+        for device in content
+            .devices
+            .iter()
+            .filter(|d| matches!(d.kind, DeviceKind::Plugin { .. }))
+        {
+            if !self.plugin_running(track, device.id) {
+                notice(
+                    &mut self.notices,
+                    "A plugin of this track does not run here, so its sound cannot be rendered for the commit.",
+                );
+                return false;
+            }
+            let captured = self.plugins.0.borrow_mut().capture(track, device.id);
+            match captured {
+                Ok(Some((hash, bytes))) => {
+                    self.put_blob(hash, bytes);
+                    ops.push(Op::DeviceSetState {
+                        track,
+                        id: device.id,
+                        state: Some(hash),
+                    });
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    notice(
+                        &mut self.notices,
+                        &format!("The plugin's state could not be saved: {err}."),
+                    );
+                    return false;
+                }
+            }
+        }
+        if !ops.is_empty() && !self.edit(ops) {
+            return false;
+        }
+        true
+    }
+
+    /// Uploads a blob made here, once, now or on the next connection.
+    fn put_blob(&mut self, hash: BlobHash, bytes: Arc<[u8]>) {
+        if self.uploads.contains_key(&hash) {
+            return;
+        }
+        self.uploads.insert(hash, bytes.clone());
+        if let Backend::Remote(remote) = &self.backend {
+            remote.link.put(hash, bytes);
+        }
     }
 
     /// Live notes: what this player plays, heard at once and sent to the others.
@@ -911,6 +1305,21 @@ impl Session {
     /// When the screen has to be drawn again although nothing arrives: soft locks run out and
     /// presence wants repeating.
     pub fn next_frame_in(&self) -> Option<Duration> {
+        // Plugins live on this thread: their windows, timers and callbacks run only when it
+        // does, also while nothing changes in this window.
+        let plugins = match self.plugins.0.borrow().activity() {
+            (_, true) => Some(PLUGIN_WINDOW_PACE),
+            (true, false) => Some(PLUGIN_PACE),
+            _ => None,
+        };
+        let others = self.others_next_frame_in();
+        match (plugins, others) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    fn others_next_frame_in(&self) -> Option<Duration> {
         let Backend::Remote(remote) = &self.backend else {
             return None;
         };
@@ -1058,6 +1467,33 @@ impl Session {
         if self.commit.is_some() || !self.online() {
             return false;
         }
+        let with_plugins = self
+            .replica
+            .view()
+            .track(track)
+            .is_some_and(|t| t.content.has_plugin());
+        if with_plugins {
+            if self.locked(track).is_some() {
+                return false;
+            }
+            // A stem runs from the start of the timeline to the end of the last clip: one that
+            // others would not even take is not rendered.
+            let view = self.replica.view();
+            let range = view.track(track).map(|t| checkout::stem_range(&t.content));
+            let seconds = range.map_or(0.0, |r| view.tempo_map().tick_to_seconds(r.end.0 as f64));
+            if seconds + 1.0 > STEM_MAX_SECS as f64 {
+                let text = format!(
+                    "This track runs for {} minutes from the start of the song; a track with plugins can be committed up to {} minutes.",
+                    (seconds / 60.0).ceil(),
+                    STEM_MAX_SECS / 60
+                );
+                notice(&mut self.notices, &text);
+                return false;
+            }
+            if !self.start_bounce(track) {
+                return false;
+            }
+        }
         let Some(workspace) = self.replica.begin_commit(track) else {
             return false;
         };
@@ -1067,7 +1503,51 @@ impl Session {
             plan: None,
             sent: None,
         });
-        self.spawn(move || Job::Plan(checkout::plan_commit(&confirmed, &workspace)));
+        if !with_plugins {
+            self.spawn(move || Job::Plan(checkout::plan_commit(&confirmed, &workspace, None)));
+            return true;
+        }
+        // The track with plugins as everyone without them will hear it: rendered here, from new
+        // instances, a slice per frame, since plugins want to run on this thread.
+        let mut doc = confirmed.clone();
+        apply_all(&mut doc, &workspace.journal);
+        let Some(content) = doc.track(track).map(|t| t.content.clone()) else {
+            return true;
+        };
+        let range = checkout::stem_range(&content);
+        let mut plugins = self.plugins.0.borrow_mut();
+        let mut source = plugins.offline(checkout::SAMPLE_RATE);
+        let render = OfflineRender::new(
+            &doc,
+            Some(&[track]),
+            range,
+            checkout::SAMPLE_RATE,
+            256,
+            &mut source,
+        );
+        let (instances, failures) = source.finish();
+        drop(plugins);
+        if !failures.is_empty() {
+            // Rendered without one of its plugins, the stem would be wrong for everyone.
+            let text = format!(
+                "The commit cannot be rendered: {}. The track stays checked out.",
+                failures.join("; ")
+            );
+            notice(&mut self.notices, &text);
+            drop(instances);
+            self.cancel_commit();
+            return false;
+        }
+        let has_notes = content.clips.values().any(|c| !c.notes.is_empty());
+        self.bounce = Some(Bounce {
+            track,
+            render,
+            instances,
+            confirmed,
+            workspace,
+            tempo_hash: doc.tempo_map().hash(),
+            has_notes,
+        });
         true
     }
 
@@ -1103,7 +1583,7 @@ impl Session {
             track: plan.track,
             ops: plan.ops.clone(),
             project_fix,
-            stem: None,
+            stem: plan.stem.as_ref().map(|s| s.stem),
             entry: ChangelogEntry {
                 summary: summary.trim().to_string(),
                 ranges: plan.ranges.clone(),
@@ -1112,9 +1592,32 @@ impl Session {
         };
         let msg = ClientMsg::Commit(Box::new(request));
         commit.sent = Some(msg.clone());
-        let blobs: Vec<BlobHash> = rendered.iter().map(|r| r.sample.blob).collect();
+        let mut blobs: Vec<BlobHash> = rendered.iter().map(|r| r.sample.blob).collect();
         for r in rendered.clone() {
             self.upload(&r);
+        }
+        if let Some(stem) = &plan.stem {
+            self.put_blob(stem.stem.blob, stem.flac.clone());
+            blobs.push(stem.stem.blob);
+        }
+        // The states of the track's plugins, saved here.
+        for op in &plan.ops {
+            let bytes = match op {
+                Op::DeviceSetState {
+                    state: Some(hash), ..
+                } => self.plugins.0.borrow().state(hash),
+                _ => None,
+            };
+            if let (
+                Op::DeviceSetState {
+                    state: Some(hash), ..
+                },
+                Some(bytes),
+            ) = (op, bytes)
+            {
+                self.put_blob(*hash, bytes);
+                blobs.push(*hash);
+            }
         }
         self.send_after_uploads(blobs, msg);
     }
@@ -1123,6 +1626,7 @@ impl Session {
     pub fn cancel_commit(&mut self) {
         if let Some(commit) = self.commit.take_if(|c| c.sent.is_none()) {
             self.replica.cancel_commit(commit.track);
+            self.bounce = None;
         }
     }
 
@@ -1273,6 +1777,12 @@ impl Session {
                         let r = r.clone();
                         self.remember(&r);
                     }
+                    if let Some(stem) = &plan.stem {
+                        self.plugins
+                            .0
+                            .borrow_mut()
+                            .add_stem(stem.stem.blob, stem.audio.clone());
+                    }
                     if let Some(commit) = self.commit.as_mut().filter(|c| c.track == plan.track) {
                         commit.plan = Some(plan);
                     }
@@ -1284,6 +1794,14 @@ impl Session {
                         sample: rendered.sample,
                     };
                     self.send_after_uploads(vec![rendered.sample.blob], attach);
+                }
+                Job::Stem { hash, audio } => {
+                    self.fetching.remove(&hash);
+                    let mut plugins = self.plugins.0.borrow_mut();
+                    match audio {
+                        Some(audio) => plugins.add_stem(hash, audio),
+                        None => plugins.give_up(&hash),
+                    }
                 }
                 Job::Decoded { hash, audio } => {
                     self.fetching.remove(&hash);
@@ -1707,13 +2225,49 @@ impl Session {
                     // Otherwise it goes again with the next connection.
                 }
                 LinkEvent::Fetched { hash, bytes } => {
-                    // Decoding takes a while for a long sample: not on the UI thread.
-                    let rate = self.engine.sample_rate();
-                    self.spawn(move || {
-                        let audio = bytes.and_then(|b| flac::decode(&b, SAMPLE_MAX_SECS).ok());
-                        let audio = audio.map(|a| Arc::from(flac::resample(&a, rate)));
-                        Job::Decoded { hash, audio }
-                    });
+                    let want = self.plugins.0.borrow().wanted(&hash);
+                    match (want, bytes) {
+                        (Some(Want::State), Some(bytes)) => {
+                            self.fetching.remove(&hash);
+                            self.plugins.0.borrow_mut().add_state(hash, bytes);
+                            continue;
+                        }
+                        (Some(Want::Stem(stem)), bytes) => {
+                            let rate = self.engine.sample_rate();
+                            self.spawn(move || {
+                                let audio = bytes.and_then(|b| flac::decode(&b, STEM_MAX_SECS).ok());
+                                let audio = audio.map(|a| {
+                                    let mut samples = flac::resample(&a, rate);
+                                    let gain = if stem.gain.is_finite() {
+                                        stem.gain.clamp(0.0, 64.0)
+                                    } else {
+                                        1.0
+                                    };
+                                    for s in &mut samples {
+                                        *s *= gain;
+                                    }
+                                    Arc::from(samples)
+                                });
+                                Job::Stem { hash, audio }
+                            });
+                            continue;
+                        }
+                        (Some(Want::State), None) => {
+                            self.fetching.remove(&hash);
+                            self.plugins.0.borrow_mut().give_up(&hash);
+                            continue;
+                        }
+                        (None, bytes) => {
+                            // Decoding takes a while for a long sample: not on the UI thread.
+                            let rate = self.engine.sample_rate();
+                            self.spawn(move || {
+                                let audio = bytes.and_then(|b| flac::decode(&b, SAMPLE_MAX_SECS).ok());
+                                let audio = audio.map(|a| Arc::from(flac::resample(&a, rate)));
+                                Job::Decoded { hash, audio }
+                            });
+                            continue;
+                        }
+                    }
                 }
                 LinkEvent::Msg(ServerMsg::Rejected {
                     client_txn_id,

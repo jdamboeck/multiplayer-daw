@@ -58,6 +58,14 @@ pub fn enter() -> Realtime {
     }
 }
 
+/// Lifts the mark for code that is not this program's to police, such as a plugin's `process`,
+/// until the returned value is dropped.
+pub fn leave() -> Realtime {
+    Realtime {
+        was: IN_REALTIME.with(|flag| flag.replace(false)),
+    }
+}
+
 pub struct Realtime {
     was: bool,
 }

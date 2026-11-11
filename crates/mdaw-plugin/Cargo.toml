@@ -1,0 +1,58 @@
+[package]
+name = "mdaw-plugin"
+description = "Plugin hosting behind a format-neutral interface; CLAP is the first format."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+mdaw-model.workspace = true
+mdaw-dsp.workspace = true
+mdaw-engine.workspace = true
+mdaw-test-plugin = { path = "../mdaw-test-plugin" }
+rtrb.workspace = true
+serde.workspace = true
+postcard.workspace = true
+clack-host = { version = "0.2", features = ["clack-plugin"] }
+clack-plugin = "0.2"
+clack-extensions = { version = "0.2", features = [
+    "clack-host",
+    "audio-ports",
+    "note-ports",
+    "params",
+    "state",
+    "gui",
+    "timer",
+    "log",
+    "thread-check",
+    "render",
+    "posix-fd",
+] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+memmap2 = "0.9"
+x11rb = "0.14"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+x11rb = "0.14"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_LibraryLoader",
+    "Win32_Graphics_Gdi",
+] }
+
+# The helper that runs one plugin in a process of its own.
+[[bin]]
+name = "mdaw-plugin-host"
+path = "src/bin/mdaw-plugin-host.rs"

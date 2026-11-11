@@ -3,11 +3,11 @@
 
 use anyhow::{Context, Result};
 use imbl::OrdMap;
-use mdaw_dsp::render_offline;
+use mdaw_dsp::{ExternalDevice, PluginRef, PluginSource, render_offline_with};
 use mdaw_engine::flac;
 use mdaw_model::{
-    Op, Project, TempoId, TempoPoint, TickRange, Track, TrackContent, TrackId, TrackShell, affected_ranges,
-    apply, apply_all, listening_range,
+    BlobHash, DeviceId, Op, Project, Stem, TempoId, TempoPoint, Tick, TickRange, Track, TrackContent,
+    TrackId, TrackShell, affected_ranges, apply, apply_all, listening_range,
 };
 use mdaw_proto::{Sample, SampleKind, Superseded, blob_hash};
 use mdaw_sync::Workspace;
@@ -40,6 +40,70 @@ pub struct CommitPlan {
     pub as_is: Vec<Rendered>,
     /// The samples for committing with the old tempo restored. Empty without a conflict.
     pub restored: Vec<Rendered>,
+    /// The track as audio, for a track with plugins.
+    pub stem: Option<StemRender>,
+}
+
+/// A stem rendered here.
+#[derive(Clone)]
+pub struct StemRender {
+    pub stem: Stem,
+    /// 24-bit FLAC at [`SAMPLE_RATE`], peak below full scale; `stem.gain` undoes the scaling.
+    pub flac: Arc<[u8]>,
+    /// As heard: interleaved stereo at the rate it was asked for, gain applied.
+    pub audio: Arc<[f32]>,
+}
+
+/// Peaks of stems are brought to this before encoding, so that integer samples do not clip
+/// what a plugin played beyond full scale: -1 dBFS.
+const STEM_PEAK: f32 = 0.891;
+
+/// Makes a stem of `audio`: interleaved stereo at [`SAMPLE_RATE`], as rendered. `rate` is the
+/// rate to keep it at for playing here.
+pub fn make_stem(audio: &[f32], tempo_hash: u64, rate: u32) -> StemRender {
+    let peak = audio.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+    let scale = if peak > STEM_PEAK { STEM_PEAK / peak } else { 1.0 };
+    let scaled: Vec<f32> = audio.iter().map(|s| s * scale).collect();
+    let bytes = flac::encode_bits(&scaled, SAMPLE_RATE, 24).expect("encoding a stem");
+    let at_rate = flac::resample(
+        &flac::Audio {
+            samples: audio.to_vec(),
+            sample_rate: SAMPLE_RATE,
+        },
+        rate,
+    );
+    StemRender {
+        stem: Stem {
+            blob: blob_hash(&bytes),
+            tempo_hash,
+            len_samples: (audio.len() / 2) as u64,
+            gain: 1.0 / scale,
+        },
+        flac: bytes.into(),
+        audio: at_rate.into(),
+    }
+}
+
+/// The range a stem covers: from the start of the timeline to the end of the track's last clip.
+pub fn stem_range(content: &TrackContent) -> TickRange {
+    TickRange::new(Tick::ZERO, content.extent().map_or(Tick::ZERO, |e| e.end))
+}
+
+/// Plays stems given to it, for rendering samples: a track whose plugins are not run here is
+/// heard through them.
+struct Stems(Vec<(BlobHash, Arc<[f32]>)>);
+
+impl PluginSource for Stems {
+    fn device(&mut self, _: TrackId, _: DeviceId, _: PluginRef<'_>) -> Option<Box<dyn ExternalDevice>> {
+        None
+    }
+
+    fn stem(&mut self, stem: &Stem) -> Option<Arc<[f32]>> {
+        self.0
+            .iter()
+            .find(|(blob, _)| *blob == stem.blob)
+            .map(|(_, audio)| audio.clone())
+    }
 }
 
 impl CommitPlan {
@@ -72,11 +136,22 @@ pub fn distinct(samples: &[Sample]) -> Vec<Sample> {
 }
 
 /// Works out the commit of `workspace` against `confirmed`, the document as the server has it.
-pub fn plan_commit(confirmed: &Project, workspace: &Workspace) -> CommitPlan {
+/// `stem` is the track rendered here, with the audio at [`SAMPLE_RATE`], for a track with
+/// plugins: its samples are cut from it.
+pub fn plan_commit(
+    confirmed: &Project,
+    workspace: &Workspace,
+    stem: Option<(StemRender, Arc<[f32]>)>,
+) -> CommitPlan {
     let track = workspace.track;
     let ops = workspace.journal.clone();
     let mut current = confirmed.clone();
     apply_all(&mut current, &ops);
+    let mut stems = Stems(Vec::new());
+    if let Some((render, audio)) = &stem {
+        current.set_stem(track, Some(render.stem));
+        stems.0.push((render.stem.blob, audio.clone()));
+    }
 
     let changed = affected_ranges(confirmed, &ops)
         .into_iter()
@@ -94,12 +169,15 @@ pub fn plan_commit(confirmed: &Project, workspace: &Workspace) -> CommitPlan {
     };
     let mut restored_doc = current.clone();
     apply_all(&mut restored_doc, &restore_tempo);
+    let render = |project: &Project, track: Option<TrackId>, range: TickRange, kind: SampleKind| {
+        render(project, track, range, kind, &mut Stems(stems.0.clone()))
+    };
 
     // Other tracks can be heard in context only if this client can render all of them.
     let context = current
         .tracks
         .iter()
-        .all(|(id, t)| *id == track || !t.content.has_clap_device());
+        .all(|(id, t)| *id == track || !t.content.has_plugin());
 
     let mut as_is = Vec::new();
     let mut restored = Vec::new();
@@ -131,6 +209,7 @@ pub fn plan_commit(confirmed: &Project, workspace: &Workspace) -> CommitPlan {
         conflict,
         as_is,
         restored,
+        stem: stem.map(|(render, _)| render),
     }
 }
 
@@ -146,12 +225,24 @@ pub fn render_before(event_doc: &Project, lost: &Superseded) -> Option<Rendered>
         .find(|a| a.track == track)
         .and_then(|a| a.range);
     let range = listening_range(&before.track(track)?.content, changed)?;
-    Some(render(&before, Some(track), range, SampleKind::Before))
+    Some(render(
+        &before,
+        Some(track),
+        range,
+        SampleKind::Before,
+        &mut Stems(Vec::new()),
+    ))
 }
 
-fn render(project: &Project, track: Option<TrackId>, range: TickRange, kind: SampleKind) -> Rendered {
+fn render(
+    project: &Project,
+    track: Option<TrackId>,
+    range: TickRange,
+    kind: SampleKind,
+    source: &mut dyn PluginSource,
+) -> Rendered {
     let only = track.map(|t| [t]);
-    let audio = render_offline(project, only.as_ref().map(|t| &t[..]), range, SAMPLE_RATE);
+    let audio = render_offline_with(project, only.as_ref().map(|t| &t[..]), range, SAMPLE_RATE, source);
     let bytes = flac::encode(&audio, SAMPLE_RATE).expect("encoding rendered audio");
     let ms = (audio.len() as u64 / 2 * 1000 / SAMPLE_RATE as u64) as u32;
     Rendered {

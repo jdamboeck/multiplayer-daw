@@ -1,4 +1,4 @@
-//! FLAC, the format of changelog samples: 16 bit stereo.
+//! FLAC, the format of changelog samples (16 bit stereo) and stems (24 bit stereo).
 
 use std::fmt;
 
@@ -33,17 +33,25 @@ impl Audio {
 
 /// Encodes interleaved stereo `f32` as 16-bit FLAC. Samples beyond full scale are clipped.
 pub fn encode(samples: &[f32], sample_rate: u32) -> Result<Vec<u8>, FlacError> {
+    encode_bits(samples, sample_rate, 16)
+}
+
+/// Encodes interleaved stereo `f32` as FLAC of 16 or 24 bits. Samples beyond full scale are
+/// clipped.
+pub fn encode_bits(samples: &[f32], sample_rate: u32, bits: u32) -> Result<Vec<u8>, FlacError> {
     use flacenc::component::BitRepr;
     use flacenc::error::Verify;
 
+    let bits = if bits >= 24 { 24 } else { 16 };
+    let full = ((1i64 << (bits - 1)) - 1) as f32;
     let ints: Vec<i32> = samples
         .iter()
-        .map(|s| (s.clamp(-1.0, 1.0) * 32767.0).round() as i32)
+        .map(|s| (s.clamp(-1.0, 1.0) * full).round() as i32)
         .collect();
     let config = flacenc::config::Encoder::default()
         .into_verified()
         .map_err(|(_, e)| FlacError(format!("encoder setup: {e:?}")))?;
-    let source = flacenc::source::MemSource::from_samples(&ints, 2, 16, sample_rate as usize);
+    let source = flacenc::source::MemSource::from_samples(&ints, 2, bits as usize, sample_rate as usize);
     let stream = flacenc::encode_with_fixed_block_size(&config, source, config.block_size)
         .map_err(|e| FlacError(format!("encoding: {e:?}")))?;
     let mut sink = flacenc::bitsink::ByteSink::new();
@@ -149,6 +157,21 @@ mod tests {
             .fold(0.0, f32::max);
         assert!(worst < 1.0 / 16_000.0, "worst error {worst}");
         assert_eq!(audio.millis(), 1000);
+    }
+
+    #[test]
+    fn stems_keep_24_bits() {
+        let samples: Vec<f32> = (0..4800)
+            .flat_map(|i| [i as f32 * 1e-6, -(i as f32) * 1e-6])
+            .collect();
+        let audio = decode(&encode_bits(&samples, 48_000, 24).unwrap(), 1).unwrap();
+        let worst = audio
+            .samples
+            .iter()
+            .zip(&samples)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max);
+        assert!(worst < 1.0 / 4_000_000.0, "worst error {worst}");
     }
 
     #[test]

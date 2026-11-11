@@ -70,8 +70,9 @@ fn rename(n: u64) -> Txn {
 fn clap(n: u64) -> Txn {
     let device = Device::new(
         DeviceId(EntityId(9)),
-        DeviceKind::Clap {
-            plugin_id: "x".into(),
+        DeviceKind::Plugin {
+            format: PluginFormat::Clap,
+            id: "x".into(),
             state: None,
         },
     );
@@ -175,7 +176,7 @@ fn events_go_to_everyone_and_rejections_to_the_sender() {
         ann_inbox.drain(),
         [ServerMsg::Rejected {
             client_txn_id: 2,
-            reason: RejectReason::ClapOutsideCommit
+            reason: RejectReason::PluginOutsideCommit
         }]
     );
     assert!(ben_inbox.drain().is_empty());

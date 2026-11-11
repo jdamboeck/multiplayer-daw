@@ -24,7 +24,9 @@ Prototype of a server/client DAW for collaborative editing. Working name.
   its owner a fork.
 - **M5** done: live MIDI. Notes from the computer keyboard or a MIDI device are heard by everyone
   as they arrive; recording turns them into a clip. A checked-out track hears only its owner.
-- **M6** (CLAP devices and stems) is next.
+- **M6** done: plugins and stems. CLAP plugins go onto a track through a checkout; the commit
+  carries their state and a stem. Clients with the plugin run it, the others play the stem. The
+  host sits behind a format-neutral interface, so VST3 can be added as another backend.
 
 ## Downloads
 
@@ -42,6 +44,12 @@ cargo test --workspace --exclude 'spike-*'
 
 Double-click an empty lane to create a clip, double-click a clip to edit its notes, Space plays,
 Ctrl+Z undoes.
+
+Clients load the CLAP plugins installed in the usual folders (and in `CLAP_PATH`), plus a
+built-in test synth; `--no-plugins` starts one without plugins, which plays their tracks from
+stems. On Linux every plugin runs in a helper process of its own (`mdaw-plugin-host`, which must
+sit next to `mdaw`), so a plugin that crashes or hangs takes only itself down;
+`MDAW_PLUGINS_IN_PROCESS=1` runs them inside `mdaw` instead.
 
 The pieces of the demo by hand, for another machine or a server that outlives its clients:
 

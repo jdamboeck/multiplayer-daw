@@ -18,14 +18,20 @@ static ALLOC: mdaw_engine::alloc_guard::GuardedAlloc = mdaw_engine::alloc_guard:
 const USAGE: &str = "\
 mdaw, a collaborative DAW (prototype)
 
-Usage: mdaw [--join <mdaw://...>] [--name <name>] [--profile <dir>]
+Usage: mdaw [--join <mdaw://...>] [--name <name>] [--profile <dir>] [--no-plugins]
 
   --join <string>   Join the project on a server. The server prints the join string when it starts.
                     Without it, mdaw opens a local project that is not saved.
   --name <name>     The name others see. Remembered in the profile.
   --profile <dir>   Where this install keeps its identity. Use different directories to run
                     several clients as different people on one machine.
+  --no-plugins      Load no plugins (also --no-clap). Tracks with plugins play their stems:
+                    how they sounded at their last commit.
+  --test-synth      Also offer the built-in test synth, a plugin for trying things out that
+                    can be told to fail or crash.
   -h, --help        Show this text.
+
+Plugins are looked for in the usual CLAP folders and in CLAP_PATH.
 
 With MDAW_SYNC_LOG=1 in the environment, a joined client prints once a second where its
 playhead is against the server's clock.
@@ -36,6 +42,8 @@ struct Args {
     join: Option<JoinInfo>,
     name: Option<String>,
     profile: Option<PathBuf>,
+    no_plugins: bool,
+    test_synth: bool,
 }
 
 /// `Ok(None)` means help was asked for.
@@ -51,6 +59,8 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Option<Args>, String>
             }
             "--name" => parsed.name = Some(value("a name")?),
             "--profile" => parsed.profile = Some(value("a directory")?.into()),
+            "--no-plugins" | "--no-clap" => parsed.no_plugins = true,
+            "--test-synth" => parsed.test_synth = true,
             other => return Err(format!("unknown argument {other}")),
         }
     }
@@ -64,6 +74,14 @@ struct Shell {
 }
 
 impl eframe::App for Shell {
+    /// Runs before every frame, and also while the window is hidden or covered.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.app.session.pump_plugins();
+        if let Some(wait) = self.app.session.next_frame_in() {
+            ctx.request_repaint_after(wait);
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.app.ui(ui);
         if let Some(last) = &mut self.sync_logged
@@ -161,6 +179,11 @@ fn main() -> ExitCode {
             }
         }
     };
+
+    let mut session = session;
+    if !args.no_plugins {
+        session.enable_plugins(mdaw_plugin::Host::standard(args.test_synth));
+    }
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

@@ -13,7 +13,8 @@ mod time;
 pub use apply::{apply, apply_all};
 pub use diff::{Affected, affected_ranges, listening_range};
 pub use doc::{
-    BuiltinKind, Checkout, Clip, Device, DeviceKind, Note, Project, Stem, Track, TrackContent, TrackShell,
+    BuiltinKind, Checkout, Clip, Device, DeviceKind, Note, PluginFormat, Project, Stem, Track, TrackContent,
+    TrackShell,
 };
 pub use ids::{ActorId, BlobHash, ClipId, DeviceId, EntityId, IdGen, NoteId, TempoId, TrackId, UserId};
 pub use op::{

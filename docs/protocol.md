@@ -1,11 +1,11 @@
 # mdaw protocol
 
-What client and server say to each other, as built. Protocol version **4**. The types live in
+What client and server say to each other, as built. Protocol version **5**. The types live in
 `mdaw-proto` (`lib.rs` for events, `wire.rs` for messages, `transport.rs` for the transport and
 datagrams, `midi.rs` for live notes) and in `mdaw-model` (ops); this text explains the rules
-around them. It covers what exists after milestone M5: the state plane with live edits, the
-shared clock and transport, checkout and commit with blobs and changelog samples, and live notes
-with recording.
+around them. It covers what exists after milestone M6: the state plane with live edits, the
+shared clock and transport, checkout and commit with blobs and changelog samples, live notes
+with recording, and plugins with stems.
 
 ## Connection
 
@@ -96,8 +96,8 @@ made the edit.
 The server handles one transaction at a time:
 
 1. **Check.** Ops out of range, an empty transaction, a `base_seq` ahead of the log, content edits
-   on a track that is checked out or carries a CLAP device, and adding a CLAP device outside a
-   commit are rejected. So is a transaction that would take the project past its size limits
+   on a track that is checked out or carries a plugin, and adding a plugin outside a commit are
+   rejected. So is a transaction that would take the project past its size limits
    (1000 tracks, 10 000 tempo points, 10 000 clips and 32 devices per track, 50 000 notes per
    clip, 4096 parameters per device), checked op by op against what is there. A rejected
    transaction changes nothing; its sender alone gets `Rejected { client_txn_id, reason }`.
@@ -323,8 +323,9 @@ The server's rules:
   only.
 - **Commit** is accepted only from the owner. Its `ops` must all be content ops of that track,
   its `project_fix` ops project-scope ops. Every blob it names must be on the server already: the
-  samples, the stem, the state of CLAP devices. A track that ends up with a CLAP device needs a
-  stem (M6). The contents could not change since the checkout, so a commit is a fast-forward.
+  samples, the stem, the states of plugins. A track that ends up with a plugin needs a stem
+  (see "Plugins and stems"). The contents could not change since the checkout, so a commit is a
+  fast-forward.
 - **Release** ends the sender's own checkout and keeps the contents as they were.
   **ForceRelease** ends anyone's; the event records whose it was.
 - **Attach** adds a `Before` sample to a recent entry that displaced an edit of the sending user:
@@ -376,7 +377,7 @@ changed range (mix or device edits), the 4 bars from the first bar with a note. 
 notes gets no samples. A commit carries:
 
 - `Solo`: the track alone, and `InContext`: all tracks, if every other track can be rendered here
-  (no CLAP devices; stems come with M6).
+  (has no plugins). For a track with plugins both are cut from its stem.
 - With a tempo conflict also `ProjectBase` (old tempo) and `ProjectCurrent` (tempo now), all
   tracks. With the old tempo restored, `Solo` and `InContext` are rendered with it.
 
@@ -384,6 +385,57 @@ Other clients download a sample when it is first played, decode and resample it 
 rate on a worker thread, and play it on the engine's preview bus, beside the transport. A
 sample longer than five minutes, at whatever rate, or at a rate outside 8 to 384 kHz, is not
 played. A sample is downloaded and decoded once, however often its button is pressed meanwhile.
+
+## Plugins and stems
+
+A device can be a plugin installed on the user's machine:
+
+```
+DeviceKind::Plugin { format: PluginFormat, id: String, state: Option<BlobHash> }
+PluginFormat = Clap            // another format is another variant; nothing else changes
+Track.stem: Option<Stem { blob, tempo_hash, len_samples, gain }>
+```
+
+- **Only through a checkout.** A plugin goes onto a track, and a track with a plugin is changed,
+  only while it is checked out (the server rejects it otherwise, and the client says so before
+  sending). Every commit of such a track carries a stem.
+- **One instrument.** A track has one instrument, the first device: Pocket or a plugin that
+  makes sound from notes. Picking another replaces it in the same transaction; plugins that
+  change sound (effects) come after it. The client keeps to this; the server does not check it.
+- **State.** The plugin's settings are its own state, an opaque blob; `id` names the plugin
+  within its format. The device's `params` are not used for plugins. Turning a plugin's knobs,
+  in its own window or in the generic controls, changes nothing in the document; at the commit
+  the owner's client saves the state of every plugin of the track whose state changed (the
+  plugin said so, or the host set a parameter) or that has none yet, uploads it, and adds a
+  `DeviceSetState` to the checkout's journal. A state is never compared byte for byte: plugins
+  save the same settings differently from instance to instance.
+- **Stem.** The owner's client renders the track alone, from new instances in offline mode
+  loaded with the states, from the start of the timeline to the end of the last clip plus one
+  second of tail, at 48 kHz, before faders and pan. It scales the audio so that its peak is at
+  most -1 dBFS (plugins play beyond full scale), encodes it as 24-bit stereo FLAC, and records
+  the factor that undoes the scaling as `gain`, and the tempo map it was rendered with as
+  `tempo_hash`. The render runs on the UI thread, a slice per frame, because plugins expect
+  their main thread to be that one.
+- **Hearing a track with plugins.** Each client decides for itself. With every plugin of the
+  track installed and its state at hand, it runs them, loaded with the committed state. Otherwise
+  the whole track plays its stem, sample-aligned to the timeline, through the track's fader and
+  pan; with another tempo map than `tempo_hash` the stem is marked stale and still plays. With
+  neither, the track is silent. Live notes reach a track only where its plugins run.
+- **Downloads.** State blobs and stems are downloaded when a client needs them. A stem is decoded
+  and resampled to the output rate off the UI thread; one longer than 15 minutes is not played.
+- **A client with no plugins** (`--no-plugins`) plays every such track from its stem.
+- **Crashes.** On Linux each plugin instance runs in a helper process (`mdaw-plugin-host`),
+  also for scanning, one file at a time. The audio thread hands it each block through shared
+  memory and waits at most the block's length plus 2 ms; a late block goes without the plugin.
+  A helper that crashes or stops answering is ended: the client says so, the track plays its
+  stem (or is silent), and the user can restart the plugin, which comes back with its settings
+  as kept aside at most two seconds before. A plugin that does not start or will not take its
+  settings is treated the same way, as is one running inside the client whose processing
+  fails. While a plugin waits for a restart it is not tried again.
+- **A commit is not sent** when a plugin of the track could not be made for the render, fails
+  or crashes during it, or when the track has notes and the render is all silence; nor when the
+  stem would run past 15 minutes from the start of the song. The client says why, and the
+  track stays checked out. This is all local to the client: nothing about it reaches the server or the others.
 
 ## Blobs
 

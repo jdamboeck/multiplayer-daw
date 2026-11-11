@@ -335,10 +335,10 @@ pub fn apply(project: &mut Project, op: &Op) -> Option<Op> {
         }
         Op::DeviceSetState { track, id, state } => {
             let old = match &project.tracks.get(track)?.content.device(*id)?.kind {
-                DeviceKind::Clap { state: old, .. } if old != state => *old,
+                DeviceKind::Plugin { state: old, .. } if old != state => *old,
                 _ => return None,
             };
-            if let DeviceKind::Clap { state: slot, .. } = &mut device_mut(project, *track, *id)?.kind {
+            if let DeviceKind::Plugin { state: slot, .. } = &mut device_mut(project, *track, *id)?.kind {
                 *slot = *state;
             }
             Some(Op::DeviceSetState {

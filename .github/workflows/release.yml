@@ -31,13 +31,15 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libasound2-dev libjack-jackd2-dev libpipewire-0.3-dev libclang-dev libx11-dev libxcb1-dev libxkbcommon-dev libwayland-dev
-      - run: cargo build --release --locked -p mdaw-client -p mdaw-server
+      - run: cargo build --release --locked -p mdaw-client -p mdaw-server -p mdaw-plugin
       - name: Package
         shell: bash
         run: |
           name="mdaw-${GITHUB_REF_NAME}-${{ matrix.target }}"
           mkdir "$name"
           cp "target/release/mdaw${{ matrix.exe }}" "target/release/mdaw-server${{ matrix.exe }}" README.md "$name/"
+          # The helper that runs each plugin in a process of its own (Linux).
+          if [ "$RUNNER_OS" = "Linux" ]; then cp target/release/mdaw-plugin-host "$name/"; fi
           cp LICENSE* "$name/" 2>/dev/null || true
           if [ "$RUNNER_OS" = "Windows" ]; then
             7z a "$name.zip" "$name" > /dev/null

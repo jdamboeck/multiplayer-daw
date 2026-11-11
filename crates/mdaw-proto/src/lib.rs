@@ -19,7 +19,7 @@ pub use wire::{
 };
 
 /// Bumped on every incompatible change to the wire format or to the meaning of an op.
-pub const PROTO_VERSION: u32 = 4;
+pub const PROTO_VERSION: u32 = 5;
 
 /// The hash a blob of these bytes is stored and named under.
 pub fn blob_hash(bytes: &[u8]) -> BlobHash {

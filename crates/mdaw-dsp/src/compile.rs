@@ -1,9 +1,12 @@
 //! Turns document tracks into flat, sample-timed data the audio thread can read without
 //! allocating or touching the document.
 
-use crate::graph::{DeviceState, Graph, TrackRuntime};
+use crate::external::{NoPlugins, PluginRef, PluginSource};
+use crate::graph::{DeviceState, Graph, Source, TrackRuntime};
 use crate::pocket::{Pocket, PocketParams};
-use mdaw_model::{BuiltinKind, DeviceId, DeviceKind, Project, TempoMap, Tick, TrackContent, TrackId};
+use mdaw_model::{
+    BlobHash, BuiltinKind, DeviceId, DeviceKind, PluginFormat, Project, TempoMap, Tick, TrackContent, TrackId,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -42,15 +45,32 @@ pub struct CompiledDevice {
 #[derive(Clone, PartialEq, Debug)]
 pub enum CompiledKind {
     Pocket(PocketParams),
-    /// A device this build cannot render (unknown built-in version, or a plugin).
+    /// A plugin, run through a [`PluginSource`].
+    Plugin {
+        format: PluginFormat,
+        id: String,
+        state: Option<BlobHash>,
+    },
+    /// A device this build cannot render (unknown built-in version).
     Inert,
 }
 
 impl CompiledKind {
-    fn tag(&self) -> u8 {
+    /// Tells apart device states that cannot be carried over to one another. A plugin instance
+    /// is kept when its state in the document changes: whoever provides plugins decides when a
+    /// new state means a new instance (see [`Compiler::forget`]).
+    fn tag(&self) -> u64 {
         match self {
-            CompiledKind::Pocket(_) => 1,
             CompiledKind::Inert => 0,
+            CompiledKind::Pocket(_) => 1,
+            CompiledKind::Plugin { format, id, .. } => {
+                // FNV-1a over what identifies the plugin.
+                let mut hash = 0xcbf2_9ce4_8422_2325u64;
+                for byte in [*format as u8].into_iter().chain(id.bytes()) {
+                    hash = (hash ^ byte as u64).wrapping_mul(0x0100_0000_01b3);
+                }
+                hash | 2
+            }
         }
     }
 }
@@ -138,7 +158,12 @@ fn compile_track(
                 } if *dsp_version == crate::pocket::DSP_VERSION => {
                     CompiledKind::Pocket(PocketParams::from_map(&device.params))
                 }
-                _ => CompiledKind::Inert,
+                DeviceKind::Plugin { format, id, state } => CompiledKind::Plugin {
+                    format: *format,
+                    id: id.clone(),
+                    state: *state,
+                },
+                DeviceKind::Builtin { .. } => CompiledKind::Inert,
             },
         })
         .collect();
@@ -162,7 +187,7 @@ pub struct Compiler {
     tempo: Arc<TempoMap>,
     tracks: BTreeMap<TrackId, Cached>,
     /// Devices that have state in the graph built last: (track, device, kind tag).
-    live: BTreeSet<(TrackId, DeviceId, u8)>,
+    live: BTreeSet<(TrackId, DeviceId, u64)>,
 }
 
 impl Compiler {
@@ -179,11 +204,27 @@ impl Compiler {
         self.sample_rate
     }
 
+    /// The next graph makes the device anew instead of taking it over from the graph before.
+    pub fn forget(&mut self, track: TrackId, device: DeviceId) {
+        self.live.retain(|(t, d, _)| (*t, *d) != (track, device));
+    }
+
     /// Builds the graph for a snapshot. `only` limits it to some tracks (offline solo renders).
     ///
     /// The graph expects to replace the one built before it and to take over that graph's
     /// device state through [`Graph::adopt_from`].
     pub fn build(&mut self, project: &Project, only: Option<&[TrackId]>) -> Graph {
+        self.build_with(project, only, &mut NoPlugins)
+    }
+
+    /// As [`Compiler::build`], with plugins and stems from `source`. A track with a plugin that
+    /// `source` cannot provide plays its stem, if `source` has that, and is silent otherwise.
+    pub fn build_with(
+        &mut self,
+        project: &Project,
+        only: Option<&[TrackId]>,
+        source: &mut dyn PluginSource,
+    ) -> Graph {
         let tempo = project.tempo_map();
         if tempo != *self.tempo {
             self.tempo = Arc::new(tempo);
@@ -208,21 +249,49 @@ impl Compiler {
                     previous.map(|p| &*p.compiled),
                 )),
             };
+            let mut missing = false;
             let devices = compiled
                 .devices
                 .iter()
                 .map(|device| {
                     let key = (id, device.id, device.kind.tag());
-                    live.insert(key);
-                    match &device.kind {
+                    let state = match &device.kind {
                         CompiledKind::Inert => DeviceState::Inert,
                         _ if self.live.contains(&key) => DeviceState::Adopt,
                         CompiledKind::Pocket(params) => {
                             DeviceState::Pocket(Box::new(Pocket::new(self.sample_rate, *params)))
                         }
+                        CompiledKind::Plugin {
+                            format,
+                            id: plugin,
+                            state,
+                        } => {
+                            let plugin = PluginRef {
+                                format: *format,
+                                id: plugin,
+                                state: *state,
+                            };
+                            match source.device(id, device.id, plugin) {
+                                Some(external) => DeviceState::External(external),
+                                None => {
+                                    missing = true;
+                                    DeviceState::Inert
+                                }
+                            }
+                        }
+                    };
+                    if !matches!(state, DeviceState::Inert) {
+                        live.insert(key);
                     }
+                    state
                 })
                 .collect();
+            // A plugin that cannot be heard here: the stem stands in for the whole track.
+            let sound = match track.stem.as_ref().filter(|_| missing) {
+                Some(stem) => source.stem(stem).map_or(Source::Silent, Source::Stem),
+                None if missing => Source::Silent,
+                None => Source::Devices,
+            };
             cache.insert(
                 id,
                 Cached {
@@ -230,7 +299,7 @@ impl Compiler {
                     compiled: compiled.clone(),
                 },
             );
-            tracks.push(TrackRuntime::new(compiled, devices));
+            tracks.push(TrackRuntime::new(compiled, devices, sound));
         }
         self.tracks = cache;
         self.live = live;

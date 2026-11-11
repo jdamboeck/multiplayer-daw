@@ -319,11 +319,11 @@ impl Op {
         )
     }
 
-    /// True when the op would put a CLAP device on a track. Only commits may do that.
-    pub fn adds_clap_device(&self) -> bool {
+    /// True when the op would put a plugin on a track. Only commits may do that.
+    pub fn adds_plugin(&self) -> bool {
         match self {
-            Op::DeviceAdd { device, .. } => matches!(device.kind, DeviceKind::Clap { .. }),
-            Op::TrackAdd { content, .. } => content.has_clap_device(),
+            Op::DeviceAdd { device, .. } => matches!(device.kind, DeviceKind::Plugin { .. }),
+            Op::TrackAdd { content, .. } => content.has_plugin(),
             _ => false,
         }
     }
@@ -332,7 +332,7 @@ impl Op {
     pub fn blobs(&self) -> Vec<BlobHash> {
         fn of_device(device: &Device) -> Option<BlobHash> {
             match &device.kind {
-                DeviceKind::Clap { state, .. } => *state,
+                DeviceKind::Plugin { state, .. } => *state,
                 DeviceKind::Builtin { .. } => None,
             }
         }
@@ -544,7 +544,7 @@ fn check_clip(clip: &Clip) -> Result<(), Invalid> {
 }
 
 fn check_device(device: &Device) -> Result<(), Invalid> {
-    if let DeviceKind::Clap { plugin_id, .. } = &device.kind
+    if let DeviceKind::Plugin { id: plugin_id, .. } = &device.kind
         && (plugin_id.is_empty() || plugin_id.len() > MAX_PLUGIN_ID_BYTES)
     {
         return Err(Invalid("bad plugin id"));
