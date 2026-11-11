@@ -15,7 +15,7 @@ pub fn toolbar(app: &mut DawApp, ui: &mut Ui) {
         .on_hover_text("Only what happened to the track selected in the arrangement");
     ui.selectable_value(&mut app.changelog_all, true, "Whole project");
     ui.separator();
-    let text = match rows(app).len() {
+    let text = match rows(app).len() + forks(app).len() {
         0 => "Nothing yet".to_string(),
         1 => "1 entry".to_string(),
         n => format!("{n} entries"),
@@ -65,6 +65,14 @@ fn rows(app: &DawApp) -> Vec<Row> {
     rows
 }
 
+/// Forks of ended checkouts to show, with their place in the session's list.
+fn forks(app: &DawApp) -> Vec<(usize, crate::checkout::Fork)> {
+    let forks = app.session.forks().iter().cloned().enumerate();
+    forks
+        .filter(|(_, fork)| app.changelog_all || Some(fork.track) == app.sel.track)
+        .collect()
+}
+
 /// When something happened, in local time: the time of day for today, the date as well before.
 pub fn when(wall_ts: u64) -> (String, String) {
     use chrono::{Datelike, Local, TimeZone};
@@ -86,7 +94,7 @@ pub fn when(wall_ts: u64) -> (String, String) {
 const TIME_WIDTH: f32 = 130.0;
 
 pub fn show(app: &mut DawApp, ui: &mut Ui) {
-    let forks = app.session.forks().to_vec();
+    let forks = forks(app);
     let rows = rows(app);
     if rows.is_empty() && forks.is_empty() {
         let project = app.session.project();
@@ -116,7 +124,8 @@ pub fn show(app: &mut DawApp, ui: &mut Ui) {
     let mut fork_action = None;
     egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
         ui.add_space(4.0);
-        for (index, fork) in forks.iter().enumerate() {
+        for (index, fork) in &forks {
+            let index = *index;
             ui.horizontal(|ui| {
                 if ui
                     .button("Restore as new track")

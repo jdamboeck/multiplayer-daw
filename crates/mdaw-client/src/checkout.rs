@@ -226,6 +226,8 @@ struct JournalFile {
 /// What is left of a checkout someone else ended: the track as its owner had made it.
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct Fork {
+    /// The track that was checked out.
+    pub track: TrackId,
     pub shell: TrackShell,
     pub content: TrackContent,
     /// Milliseconds since the Unix epoch when it was saved.
@@ -372,6 +374,7 @@ mod tests {
         assert!(files.load_journal(track).is_none());
 
         let fork = Fork {
+            track,
             shell: TrackShell {
                 name: "x".into(),
                 color: 1,
@@ -384,5 +387,6 @@ mod tests {
         let forks = files.forks();
         assert_eq!(forks.len(), 1);
         assert_eq!((forks[0].saved, &forks[0].path), (42, &path));
+        assert_eq!(forks[0].track, track);
     }
 }

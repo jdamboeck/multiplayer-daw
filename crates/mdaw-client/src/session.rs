@@ -959,7 +959,12 @@ impl Session {
             return false;
         };
         let id = self.replica.ids().track();
-        let after = self.replica.view().track_order.last().copied();
+        // Right below the track it came from, while that is still there.
+        let view = self.replica.view();
+        let after = match view.track(fork.track) {
+            Some(_) => Some(fork.track),
+            None => view.track_order.last().copied(),
+        };
         let shell = TrackShell {
             name: format!("{} (fork)", fork.shell.name),
             color: fork.shell.color,
@@ -1164,6 +1169,7 @@ impl Session {
         apply_all(&mut project, &workspace.journal);
         let Some(forked) = project.track(id) else { return };
         let mut fork = Fork {
+            track: id,
             shell: forked.shell.clone(),
             content: (*forked.content).clone(),
             saved: std::time::SystemTime::now()

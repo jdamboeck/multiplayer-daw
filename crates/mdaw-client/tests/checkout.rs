@@ -277,14 +277,19 @@ fn a_forced_release_leaves_the_owner_a_fork() {
             .any(|n| n.contains("ben ended your checkout"))
     );
 
+    assert_eq!(ann.forks()[0].track, track, "the fork knows where it came from");
+
+    // With another track in the project, the fork goes back right under its own.
+    let (other, _) = add_track(&mut ben);
+    settle(&mut [&mut ann, &mut ben]);
     assert!(ann.restore_fork(0));
     settle(&mut [&mut ann, &mut ben]);
-    assert_eq!(ben.project().tracks.len(), 2);
-    let (_, restored) = ben
-        .project()
-        .ordered_tracks()
-        .find(|(id, _)| *id != track)
-        .unwrap();
+    let order: Vec<TrackId> = ben.project().track_order.iter().copied().collect();
+    assert_eq!(order.len(), 3);
+    let at = order.iter().position(|id| *id == track).unwrap();
+    let fork = order[at + 1];
+    assert!(fork != other && fork != track);
+    let restored = ben.project().track(fork).unwrap();
     assert_eq!(restored.shell.name, "keys (fork)");
     assert_eq!(restored.content.clips[&clip].notes.len(), 2);
     assert!(ann.forks().is_empty() && files.forks().is_empty());
