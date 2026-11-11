@@ -267,7 +267,9 @@ The server's rules:
   stem (M6). The contents could not change since the checkout, so a commit is a fast-forward.
 - **Release** ends the sender's own checkout and keeps the contents as they were.
   **ForceRelease** ends anyone's; the event records whose it was.
-- **Attach** adds a sample to an earlier entry; the blob must be on the server.
+- **Attach** adds a `Before` sample to a recent entry that displaced an edit of the sending user:
+  how the track sounded with that edit. One per track of such edits; the blob must be on the
+  server. Anything else is denied with `NoSuchEntry`.
 
 **Leases.** The owner's client sends `LeaseRenew` every 10 s. A checkout without one for 60 s is
 stale: the server sends everyone `Stale(tracks)` whenever that set changes, and clients show it.
@@ -318,8 +320,9 @@ notes gets no samples. A commit carries:
 - With a tempo conflict also `ProjectBase` (old tempo) and `ProjectCurrent` (tempo now), all
   tracks. With the old tempo restored, `Solo` and `InContext` are rendered with it.
 
-Other clients download a sample when it is first played, decode it, resample it to the output
-rate, and play it on the engine's preview bus, beside the transport.
+Other clients download a sample when it is first played, decode and resample it to the output
+rate on a worker thread, and play it on the engine's preview bus, beside the transport. A
+sample longer than five minutes at 48 kHz, or at a rate outside 8 to 384 kHz, is not played.
 
 ## Blobs
 

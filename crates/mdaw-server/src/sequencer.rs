@@ -2,9 +2,10 @@
 
 use mdaw_model::{ActorId, BlobHash, DeviceKind, Op, Project, PropKey, Scope, TrackId, UserId, apply};
 use mdaw_proto::{
-    CommitRequest, Event, EventBody, RejectReason, ReleaseReason, Sample, Superseded, Txn, apply_event,
+    CommitRequest, Event, EventBody, RejectReason, ReleaseReason, Sample, SampleKind, Superseded, Txn,
+    apply_event,
 };
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 
 /// Events kept in memory to find what a transaction displaced. A client further behind than
 /// this gets fewer `Superseded` records, nothing else.
@@ -232,7 +233,8 @@ impl Sequencer {
         Ok(self.append(actor, user, wall_ts, body))
     }
 
-    /// Adds a sample to the entry of event `entry_seq`.
+    /// Adds a sample to the entry of event `entry_seq`: how the track sounded with an edit of
+    /// `user` that the event displaced. One per track of such edits, from that user only.
     pub fn attach(
         &mut self,
         actor: ActorId,
@@ -242,7 +244,23 @@ impl Sequencer {
         sample: Sample,
         has_blob: impl Fn(&BlobHash) -> bool,
     ) -> Result<Event, RejectReason> {
-        if entry_seq == 0 || entry_seq > self.head {
+        // Attaching comes right after the event, so it is still in the tail.
+        let entry = self.tail.iter().find(|e| e.seq == entry_seq);
+        let Some(EventBody::Txn { superseded, .. }) = entry.map(|e| &e.body) else {
+            return Err(RejectReason::NoSuchEntry);
+        };
+        let tracks: BTreeSet<TrackId> = superseded
+            .iter()
+            .filter(|lost| lost.lost_user == user)
+            .filter_map(|lost| lost.entity.track())
+            .collect();
+        let attached = self
+            .tail
+            .iter()
+            .filter(|e| e.user == user)
+            .filter(|e| matches!(e.body, EventBody::Attach { entry_seq: s, .. } if s == entry_seq))
+            .count();
+        if sample.kind != SampleKind::Before || attached >= tracks.len() {
             return Err(RejectReason::NoSuchEntry);
         }
         if !has_blob(&sample.blob) {

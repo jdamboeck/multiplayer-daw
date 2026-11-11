@@ -42,6 +42,9 @@ const MAX_LOG: usize = 500;
 const MAX_NOTICES: usize = 4;
 /// How often the work of a checkout is written to disk while it changes.
 const JOURNAL_EVERY: Duration = Duration::from_millis(500);
+/// Longest sample played from the changelog: five minutes at 48 kHz. Samples rendered here are
+/// at most 8 bars and a second.
+const SAMPLE_MAX_FRAMES: usize = 48_000 * 300;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Status {
@@ -124,7 +127,15 @@ struct Commit {
 /// Results of work done on other threads.
 enum Job {
     Plan(CommitPlan),
-    Before { entry_seq: u64, rendered: Rendered },
+    Before {
+        entry_seq: u64,
+        rendered: Rendered,
+    },
+    /// A downloaded sample, ready to play; `None` if it was not one.
+    Decoded {
+        hash: BlobHash,
+        audio: Option<Arc<[f32]>>,
+    },
     Nothing,
 }
 
@@ -1056,6 +1067,20 @@ impl Session {
                     };
                     self.send_after_uploads(vec![rendered.sample.blob], attach);
                 }
+                Job::Decoded { hash, audio } => {
+                    let Some(audio) = audio else {
+                        if self.wanted.take() == Some(hash) {
+                            notice(&mut self.notices, "Could not get the sample from the server.");
+                        }
+                        continue;
+                    };
+                    self.audio.insert(hash, audio.clone());
+                    if self.wanted == Some(hash) {
+                        self.wanted = None;
+                        let id = self.engine.preview(audio);
+                        self.playing = Some((hash, id));
+                    }
+                }
                 Job::Nothing => {}
             }
         }
@@ -1451,20 +1476,13 @@ impl Session {
                     // Otherwise it goes again with the next connection.
                 }
                 LinkEvent::Fetched { hash, bytes } => {
-                    let audio = bytes.and_then(|b| flac::decode(&b).ok());
-                    let Some(audio) = audio else {
-                        if self.wanted.take() == Some(hash) {
-                            notice(&mut self.notices, "Could not get the sample from the server.");
-                        }
-                        continue;
-                    };
-                    let resampled: Arc<[f32]> = flac::resample(&audio, self.engine.sample_rate()).into();
-                    self.audio.insert(hash, resampled.clone());
-                    if self.wanted == Some(hash) {
-                        self.wanted = None;
-                        let id = self.engine.preview(resampled);
-                        self.playing = Some((hash, id));
-                    }
+                    // Decoding takes a while for a long sample: not on the UI thread.
+                    let rate = self.engine.sample_rate();
+                    self.spawn(move || {
+                        let audio = bytes.and_then(|b| flac::decode(&b, SAMPLE_MAX_FRAMES).ok());
+                        let audio = audio.map(|a| Arc::from(flac::resample(&a, rate)));
+                        Job::Decoded { hash, audio }
+                    });
                 }
                 LinkEvent::Msg(ServerMsg::Rejected {
                     client_txn_id,

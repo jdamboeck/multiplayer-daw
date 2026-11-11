@@ -266,47 +266,73 @@ fn a_checkout_ends_by_its_owner_or_by_force() {
 }
 
 #[test]
-fn samples_can_be_attached_later() {
+fn only_the_user_whose_edit_lost_attaches_how_it_sounded() {
     let (mut hub, ann, ben) = setup(Store::in_memory().unwrap());
+    // Both rename the clip from seq 1; Ann's comes second and displaces Ben's.
+    let rename = |name: &str| Txn {
+        client_txn_id: 2,
+        base_seq: 1,
+        ops: vec![Op::ClipSet {
+            track: TRACK,
+            id: CLIP,
+            prop: ClipProp::Name(name.into()),
+        }],
+    };
+    hub.submit(ben.actor, rename("ben's"));
+    hub.submit(ann.actor, rename("ann's"));
+    let entry = ann.inbox.events().pop().unwrap();
+    let EventBody::Txn { superseded, .. } = &entry.body else {
+        panic!("expected a txn")
+    };
+    assert_eq!(superseded[0].lost_user, ben.user);
+    ben.inbox.drain();
+
     let audio = vec![7u8; 100];
     let blob = blob_hash(&audio);
-    hub.handle(
-        ben.actor,
-        ClientMsg::Attach {
-            entry_seq: 1,
-            sample: sample(blob),
-        },
+    let before = Sample {
+        kind: SampleKind::Before,
+        ..sample(blob)
+    };
+    let attach = |hub: &mut Hub, who: &Client, entry_seq: u64, sample: Sample| {
+        hub.handle(who.actor, ClientMsg::Attach { entry_seq, sample });
+        who.inbox.denied()
+    };
+    let refused = |seq| [(Request::Attach(seq), RejectReason::NoSuchEntry)];
+    assert_eq!(attach(&mut hub, &ben, 99, before), refused(99));
+    assert_eq!(
+        attach(&mut hub, &ben, 1, before),
+        refused(1),
+        "nothing of Ben's lost there"
     );
     assert_eq!(
-        ben.inbox.denied(),
-        [(Request::Attach(1), RejectReason::MissingBlob(blob))]
+        attach(&mut hub, &ann, entry.seq, before),
+        refused(entry.seq),
+        "not Ann's"
     );
+    assert_eq!(
+        attach(&mut hub, &ben, entry.seq, sample(blob)),
+        refused(entry.seq),
+        "only how it sounded before"
+    );
+    assert_eq!(
+        attach(&mut hub, &ben, entry.seq, before),
+        [(Request::Attach(entry.seq), RejectReason::MissingBlob(blob))]
+    );
+
     hub.blobs().put(&blob, &audio).unwrap();
-    hub.handle(
-        ben.actor,
-        ClientMsg::Attach {
-            entry_seq: 99,
-            sample: sample(blob),
-        },
-    );
-    assert_eq!(
-        ben.inbox.denied(),
-        [(Request::Attach(99), RejectReason::NoSuchEntry)]
-    );
-    hub.handle(
-        ben.actor,
-        ClientMsg::Attach {
-            entry_seq: 1,
-            sample: sample(blob),
-        },
-    );
+    assert!(attach(&mut hub, &ben, entry.seq, before).is_empty());
     let event = ann.inbox.events().pop().unwrap();
     assert_eq!(
         event.body,
         EventBody::Attach {
-            entry_seq: 1,
-            sample: sample(blob)
+            entry_seq: entry.seq,
+            sample: before
         }
+    );
+    assert_eq!(
+        attach(&mut hub, &ben, entry.seq, before),
+        refused(entry.seq),
+        "one per track"
     );
 }
 

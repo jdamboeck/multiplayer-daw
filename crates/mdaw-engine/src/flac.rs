@@ -53,18 +53,33 @@ pub fn encode(samples: &[f32], sample_rate: u32) -> Result<Vec<u8>, FlacError> {
     Ok(sink.as_slice().to_vec())
 }
 
+/// Sample rates [`decode`] accepts. Outside them a file is more likely made up than recorded,
+/// and converting it would take far more memory than the file suggests.
+pub const RATES: std::ops::RangeInclusive<u32> = 8_000..=384_000;
+
 /// Decodes FLAC to interleaved stereo. Mono becomes two equal channels; further channels are
-/// dropped.
-pub fn decode(bytes: &[u8]) -> Result<Audio, FlacError> {
+/// dropped. A file of more than `max_frames` frames is an error: the bytes come from others,
+/// and a few of them can claim, or hold, hours of silence.
+pub fn decode(bytes: &[u8], max_frames: usize) -> Result<Audio, FlacError> {
     let bad = |what: &str, e: claxon::Error| FlacError(format!("{what}: {e}"));
     let mut reader = claxon::FlacReader::new(bytes).map_err(|e| bad("not FLAC", e))?;
     let info = reader.streaminfo();
+    if !RATES.contains(&info.sample_rate) {
+        return Err(FlacError(format!("sample rate {} Hz", info.sample_rate)));
+    }
+    let too_long = || FlacError(format!("longer than {max_frames} frames"));
+    if info.samples.is_some_and(|n| n > max_frames as u64) {
+        return Err(too_long());
+    }
     let channels = info.channels as usize;
-    let scale = 1.0 / (1u64 << (info.bits_per_sample - 1)) as f32;
+    let scale = 1.0 / (1u64 << (info.bits_per_sample.clamp(1, 32) - 1)) as f32;
     let mut out = Vec::with_capacity(info.samples.unwrap_or(0) as usize * 2);
     let mut blocks = reader.blocks();
     let mut buffer = Vec::new();
     while let Some(block) = blocks.read_next_or_eof(buffer).map_err(|e| bad("decoding", e))? {
+        if out.len() / 2 + block.duration() as usize > max_frames {
+            return Err(too_long());
+        }
         for i in 0..block.duration() {
             let left = block.sample(0, i) as f32 * scale;
             let right = if channels > 1 {
@@ -121,7 +136,7 @@ mod tests {
             .collect();
         let bytes = encode(&samples, 48_000).unwrap();
         assert!(bytes.len() < samples.len() * 2, "FLAC compresses");
-        let audio = decode(&bytes).unwrap();
+        let audio = decode(&bytes, 48_000).unwrap();
         assert_eq!(audio.sample_rate, 48_000);
         assert_eq!(audio.samples.len(), samples.len());
         let worst = audio
@@ -147,6 +162,35 @@ mod tests {
 
     #[test]
     fn garbage_is_an_error() {
-        assert!(decode(b"not a flac file at all").is_err());
+        assert!(decode(b"not a flac file at all", 1000).is_err());
+    }
+
+    /// A short file whose STREAMINFO is changed by `patch`, which gets the 64 bits holding the
+    /// sample rate, channels, bits per sample and total samples.
+    fn patched(patch: impl Fn(u64) -> u64) -> Vec<u8> {
+        let mut bytes = encode(&vec![0.1; 4800 * 2], 48_000).unwrap();
+        // "fLaC", the block header, then 10 bytes of block and frame sizes.
+        let at = 4 + 4 + 10;
+        let field = u64::from_be_bytes(bytes[at..at + 8].try_into().unwrap());
+        bytes[at..at + 8].copy_from_slice(&patch(field).to_be_bytes());
+        bytes
+    }
+
+    #[test]
+    fn a_file_may_not_claim_or_hold_more_than_it_is_allowed() {
+        let total = (1u64 << 36) - 1;
+        let claims_hours = patched(|field| field | total);
+        assert!(
+            decode(&claims_hours, 48_000).is_err(),
+            "no allocation for the claim"
+        );
+        let says_nothing = patched(|field| field & !total);
+        assert!(decode(&says_nothing, 48_000).is_ok());
+        assert!(decode(&says_nothing, 1000).is_err(), "counted while decoding");
+        let one_hertz = patched(|field| (field & ((1 << 44) - 1)) | (1 << 44));
+        assert!(
+            decode(&one_hertz, 48_000).is_err(),
+            "1 Hz would take 48000 times the memory"
+        );
     }
 }
