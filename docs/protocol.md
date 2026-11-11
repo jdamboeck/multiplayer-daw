@@ -109,9 +109,9 @@ The server handles one transaction at a time:
 Events are the only way the document changes. Every client applies them in `seq` order, so all
 replicas hold the same document.
 
-The project thread handles one message at a time. Each connection may have 256 messages waiting
-for it; past that, the server stops reading from it until there is room, and QUIC's flow control
-slows the client down.
+The project thread handles one message at a time. Each connection may have 64 MiB of messages
+waiting for it, each counted as at least 1 KiB; past that, the server stops reading from it until
+there is room, and QUIC's flow control slows the client down.
 
 ### What the client does
 
@@ -334,7 +334,8 @@ notes gets no samples. A commit carries:
 
 Other clients download a sample when it is first played, decode and resample it to the output
 rate on a worker thread, and play it on the engine's preview bus, beside the transport. A
-sample longer than five minutes at 48 kHz, or at a rate outside 8 to 384 kHz, is not played.
+sample longer than five minutes, at whatever rate, or at a rate outside 8 to 384 kHz, is not
+played. A sample is downloaded and decoded once, however often its button is pressed meanwhile.
 
 ## Blobs
 

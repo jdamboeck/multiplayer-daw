@@ -296,3 +296,37 @@ fn a_workspace_remembers_its_checkout_and_the_track_it_began_with() {
     );
     assert_eq!(workspace.journal, [add(1)]);
 }
+
+#[test]
+fn a_snapshot_with_a_newer_checkout_of_the_same_track_ends_the_old_workspace() {
+    let mut replica = ann();
+    replica
+        .on_event(&event(1, ANN, EventBody::Checkout { track: TRACK }))
+        .unwrap();
+    replica.submit(vec![add(1)]);
+
+    // Meanwhile the checkout was ended, and Ann checked the track out again elsewhere.
+    let mut doc = base();
+    doc.set_checkout(
+        TRACK,
+        Some(Checkout {
+            user: ANN,
+            base_seq: 7,
+        }),
+    );
+    replica
+        .resync(ActorId(9), 7, SyncData::Snapshot(doc), None)
+        .unwrap();
+    let ended = replica.take_ended();
+    assert_eq!(ended.len(), 1);
+    assert_eq!((ended[0].0.base_seq, ended[0].1), (1, Ended::Lost));
+    assert_eq!(ended[0].0.journal, [add(1)], "the old work is handed back");
+    let workspace = replica.workspace(TRACK).unwrap();
+    assert_eq!(workspace.base_seq, 7);
+    assert!(workspace.journal.is_empty());
+    assert_eq!(
+        notes(replica.view()),
+        0,
+        "the old journal is not on the new checkout"
+    );
+}

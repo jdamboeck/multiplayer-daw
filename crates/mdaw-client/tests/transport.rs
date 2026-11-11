@@ -259,6 +259,52 @@ fn a_refused_tempo_change_leaves_the_playhead_where_the_server_has_it() {
 }
 
 #[test]
+fn a_refused_tempo_change_right_after_joining_leaves_the_playhead_where_the_server_has_it() {
+    let (_dir, server) = serve();
+    let mut ann = join(&server, "ann");
+    let track = ann.ids().track();
+    let add = Op::TrackAdd {
+        id: track,
+        shell: TrackShell {
+            name: "t".into(),
+            color: 0,
+        },
+        content: TrackContent::default(),
+        after: None,
+    };
+    assert!(ann.edit(vec![add]));
+    settle(&mut [&mut ann]);
+    ann.play();
+    settle(&mut [&mut ann]);
+
+    // Ben joins while it plays: the welcome is all the server has said about the transport.
+    let mut ben = join(&server, "ben");
+    settle(&mut [&mut ann, &mut ben]);
+    until(&mut [&mut ann, &mut ben], "half a beat has played", |s| {
+        s.iter().all(|s| s.position() > 480.0)
+    });
+    ann.check_out(track);
+    until(&mut [&mut ann], "the checkout is Ann's", |s| {
+        s[0].workspace(track).is_some()
+    });
+    let id = *ben.project().tempo.keys().next().unwrap();
+    let point = TempoPoint {
+        tick: Tick::ZERO,
+        milli_bpm: 60_000,
+    };
+    let gain = Op::TrackSetMix {
+        track,
+        prop: MixProp::Gain(0.5),
+    };
+    assert!(ben.edit(vec![Op::TempoPut { id, point }, gain]));
+    until(&mut [&mut ann, &mut ben], "the edit is refused", |s| {
+        s[1].notices().iter().any(|n| n.contains("not accepted"))
+    });
+    settle(&mut [&mut ann, &mut ben]);
+    assert_together(&server, &mut [&mut ann, &mut ben]);
+}
+
+#[test]
 fn an_unlinked_client_plays_on_its_own() {
     let (_dir, server) = serve();
     let (mut ann, mut ben) = (join(&server, "ann"), join(&server, "ben"));

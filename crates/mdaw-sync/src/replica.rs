@@ -479,17 +479,23 @@ impl Replica {
             return false;
         };
         let confirmed = &self.confirmed;
+        // A workspace ends when its checkout is gone, and also when the track is checked out
+        // again since: that is another checkout, with another base.
         let gone: Vec<TrackId> = self
             .workspaces
-            .keys()
-            .filter(|id| {
+            .values()
+            .filter(|w| {
                 confirmed
-                    .track(**id)
+                    .track(w.track)
                     .and_then(|t| t.checkout)
-                    .is_none_or(|c| c.user != user)
+                    .is_none_or(|c| c.user != user || c.base_seq != w.base_seq)
             })
-            .copied()
+            .map(|w| w.track)
             .collect();
+        for track in &gone {
+            self.end(*track, Ended::Lost);
+        }
+        let confirmed = &self.confirmed;
         let new: Vec<(TrackId, u64, Arc<Track>)> = confirmed
             .tracks
             .iter()
@@ -500,9 +506,6 @@ impl Replica {
             })
             .collect();
         let changed = !gone.is_empty() || !new.is_empty();
-        for track in gone {
-            self.end(track, Ended::Lost);
-        }
         for (track, base_seq, base) in new {
             let workspace = Workspace::new(track, base_seq, base, self.confirmed.tempo.clone());
             self.workspaces.insert(track, workspace);

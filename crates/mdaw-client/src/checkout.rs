@@ -325,6 +325,24 @@ impl Files {
             .collect()
     }
 
+    /// Renames saved checkouts that cannot be read, as those of an older version, so that they
+    /// are neither lost nor read again. Returns how many there were.
+    pub fn set_aside_unreadable(&self) -> usize {
+        let Ok(entries) = std::fs::read_dir(self.dir.join("checkouts")) else {
+            return 0;
+        };
+        entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "journal"))
+            .filter(|path| {
+                let bytes = std::fs::read(path).unwrap_or_default();
+                postcard::from_bytes::<SavedCheckout>(&bytes).is_err()
+            })
+            .filter(|path| std::fs::rename(path, path.with_extension("journal.unreadable")).is_ok())
+            .count()
+    }
+
     pub fn remove_journal(&self, track: TrackId) {
         let _ = std::fs::remove_file(self.journal_path(track));
     }

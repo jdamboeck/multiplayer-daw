@@ -1,6 +1,6 @@
 //! One editing session: the replica, the thing that orders its edits, and the audio engine.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
 use std::time::{Duration, Instant};
@@ -42,9 +42,9 @@ const MAX_LOG: usize = 500;
 const MAX_NOTICES: usize = 4;
 /// How often the work of a checkout is written to disk while it changes.
 const JOURNAL_EVERY: Duration = Duration::from_millis(500);
-/// Longest sample played from the changelog: five minutes at 48 kHz. Samples rendered here are
-/// at most 8 bars and a second.
-const SAMPLE_MAX_FRAMES: usize = 48_000 * 300;
+/// Longest sample played from the changelog, in seconds. Samples rendered here are at most 8 bars
+/// and a second.
+const SAMPLE_MAX_SECS: u32 = 300;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Status {
@@ -189,6 +189,8 @@ pub struct Session {
     audio: HashMap<BlobHash, Arc<[f32]>>,
     /// A sample to play as soon as it has been downloaded.
     wanted: Option<BlobHash>,
+    /// Samples being downloaded or decoded.
+    fetching: HashSet<BlobHash>,
     /// The sample playing, with its preview id.
     playing: Option<(BlobHash, u64)>,
     forks: Vec<Fork>,
@@ -321,7 +323,7 @@ impl Session {
             clock: None,
             transport,
             transport_heard: true,
-            said: None,
+            said: Some((transport, project.tempo_map())),
             transport_asked: 0,
             applied: None,
             stale,
@@ -362,6 +364,7 @@ impl Session {
             samples: HashMap::new(),
             audio: HashMap::new(),
             wanted: None,
+            fetching: HashSet::new(),
             playing: None,
             forks: Vec::new(),
             restoring: Vec::new(),
@@ -422,9 +425,19 @@ impl Session {
         changed
     }
 
-    /// Edits of a track someone else has checked out would be refused by the server; they are
-    /// refused here already, with a word why.
+    /// Edits the server would refuse, of a track someone else has checked out or past the limits
+    /// of the project, are refused here already, with a word why.
     fn allowed(&mut self, ops: &[Op]) -> bool {
+        // What the server would refuse as out of range or too large, inside a checkout as well,
+        // where it would otherwise only show at the commit.
+        let mut doc = self.replica.view().clone();
+        for op in ops {
+            if let Err(why) = op.validate().and_then(|()| op.fits(&doc)) {
+                notice(&mut self.notices, &format!("This edit cannot be made: {why}."));
+                return false;
+            }
+            apply(&mut doc, op);
+        }
         for op in ops {
             let track = match op.scope() {
                 Scope::Project => continue,
@@ -783,6 +796,10 @@ impl Session {
         if busy {
             return Some(Duration::from_millis(100));
         }
+        // Work of a checkout waits for its turn to be written, and is not left waiting longer.
+        if self.unsaved() {
+            return Some(JOURNAL_EVERY.saturating_sub(self.saved_at.elapsed()));
+        }
         // Leases are renewed even while nothing moves.
         let lease = (!self.saved.is_empty()).then_some(Duration::from_secs(LEASE_RENEW_SECS));
         (locks || self.editing.is_some() || remote.presence_sent.editing.is_some())
@@ -794,6 +811,16 @@ impl Session {
     /// by the checkouts they belong to.
     pub fn set_files(&mut self, files: Files) {
         self.forks = files.forks();
+        let unreadable = files.set_aside_unreadable();
+        if unreadable > 0 {
+            notice(
+                &mut self.notices,
+                &format!(
+                    "{unreadable} saved checkout(s) from an older version could not be read; they are \
+                     kept beside the others as .unreadable."
+                ),
+            );
+        }
         let journals = files.journals();
         self.files = Some(files.clone());
         // Work of checkouts that ended while this client was not running.
@@ -806,7 +833,24 @@ impl Session {
                 continue;
             }
             files.remove_journal(saved.track);
-            if saved.journal.is_empty() {
+            // Committed or dropped by this user, with the window closed before it heard back:
+            // nothing to keep.
+            let ended_here = self.log.iter().any(|entry| {
+                entry.seq > saved.base_seq
+                    && entry.by == self.user
+                    && match &entry.what {
+                        Logged::Commit { track, .. } => *track == saved.track,
+                        Logged::Release { track, reason } => {
+                            *track == saved.track
+                                && match reason {
+                                    ReleaseReason::Abandoned => true,
+                                    ReleaseReason::Forced { owner } => *owner == self.user,
+                                }
+                        }
+                        Logged::Checkout { .. } => false,
+                    }
+            });
+            if saved.journal.is_empty() || ended_here {
                 continue;
             }
             let shell = self
@@ -983,7 +1027,10 @@ impl Session {
                     return;
                 };
                 self.wanted = Some(blob);
-                remote.link.get(blob);
+                // Pressed again while it is on its way: one download, one decode.
+                if self.fetching.insert(blob) {
+                    remote.link.get(blob);
+                }
             }
         }
     }
@@ -1111,6 +1158,7 @@ impl Session {
                     self.send_after_uploads(vec![rendered.sample.blob], attach);
                 }
                 Job::Decoded { hash, audio } => {
+                    self.fetching.remove(&hash);
                     let Some(audio) = audio else {
                         if self.wanted.take() == Some(hash) {
                             notice(&mut self.notices, "Could not get the sample from the server.");
@@ -1250,16 +1298,26 @@ impl Session {
             if self.saved.get(&workspace.track) == Some(&changes) {
                 continue;
             }
-            if let Some(files) = &self.files
-                && let Err(err) = files.save_journal(workspace)
-            {
-                notice(
+            match self.files.as_ref().map(|files| files.save_journal(workspace)) {
+                // Tried again with the next write.
+                Some(Err(err)) => notice(
                     &mut self.notices,
                     &format!("Could not save the checkout: {err:#}."),
-                );
+                ),
+                Some(Ok(())) | None => {
+                    self.saved.insert(workspace.track, changes);
+                }
             }
-            self.saved.insert(workspace.track, changes);
         }
+    }
+
+    /// Whether a checkout has changes that are not on disk yet.
+    fn unsaved(&self) -> bool {
+        self.files.is_some()
+            && self
+                .replica
+                .workspaces()
+                .any(|w| self.saved.get(&w.track) != Some(&w.changes))
     }
 
     /// Keeps the work of a checkout that ended without a commit. It is rebuilt from the track
@@ -1524,7 +1582,7 @@ impl Session {
                     // Decoding takes a while for a long sample: not on the UI thread.
                     let rate = self.engine.sample_rate();
                     self.spawn(move || {
-                        let audio = bytes.and_then(|b| flac::decode(&b, SAMPLE_MAX_FRAMES).ok());
+                        let audio = bytes.and_then(|b| flac::decode(&b, SAMPLE_MAX_SECS).ok());
                         let audio = audio.map(|a| Arc::from(flac::resample(&a, rate)));
                         Job::Decoded { hash, audio }
                     });

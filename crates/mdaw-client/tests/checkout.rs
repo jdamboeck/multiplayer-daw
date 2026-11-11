@@ -463,24 +463,31 @@ fn a_fork_the_server_refuses_to_add_stays_a_fork() {
     let server = server(dir.path());
     let (mut ben, track, _) = leave_work_behind(&server, dir.path());
     ben.force_release(track);
-    // The project is full: a thousand tracks.
-    let ids = ben.ids();
-    let more: Vec<Op> = (1..1000)
-        .map(|n| Op::TrackAdd {
-            id: ids.track(),
-            shell: TrackShell {
-                name: format!("t{n}"),
-                color: 0,
-            },
-            content: TrackContent::default(),
-            after: None,
-        })
-        .collect();
-    assert!(ben.edit(more));
+    let tracks = |ben: &mut Session, from: usize, to: usize| -> Vec<Op> {
+        let ids = ben.ids();
+        (from..to)
+            .map(|n| Op::TrackAdd {
+                id: ids.track(),
+                shell: TrackShell {
+                    name: format!("t{n}"),
+                    color: 0,
+                },
+                content: TrackContent::default(),
+                after: None,
+            })
+            .collect()
+    };
+    let almost = tracks(&mut ben, 1, 999);
+    assert!(ben.edit(almost));
     settle(&mut [&mut ben]);
-    assert_eq!(ben.project().tracks.len(), 1000);
 
     let mut ann = rejoin(&server, dir.path());
+    let last = tracks(&mut ben, 999, 1000);
+    assert!(ben.edit(last));
+    settle(&mut [&mut ben]);
+    assert_eq!(ben.project().tracks.len(), 1000);
+    // Ann has not heard of the last track yet: her client lets the restore go, the server
+    // refuses it.
     assert!(ann.restore_fork(0));
     assert!(ann.forks().is_empty(), "out of sight while on its way");
     until(&mut [&mut ann, &mut ben], "the fork is back", |s| {
@@ -492,6 +499,11 @@ fn a_fork_the_server_refuses_to_add_stays_a_fork() {
         1,
         "still on disk"
     );
+
+    // Now that Ann knows the project is full, her client says so at once.
+    assert!(!ann.restore_fork(0));
+    assert!(ann.notices().iter().any(|n| n.contains("cannot be made")));
+    assert_eq!(ann.forks().len(), 1);
 }
 
 #[test]
@@ -557,4 +569,131 @@ fn an_edit_that_lost_gets_a_sample_of_how_it_sounded() {
     }
     let heard = winner.engine_mut().pump(4800).unwrap();
     assert!(heard.iter().any(|s| s.abs() > 0.01), "the sample has sound");
+}
+
+#[test]
+fn work_dropped_just_before_the_window_closed_does_not_come_back_as_a_fork() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = server(dir.path());
+    let mut ann = join(&server, "ann");
+    let mut ben = join(&server, "ben");
+    ann.set_files(Files::new(dir.path().join("ann")));
+    let (track, clip) = add_track(&mut ann);
+    settle(&mut [&mut ann, &mut ben]);
+    check_out(&mut ann, &mut ben, track);
+    let edit = note(1, ann.ids(), track, clip);
+    ann.edit(vec![edit]);
+
+    // Ann drops her changes and closes the window before her client hears that it is done.
+    ann.release(track);
+    until(&mut [&mut ben], "the release is sequenced", |s| {
+        s[0].checkout_owner(track).is_none()
+    });
+    drop(ann);
+    let mut ann = rejoin(&server, dir.path());
+    assert!(ann.forks().is_empty(), "nothing to keep");
+    assert!(!ann.notices().iter().any(|n| n.contains("while you were away")));
+    assert!(Files::new(dir.path().join("ann")).journals().is_empty());
+    ann.frame();
+}
+
+#[test]
+fn a_saved_checkout_that_cannot_be_read_is_set_aside_with_a_word() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = server(dir.path());
+    let checkouts = dir.path().join("ann").join("checkouts");
+    std::fs::create_dir_all(&checkouts).unwrap();
+    std::fs::write(checkouts.join("00000000000000ff.journal"), b"older format").unwrap();
+    let ann = rejoin(&server, dir.path());
+    assert!(ann.notices().iter().any(|n| n.contains("could not be read")));
+    assert!(checkouts.join("00000000000000ff.journal.unreadable").exists());
+    drop(ann);
+    let ann = rejoin(&server, dir.path());
+    assert!(ann.notices().is_empty(), "told once");
+}
+
+#[test]
+fn checkout_work_reaches_the_disk_soon_and_a_failed_write_is_tried_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = server(dir.path());
+    let mut ann = join(&server, "ann");
+    let mut ben = join(&server, "ben");
+    let files = Files::new(dir.path().join("ann"));
+    ann.set_files(files.clone());
+    let (track, clip) = add_track(&mut ann);
+    settle(&mut [&mut ann, &mut ben]);
+    check_out(&mut ann, &mut ben, track);
+    let saved = |n: usize| files.load_journal(track).is_some_and(|s| s.journal.len() == n);
+
+    // One edit, then nothing more happens: the window still asks to be woken to write it, as a
+    // window loop that only sleeps until `next_frame_in` would.
+    let run_as_a_window = |ann: &mut Session, done: &dyn Fn() -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done() {
+            let wait = ann.next_frame_in().expect("asks for a frame");
+            assert!(wait <= Duration::from_millis(500), "asks to wait {wait:?}");
+            std::thread::sleep(wait);
+            ann.frame();
+            assert!(Instant::now() < deadline, "never written");
+        }
+    };
+    ann.frame();
+    let edit = note(1, ann.ids(), track, clip);
+    ann.edit(vec![edit]);
+    run_as_a_window(&mut ann, &|| saved(1));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let checkouts = dir.path().join("ann").join("checkouts");
+        let mode = |m| std::fs::set_permissions(&checkouts, std::fs::Permissions::from_mode(m)).unwrap();
+        mode(0o500);
+        let edit = note(2, ann.ids(), track, clip);
+        ann.edit(vec![edit]);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ann.notices().iter().any(|n| n.contains("Could not save")) {
+            ann.frame();
+            std::thread::sleep(Duration::from_millis(20));
+            assert!(Instant::now() < deadline, "no word of the failure");
+        }
+        mode(0o700);
+        // No further edit: the write is tried again by itself.
+        run_as_a_window(&mut ann, &|| saved(2));
+    }
+}
+
+#[test]
+fn an_edit_past_the_limits_is_refused_at_once_also_inside_a_checkout() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = server(dir.path());
+    let mut ann = join(&server, "ann");
+    let mut ben = join(&server, "ben");
+    let (track, _) = add_track(&mut ann);
+    settle(&mut [&mut ann, &mut ben]);
+    check_out(&mut ann, &mut ben, track);
+
+    // The track has one device; 31 more fill it, the next is one too many.
+    let device = |ann: &mut Session| {
+        let kind = DeviceKind::Builtin {
+            kind: BuiltinKind::Pocket,
+            dsp_version: pocket::DSP_VERSION,
+        };
+        Op::DeviceAdd {
+            track,
+            device: Device::new(ann.ids().device(), kind),
+            after: None,
+        }
+    };
+    for _ in 0..31 {
+        let op = device(&mut ann);
+        assert!(ann.edit(vec![op]));
+    }
+    let op = device(&mut ann);
+    assert!(!ann.edit(vec![op]), "refused here, not at the commit");
+    assert!(ann.notices().iter().any(|n| n.contains("cannot be made")));
+    assert_eq!(ann.workspace(track).unwrap().journal.len(), 31);
+
+    // An op out of range is refused with a word too, where a debug build used to stop.
+    let prop = ShellProp::Name("x".repeat(200));
+    assert!(!ann.edit(vec![Op::TrackSetShell { id: track, prop }]));
 }
