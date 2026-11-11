@@ -185,7 +185,10 @@ fn a_client_that_was_gone_catches_up() {
     settle(&mut [&mut ann, &mut ben]);
     assert_eq!(pitch(ben.project(), at), Some(72));
     assert_eq!(pitch(ben.project(), second), Some(60));
-    assert_eq!(ann.peers().len(), 2);
+    // Who is there travels apart from the document, so it may come a moment later.
+    until(&mut [&mut ann, &mut ben], "ann sees ben back", |s| {
+        s[0].peers().len() == 2
+    });
 
     // The new connection mints IDs that do not collide with the old one's.
     let third = add_track(&mut ben, "Pad");
@@ -222,7 +225,9 @@ fn the_server_restarts_under_its_clients() {
     assert_eq!(pitch(ben.project(), at), Some(67));
     assert_eq!(pitch(ann.project(), offline), Some(60));
     assert_eq!(ann.seq(), before + 2, "each offline edit was sequenced once");
-    assert_eq!(ann.peers().len(), 2);
+    until(&mut [&mut ann, &mut ben], "ann sees ben back", |s| {
+        s[0].peers().len() == 2
+    });
 
     // What was made before the restart can still be undone after it.
     assert!(ann.undo());

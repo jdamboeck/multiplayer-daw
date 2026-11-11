@@ -166,11 +166,11 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     file.sync_all()
 }
 
-#[cfg(test)]
+// File modes exist only on Unix.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
     #[test]
     fn only_the_owner_can_read_the_key() {
         use std::os::unix::fs::PermissionsExt;
