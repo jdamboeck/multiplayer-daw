@@ -3,7 +3,7 @@
 
 use mdaw_client::{Session, Status, Who};
 use mdaw_engine::Engine;
-use mdaw_model::{Op, TempoPoint, Tick, TickRange};
+use mdaw_model::{MixProp, Op, TempoPoint, Tick, TickRange, TrackContent, TrackShell};
 use mdaw_server::{Config, Server};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -210,6 +210,52 @@ fn a_tempo_change_while_playing_leaves_everyone_together() {
             "the playhead moved by {moved} ticks"
         );
     }
+}
+
+#[test]
+fn a_refused_tempo_change_leaves_the_playhead_where_the_server_has_it() {
+    let (_dir, server) = serve();
+    let (mut ann, mut ben) = (join(&server, "ann"), join(&server, "ben"));
+    let track = ann.ids().track();
+    let add = Op::TrackAdd {
+        id: track,
+        shell: TrackShell {
+            name: "t".into(),
+            color: 0,
+        },
+        content: TrackContent::default(),
+        after: None,
+    };
+    assert!(ann.edit(vec![add]));
+    settle(&mut [&mut ann, &mut ben]);
+    ann.play();
+    settle(&mut [&mut ann, &mut ben]);
+    until(&mut [&mut ann, &mut ben], "half a beat has played", |s| {
+        s.iter().all(|s| s.position() > 480.0)
+    });
+
+    // Ben checks the track out; before Ann hears of it, she changes the tempo and the track in
+    // one edit, which the server refuses as a whole.
+    ben.check_out(track);
+    until(&mut [&mut ben], "the checkout is Ben's", |s| {
+        s[0].workspace(track).is_some()
+    });
+    let id = *ann.project().tempo.keys().next().unwrap();
+    let point = TempoPoint {
+        tick: Tick::ZERO,
+        milli_bpm: 60_000,
+    };
+    let gain = Op::TrackSetMix {
+        track,
+        prop: MixProp::Gain(0.5),
+    };
+    assert!(ann.edit(vec![Op::TempoPut { id, point }, gain]));
+    until(&mut [&mut ann, &mut ben], "the edit is refused", |s| {
+        s[0].notices().iter().any(|n| n.contains("not accepted"))
+    });
+    settle(&mut [&mut ann, &mut ben]);
+    assert_eq!(ann.project().tempo_map().milli_bpm_at(Tick::ZERO), 120_000);
+    assert_together(&server, &mut [&mut ann, &mut ben]);
 }
 
 #[test]

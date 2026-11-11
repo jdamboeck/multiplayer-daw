@@ -501,3 +501,18 @@ fn validation_rejects_out_of_range_values() {
         assert!(op.validate().is_err(), "{op:?} should be invalid");
     }
 }
+
+#[test]
+fn a_fitted_name_is_always_a_valid_one() {
+    let rename = |name: String| Op::TrackSetShell {
+        id: TrackId(EntityId(1)),
+        prop: ShellProp::Name(name),
+    };
+    let long = "ä".repeat(100); // 200 bytes
+    for suffix in ["", " (fork)"] {
+        let name = fit_name(&long, suffix);
+        assert!(name.len() <= MAX_NAME_BYTES && name.ends_with(suffix), "{name}");
+        assert!(rename(name).validate().is_ok());
+    }
+    assert_eq!(fit_name("keys", " (fork)"), "keys (fork)");
+}

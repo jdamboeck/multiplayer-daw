@@ -414,7 +414,18 @@ impl fmt::Display for Invalid {
 
 impl std::error::Error for Invalid {}
 
-const MAX_NAME_BYTES: usize = 128;
+/// Longest name of a project, track or clip, in bytes of UTF-8.
+pub const MAX_NAME_BYTES: usize = 128;
+
+/// `name` followed by `suffix`, with `name` cut on a character boundary so that the whole fits
+/// in [`MAX_NAME_BYTES`] and an op carrying it is valid. `suffix` is kept whole.
+pub fn fit_name(name: &str, suffix: &str) -> String {
+    let mut end = name.len().min(MAX_NAME_BYTES.saturating_sub(suffix.len()));
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{suffix}", &name[..end])
+}
 const MAX_PLUGIN_ID_BYTES: usize = 256;
 const MAX_NOTES_PER_CLIP: usize = 50_000;
 const MAX_CLIPS_PER_TRACK: usize = 10_000;

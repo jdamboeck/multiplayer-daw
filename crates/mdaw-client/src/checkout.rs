@@ -36,8 +36,6 @@ pub struct CommitPlan {
     pub ranges: Vec<TickRange>,
     /// The tempo changed under the track since the checkout began.
     pub conflict: bool,
-    /// Ops that put the tempo back to what it was at checkout.
-    pub restore_tempo: Vec<Op>,
     /// The samples for committing as is.
     pub as_is: Vec<Rendered>,
     /// The samples for committing with the old tempo restored. Empty without a conflict.
@@ -131,7 +129,6 @@ pub fn plan_commit(confirmed: &Project, workspace: &Workspace) -> CommitPlan {
         ops,
         ranges: changed.into_iter().collect(),
         conflict,
-        restore_tempo,
         as_is,
         restored,
     }

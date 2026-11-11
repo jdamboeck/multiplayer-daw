@@ -646,7 +646,7 @@ fn header(app: &mut DawApp, ui: &mut Ui, rect: Rect, clip: Rect, id: TrackId, tr
                     && !cancelled
                     && !text.trim().is_empty()
                 {
-                    let prop = ShellProp::Name(text.trim().to_owned());
+                    let prop = ShellProp::Name(mdaw_model::fit_name(text.trim(), ""));
                     app.session.edit(vec![Op::TrackSetShell { id, prop }]);
                 }
             }

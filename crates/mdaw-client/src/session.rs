@@ -10,7 +10,7 @@ use mdaw_dsp::pocket;
 use mdaw_engine::{Engine, clock, flac};
 use mdaw_model::{
     ActorId, BlobHash, BuiltinKind, Device, DeviceKind, EntityRef, IdGen, Op, Project, Scope, TempoMap,
-    TempoPoint, Tick, TickRange, TrackContent, TrackId, TrackShell, UserId, apply, apply_all,
+    TempoPoint, Tick, TickRange, TrackContent, TrackId, TrackShell, UserId, apply, apply_all, fit_name,
 };
 use mdaw_net::{ClockEstimate, JoinInfo};
 use mdaw_proto::{
@@ -222,6 +222,9 @@ struct Remote {
     transport: TransportState,
     /// The server spoke about the transport since it was last looked at.
     transport_heard: bool,
+    /// The state the server gave last, with the tempo of the document at that point. While the
+    /// tempo is that again, the state holds as it is.
+    said: Option<(TransportState, TempoMap)>,
     /// Requests for the shared transport the server has not answered yet. While there are
     /// any, what it says is older than what this client asked for.
     transport_asked: u32,
@@ -316,6 +319,7 @@ impl Session {
             clock: None,
             transport,
             transport_heard: true,
+            said: None,
             transport_asked: 0,
             applied: None,
             stale,
@@ -632,10 +636,15 @@ impl Session {
         };
         let now = clock::now_micros() + offset;
         if before != self.tempo && !heard {
-            // The tempo changed under a running transport. The server will say where that
-            // leaves the playhead; until then, and for an edit of our own that the server has
-            // yet to see, the answer is: where it is now.
-            remote.transport = remote.transport.reanchored(now, &before);
+            remote.transport = match &remote.said {
+                // Back to the tempo the server's last word was given under, as when an edit of
+                // the tempo is refused: that word holds again.
+                Some((state, tempo)) if *tempo == self.tempo && remote.transport_asked == 0 => *state,
+                // The tempo changed under a running transport. The server will say where that
+                // leaves the playhead; until then, and for an edit of our own that the server has
+                // yet to see, the answer is: where it is now.
+                _ => remote.transport.reanchored(now, &before),
+            };
         }
         let state = remote.transport;
         let follow = |engine: &mut Engine, fresh| {
@@ -906,14 +915,18 @@ impl Session {
         };
         let restore = restore_tempo && plan.conflict;
         let rendered = if restore { &plan.restored } else { &plan.as_is };
+        // Worked out from the tempo as it is now, not as it was when the dialog opened: someone
+        // may have changed it again while the samples were listened to.
+        let project_fix = match self.replica.workspace(plan.track) {
+            Some(workspace) if restore => {
+                checkout::tempo_fix(&self.replica.confirmed().tempo, &workspace.base_tempo)
+            }
+            _ => Vec::new(),
+        };
         let request = CommitRequest {
             track: plan.track,
             ops: plan.ops.clone(),
-            project_fix: if restore {
-                plan.restore_tempo.clone()
-            } else {
-                Vec::new()
-            },
+            project_fix,
             stem: None,
             entry: ChangelogEntry {
                 summary: summary.trim().to_string(),
@@ -1011,7 +1024,7 @@ impl Session {
             None => view.track_order.last().copied(),
         };
         let shell = TrackShell {
-            name: format!("{} (fork)", fork.shell.name),
+            name: fit_name(&fork.shell.name, " (fork)"),
             color: fork.shell.color,
         };
         let op = Op::TrackAdd {
@@ -1403,6 +1416,7 @@ impl Session {
                     match self.replica.resync(actor, head_seq, sync, acked) {
                         Ok(resend) => {
                             remote.status = Status::Online;
+                            remote.said = Some((transport, self.replica.confirmed().tempo_map()));
                             let reloaded = std::mem::take(&mut remote.desynced);
                             for txn in resend {
                                 remote.link.send(epoch, ClientMsg::Submit(txn));
@@ -1442,6 +1456,7 @@ impl Session {
                     if remote.transport_asked == 0 {
                         remote.transport = state;
                         remote.transport_heard = true;
+                        remote.said = Some((state, self.replica.confirmed().tempo_map()));
                     }
                 }
                 LinkEvent::Msg(_) if remote.desynced => {}

@@ -16,7 +16,9 @@ pub use doc::{
     BuiltinKind, Checkout, Clip, Device, DeviceKind, Note, Project, Stem, Track, TrackContent, TrackShell,
 };
 pub use ids::{ActorId, BlobHash, ClipId, DeviceId, EntityId, IdGen, NoteId, TempoId, TrackId, UserId};
-pub use op::{ClipProp, EntityRef, Invalid, MixProp, NoteProp, Op, PropKey, Scope, ShellProp};
+pub use op::{
+    ClipProp, EntityRef, Invalid, MAX_NAME_BYTES, MixProp, NoteProp, Op, PropKey, Scope, ShellProp, fit_name,
+};
 pub use time::{
     DEFAULT_MILLI_BPM, MAX_MILLI_BPM, MAX_TICK, MIN_MILLI_BPM, PPQ, TICKS_PER_BAR, TempoMap, TempoPoint,
     Tick, TickRange,
