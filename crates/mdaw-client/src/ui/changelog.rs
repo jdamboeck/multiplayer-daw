@@ -2,7 +2,7 @@
 //! else's concurrent edit with a way back, and forks of checkouts that were ended.
 
 use egui::{Button, RichText, Ui};
-use mdaw_model::{ClipProp, EntityRef, MixProp, NoteProp, Op, Project, PropKey, ShellProp};
+use mdaw_model::{ClipProp, EntityRef, MixProp, NoteProp, Op, Project, PropKey, ShellProp, TrackId};
 use mdaw_proto::{ReleaseReason, Superseded};
 
 use super::checkout::sample_button;
@@ -11,8 +11,11 @@ use crate::session::{Displaced, LogEntry, Logged};
 use crate::{DawApp, theme};
 
 pub fn toolbar(app: &mut DawApp, ui: &mut Ui) {
-    let count = app.session.displaced().len() + app.session.log().len();
-    let text = match count {
+    ui.selectable_value(&mut app.changelog_all, false, "Selected track")
+        .on_hover_text("Only what happened to the track selected in the arrangement");
+    ui.selectable_value(&mut app.changelog_all, true, "Whole project");
+    ui.separator();
+    let text = match rows(app).len() {
         0 => "Nothing yet".to_string(),
         1 => "1 entry".to_string(),
         n => format!("{n} entries"),
@@ -33,25 +36,80 @@ impl Row {
             Row::Displaced(entry) => entry.seq,
         }
     }
+
+    fn wall_ts(&self) -> u64 {
+        match self {
+            Row::Log(entry) => entry.wall_ts,
+            Row::Displaced(entry) => entry.wall_ts,
+        }
+    }
+
+    /// The track the line is about; `None` for the tempo and other project settings.
+    fn track(&self) -> Option<TrackId> {
+        match self {
+            Row::Log(entry) => Some(entry.what.track()),
+            Row::Displaced(entry) => entry.lost.entity.track(),
+        }
+    }
 }
+
+/// The lines to show, newest first; within one event, in the order recorded.
+fn rows(app: &DawApp) -> Vec<Row> {
+    let mut rows: Vec<Row> = app.session.log().iter().cloned().map(Row::Log).collect();
+    rows.extend(app.session.displaced().iter().cloned().map(Row::Displaced));
+    if !app.changelog_all {
+        rows.retain(|row| row.track().is_some_and(|track| Some(track) == app.sel.track));
+    }
+    rows.reverse();
+    rows.sort_by_key(|row| std::cmp::Reverse(row.seq()));
+    rows
+}
+
+/// When something happened, in local time: the time of day for today, the date as well before.
+pub fn when(wall_ts: u64) -> (String, String) {
+    use chrono::{Datelike, Local, TimeZone};
+    let Some(at) = Local.timestamp_millis_opt(wall_ts as i64).single() else {
+        return (String::new(), String::new());
+    };
+    let now = Local::now();
+    let short = if at.date_naive() == now.date_naive() {
+        at.format("%H:%M:%S").to_string()
+    } else if at.year() == now.year() {
+        at.format("%b %-d, %H:%M").to_string()
+    } else {
+        at.format("%Y-%m-%d %H:%M").to_string()
+    };
+    (short, at.format("%A, %Y-%m-%d %H:%M:%S").to_string())
+}
+
+/// Room for the longest time label, "2025-11-11 14:32".
+const TIME_WIDTH: f32 = 130.0;
 
 pub fn show(app: &mut DawApp, ui: &mut Ui) {
     let forks = app.session.forks().to_vec();
-    if app.session.displaced().is_empty() && app.session.log().is_empty() && forks.is_empty() {
+    let rows = rows(app);
+    if rows.is_empty() && forks.is_empty() {
+        let project = app.session.project();
+        let hint = match app.sel.track.and_then(|id| project.track(id)) {
+            _ if app.changelog_all => {
+                "Commits of checked-out tracks are listed here, with samples to listen to.\n\
+                 When two people change the same thing at the same moment, the last change wins;\n\
+                 the one that lost is listed here too and can be brought back."
+                    .to_string()
+            }
+            Some(track) => format!(
+                "Nothing has happened to \"{}\" yet.\nCommits, checkouts and edits that lost against \
+                 someone else's are listed here.",
+                track.shell.name
+            ),
+            None => "Select a track to see what happened to it, or show the whole project.".to_string(),
+        };
         ui.centered_and_justified(|ui| {
-            let hint = "Commits of checked-out tracks are listed here, with samples to listen to.\n\
-                        When two people change the same thing at the same moment, the last change wins;\n\
-                        the one that lost is listed here too and can be brought back.";
             ui.label(RichText::new(hint).color(theme::TEXT_DIM));
         });
         return;
     }
     let project = app.session.project().clone();
-    let mut rows: Vec<Row> = app.session.log().iter().cloned().map(Row::Log).collect();
-    rows.extend(app.session.displaced().iter().cloned().map(Row::Displaced));
-    // Newest first; within one event, in the order recorded.
-    rows.reverse();
-    rows.sort_by_key(|row| std::cmp::Reverse(row.seq()));
 
     let mut restore = None;
     let mut play = None;
@@ -86,6 +144,16 @@ pub fn show(app: &mut DawApp, ui: &mut Ui) {
             let first = last_seq != Some(row.seq());
             last_seq = Some(row.seq());
             ui.horizontal_wrapped(|ui| {
+                let (short, long) = when(row.wall_ts());
+                // Lines of one event share its time; show it once.
+                let shown = if first { short } else { String::new() };
+                let size = egui::vec2(TIME_WIDTH, ui.spacing().interact_size.y);
+                let layout = egui::Layout::left_to_right(egui::Align::Center);
+                ui.allocate_ui_with_layout(size, layout, |ui| {
+                    ui.set_min_width(TIME_WIDTH);
+                    let text = RichText::new(shown).monospace().color(theme::TEXT_DIM);
+                    ui.label(text).on_hover_text(long);
+                });
                 match row {
                     Row::Displaced(entry) => {
                         let possible = app.session.can_restore(&entry.lost);
@@ -254,4 +322,19 @@ fn value(op: &Op) -> Option<String> {
 fn pitch_name(pitch: u8) -> String {
     const NAMES: [&str; 12] = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
     format!("{}{}", NAMES[pitch as usize % 12], pitch as i32 / 12 - 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::when;
+
+    #[test]
+    fn times_say_as_much_as_they_need() {
+        let now = chrono::Utc::now().timestamp_millis() as u64;
+        let (today, long) = when(now);
+        assert_eq!(today.len(), 8, "only the time of day: {today}");
+        assert!(long.contains(&today));
+        let (old, _) = when(1_577_000_000_000); // December 2019
+        assert!(old.starts_with("2019-12-"), "{old}");
+    }
 }

@@ -26,6 +26,7 @@ quinn.workspace = true
 tokio.workspace = true
 eframe.workspace = true
 egui.workspace = true
+chrono.workspace = true
 
 [dev-dependencies]
 egui_kittest = { workspace = true, features = ["wgpu"] }

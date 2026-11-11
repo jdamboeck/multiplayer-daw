@@ -59,6 +59,8 @@ pub struct Displaced {
     pub seq: u64,
     /// Who made the edit that won.
     pub by: UserId,
+    /// Server wall clock of that event, milliseconds since the Unix epoch.
+    pub wall_ts: u64,
     pub lost: Superseded,
 }
 
@@ -71,6 +73,16 @@ pub struct LogEntry {
     /// Server wall clock, milliseconds since the Unix epoch.
     pub wall_ts: u64,
     pub what: Logged,
+}
+
+impl Logged {
+    pub fn track(&self) -> TrackId {
+        match self {
+            Logged::Checkout { track } | Logged::Commit { track, .. } | Logged::Release { track, .. } => {
+                *track
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1529,11 +1541,16 @@ fn notice(notices: &mut Vec<String>, text: &str) {
 }
 
 fn record_displaced(displaced: &mut Vec<Displaced>, event: Event) {
-    let (seq, by) = (event.seq, event.user);
+    let (seq, by, wall_ts) = (event.seq, event.user, event.wall_ts);
     let EventBody::Txn { superseded, .. } = event.body else {
         return;
     };
-    displaced.extend(superseded.into_iter().map(|lost| Displaced { seq, by, lost }));
+    displaced.extend(superseded.into_iter().map(|lost| Displaced {
+        seq,
+        by,
+        wall_ts,
+        lost,
+    }));
     if displaced.len() > MAX_DISPLACED {
         displaced.drain(..displaced.len() - MAX_DISPLACED);
     }

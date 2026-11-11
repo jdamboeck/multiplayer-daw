@@ -50,6 +50,8 @@ pub struct DawApp {
     pub commit: Option<checkout::CommitDialog>,
     /// A track whose checkout by someone else the user asked to end, awaiting confirmation.
     pub confirm_force: Option<TrackId>,
+    /// The changelog lists the whole project rather than the selected track.
+    pub changelog_all: bool,
 }
 
 impl DawApp {
@@ -72,6 +74,7 @@ impl DawApp {
             editing: None,
             commit: None,
             confirm_force: None,
+            changelog_all: false,
         }
     }
 
@@ -214,10 +217,11 @@ impl DawApp {
         }
     }
 
-    /// Undo, redo and remote edits can remove what was selected.
+    /// Undo, redo and remote edits can remove what was selected. A track stays selected while
+    /// there is one, so the views that follow it, such as the changelog, have something to show.
     fn drop_stale_selection(&mut self) {
         let project = self.session.project();
-        if self.sel.track.is_some_and(|id| project.track(id).is_none()) {
+        if self.sel.track.is_none_or(|id| project.track(id).is_none()) {
             self.sel.track = project.ordered_tracks().next().map(|(id, _)| id);
         }
         let clip = self

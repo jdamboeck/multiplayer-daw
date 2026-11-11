@@ -274,6 +274,7 @@ fn a_lost_edit_is_listed_and_comes_back_with_one_click() {
     assert_eq!(pitch(&ann), 65);
 
     // Both changelogs say what happened, each from its own point of view.
+    // The changelog follows the selected track, which is the only one.
     for h in [&mut ann, &mut ben] {
         h.get_by_label("Changelog").click();
         h.run_steps(3);
@@ -286,6 +287,14 @@ fn a_lost_edit_is_listed_and_comes_back_with_one_click() {
         &ben,
         "ann: pitch D4 for a note on \"Track 1\", overwritten by you"
     ));
+
+    // A new track has nothing in it yet; the whole project still has the line.
+    ben.get_by_label("+ Track").click();
+    ben.run_steps(3);
+    assert!(shows(&ben, "Nothing has happened to \"Track 2\" yet"));
+    ben.get_by_label("Whole project").click();
+    ben.run_steps(3);
+    assert!(shows(&ben, "overwritten by you"));
 
     // Ben gives ann her note back.
     ben.get_by_label("Restore").click();
@@ -378,6 +387,8 @@ fn a_track_is_checked_out_committed_and_heard_through_the_window() {
     assert!(shows(&ben, "Check out"), "the track is free again");
 
     ben.get_by_label("Changelog").click();
+    ben.run_steps(2);
+    ben.get_by_label("Whole project").click();
     ben.run_steps(3);
     assert!(shows(&ben, "ann committed \"Track 1\""));
     ben.get_by_label_contains("Track alone").click();
@@ -542,6 +553,8 @@ fn screenshots() {
         b.session.locked_by(&the_clip).is_some()
     });
     ben.get_by_label("Changelog").click();
+    ben.run_steps(2);
+    ben.get_by_label("Whole project").click();
     ben.run_steps(3);
     ben.render()
         .expect("render")
@@ -572,4 +585,17 @@ fn screenshots() {
             .save(format!("{shots}/{name}.png"))
             .expect("save");
     }
+
+    // Ann commits and reads the changelog of the track she has selected.
+    ann.get_by_label("Commit").click();
+    until(&mut ann, &mut ben, "the commit lands", |_, b| {
+        b.session.checkout_owner(track).is_none()
+    });
+    settle(&mut ann, &mut ben);
+    ann.get_by_label("Changelog").click();
+    ann.run_steps(3);
+    ann.render()
+        .expect("render")
+        .save(format!("{shots}/changelog-ann.png"))
+        .expect("save");
 }
