@@ -182,6 +182,21 @@ impl Store {
         Ok(ActorId(next))
     }
 
+    /// Records the start of a run of the server: the last actor handed out before it, and the head
+    /// of the log it started with. Returns every run so far, this one included, oldest first.
+    pub fn start_run(&self, head: u64) -> Result<Vec<Run>> {
+        let mut runs: Vec<Run> = match self.meta("runs")? {
+            Some(bytes) => postcard::from_bytes(&bytes).context("stored runs")?,
+            None => Vec::new(),
+        };
+        runs.push(Run {
+            last_actor: self.last_actor()?,
+            head,
+        });
+        self.set_meta_durably("runs", &postcard::to_stdvec(&runs)?)?;
+        Ok(runs)
+    }
+
     /// The actor ID handed out last, `ActorId(0)` if none was.
     pub fn last_actor(&self) -> Result<ActorId> {
         Ok(ActorId(match self.meta("last_actor")? {
@@ -189,4 +204,14 @@ impl Store {
             None => 0,
         }))
     }
+}
+
+/// One start of the server.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+pub struct Run {
+    /// Actors up to this one were handed out before the run.
+    pub last_actor: ActorId,
+    /// The head of the log when the run began. Events after it that clients of earlier runs
+    /// received may have been lost in a crash, and others written under their seqs.
+    pub head: u64,
 }

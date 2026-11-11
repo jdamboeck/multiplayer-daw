@@ -84,6 +84,11 @@ pub async fn write_frame<T: Framed>(stream: &mut SendStream, msg: &T) -> Result<
 ///
 /// Not cancel safe: a frame read half is lost with the future.
 pub async fn read_frame<T: Framed>(stream: &mut RecvStream) -> Result<Option<T>> {
+    Ok(read_frame_sized(stream).await?.map(|(msg, _)| msg))
+}
+
+/// As [`read_frame`], with the size of the frame's payload in bytes.
+pub async fn read_frame_sized<T: Framed>(stream: &mut RecvStream) -> Result<Option<(T, usize)>> {
     let mut header = [0u8; 4];
     let mut filled = 0;
     while filled < header.len() {
@@ -98,7 +103,7 @@ pub async fn read_frame<T: Framed>(stream: &mut RecvStream) -> Result<Option<T>>
         .read_exact(&mut payload)
         .await
         .context("the stream ended inside a frame")?;
-    Ok(Some(mdaw_proto::decode(&payload)?))
+    Ok(Some((mdaw_proto::decode(&payload)?, payload.len())))
 }
 
 /// Sends a datagram. It may never arrive; that it could not even be queued is not reported

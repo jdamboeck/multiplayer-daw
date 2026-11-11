@@ -2654,6 +2654,7 @@ dependencies = [
  "proptest",
  "quinn",
  "rusqlite",
+ "serde",
  "tempfile",
  "tokio",
 ]

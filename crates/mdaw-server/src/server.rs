@@ -6,7 +6,7 @@ use crate::hub::{Hub, Sink};
 use crate::store::Store;
 use anyhow::{Context, Result, bail};
 use mdaw_model::ActorId;
-use mdaw_net::{Identity, JoinInfo, read_frame, write_frame};
+use mdaw_net::{Identity, JoinInfo, read_frame, read_frame_sized, write_frame};
 use mdaw_proto::{BlobAnswer, BlobRequest, ClientMsg, Datagram, Hello, MAX_BLOB, RefuseReason, ServerMsg};
 use quinn::{Connection, Endpoint, VarInt};
 use std::net::SocketAddr;
@@ -19,8 +19,9 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
 /// Messages a client may have waiting to be written before it counts as too slow.
 const OUTBOX: usize = 4096;
-/// Messages of one client the project thread may have waiting.
-const QUEUED_PER_CLIENT: usize = 256;
+/// Bytes of one client's messages the project thread may have waiting, in KiB. Every message
+/// counts at least 1 KiB, so this also bounds their number.
+const QUEUED_KIB_PER_CLIENT: usize = 64 << 10;
 /// Blob transfers of one client at a time; each holds its blob in memory.
 const BLOBS_PER_CLIENT: usize = 4;
 
@@ -234,10 +235,11 @@ async fn serve(
     };
     // A client that sends faster than the project thread handles its messages waits here, and
     // QUIC's flow control slows it down; the queue does not grow.
-    let queue = Arc::new(Semaphore::new(QUEUED_PER_CLIENT));
+    let queue = Arc::new(Semaphore::new(QUEUED_KIB_PER_CLIENT));
     let reader = async {
-        while let Some(msg) = read_frame::<ClientMsg>(&mut recv).await? {
-            let queued = queue.clone().acquire_owned().await?;
+        while let Some((msg, len)) = read_frame_sized::<ClientMsg>(&mut recv).await? {
+            let kib = (len >> 10).clamp(1, QUEUED_KIB_PER_CLIENT) as u32;
+            let queued = queue.clone().acquire_many_owned(kib).await?;
             if commands
                 .send(Command::Msg {
                     actor,

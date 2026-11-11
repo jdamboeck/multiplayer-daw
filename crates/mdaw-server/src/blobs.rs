@@ -82,6 +82,11 @@ impl Blobs {
                         return Err(err).context("writing a blob");
                     }
                     std::fs::rename(&part, &path).context("storing a blob")?;
+                    // The new name is on disk too before the upload is answered `Stored`.
+                    #[cfg(unix)]
+                    std::fs::File::open(dir)
+                        .and_then(|dir| dir.sync_all())
+                        .context("storing a blob")?;
                 }
             }
             Inner::Memory(map) => {

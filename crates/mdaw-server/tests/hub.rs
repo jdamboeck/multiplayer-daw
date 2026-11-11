@@ -439,6 +439,50 @@ fn events_lost_in_a_crash_are_not_taken_for_their_replacements() {
 }
 
 #[test]
+fn events_lost_in_a_crash_stay_lost_through_later_restarts() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("project.db");
+    let open = || Hub::open(Store::open(&path).unwrap(), Blobs::in_memory()).unwrap();
+    let mut hub = open();
+    let (ann, _, ann_welcome) = join(&mut hub, 1);
+    for n in 1..=5 {
+        hub.submit(ann, rename(n));
+    }
+    drop(hub);
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute("DELETE FROM events WHERE seq > 2", []).unwrap();
+    drop(db);
+
+    // Ann stays away while the server runs again, writes more, and is restarted cleanly.
+    let mut hub = open();
+    let (ben, _, ben_welcome) = join(&mut hub, 2);
+    for n in 10..=20 {
+        hub.submit(ben, rename(n));
+    }
+    drop(hub);
+    let mut hub = open();
+    assert_eq!(hub.head(), 13);
+
+    // Ann's 3 to 5 are still not the server's.
+    let resume = Resume {
+        prev_actor: ann,
+        session_secret: ann_welcome.session_secret,
+        last_seq: 5,
+    };
+    let (_, _, welcome) = rejoin(&mut hub, 1, Some(resume));
+    assert!(matches!(welcome.sync, SyncData::Snapshot(_)));
+
+    // Ben, of the run between, had nothing that was lost, and catches up as usual.
+    let resume = Resume {
+        prev_actor: ben,
+        session_secret: ben_welcome.session_secret,
+        last_seq: 13,
+    };
+    let (_, _, welcome) = rejoin(&mut hub, 2, Some(resume));
+    assert!(matches!(welcome.sync, SyncData::Events(e) if e.is_empty()));
+}
+
+#[test]
 fn a_store_in_another_format_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("project.db");

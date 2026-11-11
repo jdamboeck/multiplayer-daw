@@ -4,6 +4,7 @@
 use crate::blobs::Blobs;
 use crate::clock::Clock;
 use crate::sequencer::Sequencer;
+use crate::store::Run;
 use crate::store::Store;
 use anyhow::{Context, Result};
 use mdaw_model::{ActorId, DEFAULT_MILLI_BPM, IdGen, Op, Project, TempoPoint, Tick, TrackId, UserId, apply};
@@ -52,11 +53,8 @@ pub struct Hub {
     /// `last_txn` of connections that have ended, for when their clients resume.
     departed: HashMap<ActorId, Option<u64>>,
     snapshot_seq: u64,
-    /// Actors up to this one connected before the server last started.
-    earlier_run: ActorId,
-    /// The head of the log when the server started. Events after it that clients of the run
-    /// before had received may have been lost in a crash, and others written under their seq.
-    opened_at: u64,
+    /// Every start of the server, oldest first.
+    runs: Vec<Run>,
     clock: Clock,
     /// The shared transport. Lives as long as the process.
     transport: TransportState,
@@ -105,7 +103,7 @@ impl Hub {
             at = last;
         }
         let recent = store.events_after(head.saturating_sub(4096), 4096)?;
-        let earlier_run = store.last_actor()?;
+        let runs = store.start_run(head)?;
         let clock = Clock::new();
         // After a restart every owner gets a full lease to come back.
         let leases = doc
@@ -127,8 +125,7 @@ impl Hub {
             blobs,
             leases,
             stale: Vec::new(),
-            earlier_run,
-            opened_at: head,
+            runs,
         })
     }
 
@@ -178,7 +175,11 @@ impl Hub {
         let head = self.seq.head();
 
         let resume = hello.resume.filter(|r| {
-            let lost = r.prev_actor <= self.earlier_run && r.last_seq > self.opened_at;
+            // A client of an earlier run claims to have events that a later start did not find.
+            let lost = self
+                .runs
+                .iter()
+                .any(|run| r.prev_actor <= run.last_actor && r.last_seq > run.head);
             r.session_secret == self.secret(r.prev_actor) && r.last_seq <= head && !lost
         });
         let mut history = Vec::new();
