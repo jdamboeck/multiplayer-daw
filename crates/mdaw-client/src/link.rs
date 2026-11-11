@@ -57,6 +57,8 @@ pub enum LinkEvent {
         hash: BlobHash,
         bytes: Option<Arc<[u8]>>,
     },
+    /// A message too large for the server to accept; it was not sent.
+    TooLarge(ClientMsg),
 }
 
 enum Out {
@@ -295,11 +297,19 @@ impl Task {
         let writing = async {
             loop {
                 match out.recv().await {
-                    Some(Out::Msg(for_epoch, msg)) if for_epoch == epoch => {
-                        if let Err(err) = mdaw_net::write_frame(&mut send, &msg).await {
-                            return End::Lost(format!("{err:#}"));
+                    Some(Out::Msg(for_epoch, msg)) if for_epoch == epoch => match mdaw_proto::encode(&msg) {
+                        Ok(frame) => {
+                            if let Err(err) = send.write_all(&frame).await {
+                                return End::Lost(format!("{err:#}"));
+                            }
                         }
-                    }
+                        // Sending it again would not make it smaller: hand it back.
+                        Err(mdaw_proto::FrameError::TooLong(..)) => {
+                            let _ = events.send(LinkEvent::TooLarge(msg));
+                            waker();
+                        }
+                        Err(err) => return End::Lost(format!("{err:#}")),
+                    },
                     // Meant for a connection that is gone; its sender has been told to resend.
                     Some(Out::Msg(..)) => {}
                     // Blobs travel on streams of their own, so they never hold up the rest.

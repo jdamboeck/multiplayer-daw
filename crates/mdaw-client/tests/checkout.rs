@@ -404,3 +404,55 @@ fn the_fork_survives_the_removal_of_its_track() {
     settle(&mut [&mut ann, &mut ben]);
     assert_eq!(ben.project().tracks.len(), 1, "back as a new track");
 }
+
+#[test]
+fn an_edit_too_large_to_send_is_taken_back_and_the_connection_stays() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = server(dir.path());
+    let mut ann = join(&server, "ann");
+    let mut ben = join(&server, "ben");
+    // A track of 40 full clips: over 16 MiB once encoded, but within every limit of the model.
+    let ids = ann.ids();
+    let track = ids.track();
+    let mut content = TrackContent::default();
+    for c in 0..40 {
+        let notes = (0..50_000)
+            .map(|n| {
+                let note = Note {
+                    start: Tick(n),
+                    dur: Tick(1_000_000),
+                    pitch: 127,
+                    vel: 127,
+                };
+                (ids.note(), note)
+            })
+            .collect();
+        let clip = Clip {
+            start: Tick::bars(c),
+            length: Tick::bars(1),
+            name: String::new(),
+            notes,
+        };
+        content.clips.insert(ids.clip(), Arc::new(clip));
+    }
+    let shell = TrackShell {
+        name: "huge".into(),
+        color: 0,
+    };
+    assert!(ann.edit(vec![Op::TrackAdd {
+        id: track,
+        shell,
+        content,
+        after: None,
+    }]));
+    until(&mut [&mut ann, &mut ben], "the edit is taken back", |s| {
+        s[0].project().tracks.is_empty() && s[0].unconfirmed() == 0
+    });
+    assert!(ann.notices().iter().any(|n| n.contains("too large")));
+    assert_eq!(ann.status(), Status::Online, "the connection is still up");
+
+    // And it still works.
+    add_track(&mut ann);
+    settle(&mut [&mut ann, &mut ben]);
+    assert_eq!(ben.project().tracks.len(), 1);
+}

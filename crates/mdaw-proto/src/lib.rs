@@ -11,9 +11,9 @@ use serde::{Deserialize, Serialize};
 
 pub use transport::{Datagram, MAX_LAG_MICROS, MAX_LEAD_MICROS, START_LEAD_MICROS, TransportState};
 pub use wire::{
-    ALPN, BlobAnswer, BlobRequest, ClientMsg, CommitRequest, FrameError, Hello, MAX_BLOB, MAX_FRAME, Peer,
-    Presence, RefuseReason, RejectReason, Request, Resume, ServerMsg, SyncData, Welcome, decode, encode,
-    payload_len,
+    ALPN, BlobAnswer, BlobRequest, ClientMsg, CommitRequest, FrameError, Framed, Hello, MAX_BLOB, MAX_FRAME,
+    MAX_SERVER_FRAME, Peer, Presence, RefuseReason, RejectReason, Request, Resume, ServerMsg, SyncData,
+    Welcome, decode, encode, payload_len,
 };
 
 /// Bumped on every incompatible change to the wire format or to the meaning of an op.

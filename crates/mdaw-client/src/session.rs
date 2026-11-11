@@ -271,7 +271,8 @@ impl Session {
                     LinkEvent::Msg(_)
                     | LinkEvent::Clock(_)
                     | LinkEvent::Stored { .. }
-                    | LinkEvent::Fetched { .. },
+                    | LinkEvent::Fetched { .. }
+                    | LinkEvent::TooLarge(_),
                 ) => {}
                 None => bail!("could not join: the server did not answer"),
             }
@@ -1471,6 +1472,27 @@ impl Session {
                 }) => {
                     self.replica.on_rejected(client_txn_id);
                     notice(&mut self.notices, &format!("An edit was not accepted: {reason}."));
+                }
+                LinkEvent::TooLarge(ClientMsg::Submit(txn)) => {
+                    self.replica.on_rejected(txn.client_txn_id);
+                    notice(
+                        &mut self.notices,
+                        "An edit was too large to send and has been taken back.",
+                    );
+                }
+                LinkEvent::TooLarge(ClientMsg::Commit(request)) => {
+                    if self.commit.as_ref().is_some_and(|c| c.track == request.track) {
+                        self.commit = None;
+                    }
+                    self.replica.cancel_commit(request.track);
+                    let mb = mdaw_proto::MAX_FRAME >> 20;
+                    let text = format!(
+                        "The commit is larger than the {mb} MiB the server takes. The track stays checked out."
+                    );
+                    notice(&mut self.notices, &text);
+                }
+                LinkEvent::TooLarge(_) => {
+                    notice(&mut self.notices, "A message was too large to send.");
                 }
                 LinkEvent::Msg(ServerMsg::Peers(peers)) => remote.set_peers(peers),
                 LinkEvent::Msg(ServerMsg::Presence { actor, presence }) => {

@@ -11,11 +11,9 @@ pub use tls::Identity;
 
 use anyhow::{Context, Result, bail};
 use mdaw_model::BlobHash;
-use mdaw_proto::{ALPN, BlobAnswer, BlobRequest, Datagram, MAX_BLOB, payload_len};
+use mdaw_proto::{ALPN, BlobAnswer, BlobRequest, Datagram, Framed, MAX_BLOB, payload_len};
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{Connection, Endpoint, RecvStream, SendStream, TransportConfig, VarInt};
-use serde::Serialize;
-use serde::de::DeserializeOwned;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -76,7 +74,7 @@ pub async fn close(endpoint: &Endpoint, connection: &Connection) {
 }
 
 /// Writes one frame.
-pub async fn write_frame<T: Serialize>(stream: &mut SendStream, msg: &T) -> Result<()> {
+pub async fn write_frame<T: Framed>(stream: &mut SendStream, msg: &T) -> Result<()> {
     let frame = mdaw_proto::encode(msg)?;
     stream.write_all(&frame).await?;
     Ok(())
@@ -85,7 +83,7 @@ pub async fn write_frame<T: Serialize>(stream: &mut SendStream, msg: &T) -> Resu
 /// Reads one frame. `None` when the peer finished the stream at a frame boundary.
 ///
 /// Not cancel safe: a frame read half is lost with the future.
-pub async fn read_frame<T: DeserializeOwned>(stream: &mut RecvStream) -> Result<Option<T>> {
+pub async fn read_frame<T: Framed>(stream: &mut RecvStream) -> Result<Option<T>> {
     let mut header = [0u8; 4];
     let mut filled = 0;
     while filled < header.len() {
@@ -95,7 +93,7 @@ pub async fn read_frame<T: DeserializeOwned>(stream: &mut RecvStream) -> Result<
             None => bail!("the stream ended inside a frame"),
         }
     }
-    let mut payload = vec![0u8; payload_len(header)?];
+    let mut payload = vec![0u8; payload_len::<T>(header)?];
     stream
         .read_exact(&mut payload)
         .await

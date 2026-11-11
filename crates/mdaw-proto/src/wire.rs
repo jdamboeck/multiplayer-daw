@@ -14,8 +14,25 @@ use std::fmt;
 /// ALPN protocol name of the QUIC connection.
 pub const ALPN: &[u8] = b"mdaw/0";
 
-/// Largest frame either side accepts.
+/// Largest frame a client may send, and the server accepts. Every event derives from one such
+/// message, so this bounds the size of an event too.
 pub const MAX_FRAME: usize = 16 << 20;
+
+/// Largest frame the server sends, and a client accepts: a snapshot of the whole project, or a
+/// catch-up made of many events. The server is the one a client chose to trust.
+pub const MAX_SERVER_FRAME: usize = 256 << 20;
+
+/// A message that travels as one frame, with the largest size accepted for it.
+pub trait Framed: Serialize + DeserializeOwned {
+    const MAX: usize = MAX_FRAME;
+}
+
+impl Framed for ClientMsg {}
+impl Framed for BlobRequest {}
+impl Framed for BlobAnswer {}
+impl Framed for ServerMsg {
+    const MAX: usize = MAX_SERVER_FRAME;
+}
 
 /// Largest blob either side accepts.
 pub const MAX_BLOB: u64 = 256 << 20;
@@ -282,15 +299,15 @@ impl fmt::Display for RejectReason {
 
 #[derive(Debug)]
 pub enum FrameError {
-    /// Longer than [`MAX_FRAME`].
-    TooLong(usize),
+    /// Longer than the limit of its message type, which is the second field.
+    TooLong(usize, usize),
     Codec(postcard::Error),
 }
 
 impl fmt::Display for FrameError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            FrameError::TooLong(len) => write!(f, "frame of {len} bytes exceeds the limit of {MAX_FRAME}"),
+            FrameError::TooLong(len, max) => write!(f, "frame of {len} bytes exceeds the limit of {max}"),
             FrameError::Codec(e) => write!(f, "malformed frame: {e}"),
         }
     }
@@ -299,11 +316,11 @@ impl fmt::Display for FrameError {
 impl std::error::Error for FrameError {}
 
 /// Encodes `msg` as one frame, length prefix included.
-pub fn encode<T: Serialize>(msg: &T) -> Result<Vec<u8>, FrameError> {
+pub fn encode<T: Framed>(msg: &T) -> Result<Vec<u8>, FrameError> {
     let frame = postcard::to_extend(msg, vec![0u8; 4]).map_err(FrameError::Codec)?;
     let len = frame.len() - 4;
-    if len > MAX_FRAME {
-        return Err(FrameError::TooLong(len));
+    if len > T::MAX {
+        return Err(FrameError::TooLong(len, T::MAX));
     }
     let mut frame = frame;
     frame[..4].copy_from_slice(&(len as u32).to_le_bytes());
@@ -311,10 +328,10 @@ pub fn encode<T: Serialize>(msg: &T) -> Result<Vec<u8>, FrameError> {
 }
 
 /// Length of the payload that follows a frame's four header bytes.
-pub fn payload_len(header: [u8; 4]) -> Result<usize, FrameError> {
+pub fn payload_len<T: Framed>(header: [u8; 4]) -> Result<usize, FrameError> {
     let len = u32::from_le_bytes(header) as usize;
-    if len > MAX_FRAME {
-        return Err(FrameError::TooLong(len));
+    if len > T::MAX {
+        return Err(FrameError::TooLong(len, T::MAX));
     }
     Ok(len)
 }
@@ -346,7 +363,7 @@ mod tests {
             }),
         });
         let frame = encode(&msg).unwrap();
-        let len = payload_len(frame[..4].try_into().unwrap()).unwrap();
+        let len = payload_len::<ClientMsg>(frame[..4].try_into().unwrap()).unwrap();
         assert_eq!(len, frame.len() - 4);
         assert_eq!(decode::<ClientMsg>(&frame[4..]).unwrap(), msg);
     }
@@ -382,9 +399,15 @@ mod tests {
     #[test]
     fn bad_frames_are_errors() {
         assert!(matches!(
-            payload_len(u32::MAX.to_le_bytes()),
-            Err(FrameError::TooLong(_))
+            payload_len::<ServerMsg>(u32::MAX.to_le_bytes()),
+            Err(FrameError::TooLong(..))
         ));
+        let between = ((MAX_FRAME + 1) as u32).to_le_bytes();
+        assert!(
+            payload_len::<ClientMsg>(between).is_err(),
+            "too long from a client"
+        );
+        assert!(payload_len::<ServerMsg>(between).is_ok(), "fine from the server");
         let mut frame = encode(&ClientMsg::Presence(Presence::default())).unwrap();
         frame.push(0);
         assert!(decode::<ClientMsg>(&frame[4..]).is_err());

@@ -16,8 +16,11 @@ section here when it is built.
 - Join string: `mdaw://<host>:<port>?fp=<64 hex digits>&token=<secret>`. The token is the session
   secret; everyone who holds it has the same rights.
 - The first bidirectional stream the client opens is the control stream. Each direction is a
-  sequence of frames: a `u32` little-endian length, then that many bytes of postcard. Frames above
-  16 MiB are an error and end the connection.
+  sequence of frames: a `u32` little-endian length, then that many bytes of postcard. A client's
+  frames may be up to 16 MiB, so no event is much larger; the server's up to 256 MiB, for a
+  snapshot or a catch-up. A longer frame is an error and ends the connection. A client does not
+  send a message over its limit: an edit that large is taken back, a commit that large is
+  cancelled, each with a notice, and the connection stays.
 - Every further stream the client opens carries one blob (see "Blobs"). The server serves them
   only after the `Welcome`.
 
@@ -48,7 +51,7 @@ Refused(BadToken | ProtoVersion(server's) | Protocol)      // then the server cl
 - `session_secret` proves on the next connection that the previous one was this client's.
 - `transport` is the shared transport as it is now (see "Clock and transport").
 - `history`, with a snapshot only: the last 200 events the changelog shows (everything but live
-  edits that displaced nothing), so a new client sees recent commits and their samples. Their
+  edits that displaced nothing), as many of the newest as fit in 16 MiB, so a new client sees recent commits and their samples. Their
   effect is in the snapshot already; the client does not apply them.
 - `stale`: the checkouts whose lease ran out (see "Checkout and commit").
 
@@ -56,8 +59,8 @@ Refused(BadToken | ProtoVersion(server's) | Protocol)      // then the server cl
 
 A client that lost its connection sends `resume` with the actor and secret of its last `Welcome`
 and the seq of the last event it received. If the secret fits and the log still reaches back that
-far (at most 5000 events), the server drops the old connection and answers with the missing
-events. Otherwise the answer carries a snapshot, as for a new client.
+far (at most 5000 events, and at most 64 MiB of them), the server drops the old connection and
+answers with the missing events. Otherwise the answer carries a snapshot, as for a new client.
 
 `acked` in the `Welcome` is the highest `client_txn_id` of the previous actor that the server has
 seen, sequenced or rejected. The client drops pending transactions up to that number that the

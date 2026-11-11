@@ -23,6 +23,10 @@ const CATCH_UP_LIMIT: u64 = 5000;
 
 /// Changelog entries a new client gets with the document.
 const HISTORY: usize = 200;
+/// A catch-up of more bytes than this is sent as a snapshot instead.
+const CATCH_UP_BYTES: usize = 64 << 20;
+/// The history sent with a snapshot is cut to this many bytes, oldest first.
+const HISTORY_BYTES: usize = 16 << 20;
 
 /// IDs in the document a new project starts with belong to this actor, which no connection gets.
 const TEMPLATE_ACTOR: ActorId = ActorId(0);
@@ -188,6 +192,19 @@ impl Hub {
         };
         if matches!(sync, SyncData::Snapshot(_)) {
             history = self.seq.history(HISTORY);
+            let mut room = HISTORY_BYTES;
+            let keep = history
+                .iter()
+                .rev()
+                .take_while(|e| match room.checked_sub(encoded_len(e)) {
+                    Some(left) => {
+                        room = left;
+                        true
+                    }
+                    None => false,
+                })
+                .count();
+            history.drain(..history.len() - keep);
         }
 
         self.sessions.insert(
@@ -483,6 +500,11 @@ impl Hub {
                 .events_after(last_seq, CATCH_UP_LIMIT)
                 .expect("reading the event log"),
         };
+        // Large commits make few events many bytes; past the budget a snapshot is smaller.
+        let bytes: usize = events.iter().map(encoded_len).sum();
+        if bytes > CATCH_UP_BYTES {
+            return SyncData::Snapshot(self.seq.doc().clone());
+        }
         SyncData::Events(events)
     }
 
@@ -551,4 +573,8 @@ fn now_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn encoded_len(event: &Event) -> usize {
+    postcard::to_stdvec(event).map_or(usize::MAX, |bytes| bytes.len())
 }
