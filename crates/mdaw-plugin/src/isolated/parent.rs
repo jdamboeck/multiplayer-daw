@@ -8,10 +8,12 @@ use crate::{
 };
 use mdaw_dsp::{BlockTime, ExternalDevice, MAX_BLOCK};
 use std::io::BufReader;
+use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{ChildStdin, Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::time::{Duration, Instant};
 
@@ -64,15 +66,19 @@ impl IsolatedBackend {
 
     /// Asks a helper what `file` holds (`None`: the test synth). A file whose plugin crashes the
     /// helper is passed over.
-    fn scan_one(&self, file: Option<&Path>) -> Vec<PluginInfo> {
+    /// What a file holds, as a helper tells; `None` if the helper could not tell (the plugin
+    /// crashed it, or hung).
+    fn scan_one(&self, file: Option<&Path>) -> Option<Vec<PluginInfo>> {
         let mut command = Command::new(&self.helper);
         command.arg("scan");
         match file {
             Some(file) => command.arg(file),
             None => command.arg("builtin"),
         };
+        let what = file.map_or("the built-in plugins".into(), |f| f.display().to_string());
         let Ok(mut child) = command.stdin(Stdio::null()).stdout(Stdio::piped()).spawn() else {
-            return Vec::new();
+            eprintln!("mdaw: no helper could be started to scan {what}");
+            return None;
         };
         let mut stdout = child.stdout.take().expect("piped");
         let (tx, rx) = channel();
@@ -80,11 +86,10 @@ impl IsolatedBackend {
             let _ = tx.send(protocol::read::<Reply>(&mut stdout));
         });
         let found = match rx.recv_timeout(SCAN) {
-            Ok(Ok(Reply::Scanned(found))) => found,
+            Ok(Ok(Reply::Scanned(found))) => Some(found),
             _ => {
-                let what = file.map_or("the built-in plugins".into(), |f| f.display().to_string());
-                eprintln!("mdaw: {what} could not be scanned; its plugins are left out");
-                Vec::new()
+                eprintln!("mdaw: {what} could not be scanned; its plugins are left out until it changes");
+                None
             }
         };
         let _ = child.kill();
@@ -101,17 +106,52 @@ impl Backend for IsolatedBackend {
     fn scan(&mut self) -> Vec<PluginInfo> {
         let mut found: Vec<(PluginInfo, Option<PathBuf>)> = Vec::new();
         if self.builtin {
-            found.extend(self.scan_one(None).into_iter().map(|p| (p, None)));
+            found.extend(
+                self.scan_one(None)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|p| (p, None)),
+            );
         }
+        // The usual places are scanned once per change of a file, and remembered; a file given
+        // by name is scanned every time.
+        let cached = self.files.is_none();
         let files = self.files.clone().unwrap_or_else(plugin_files);
-        // Each file in a helper of its own, several at once.
-        let results: Vec<_> = std::thread::scope(|scope| {
-            let handles: Vec<_> = files
-                .iter()
-                .map(|file| scope.spawn(|| (file.clone(), self.scan_one(Some(file)))))
-                .collect();
-            handles.into_iter().filter_map(|h| h.join().ok()).collect()
-        });
+        let mut cache = if cached { scan_cache::load() } else { Vec::new() };
+        let mut results: Vec<(PathBuf, Vec<PluginInfo>)> = Vec::new();
+        let mut to_scan = Vec::new();
+        for file in files {
+            let stamp = scan_cache::stamp(&file);
+            match cache.iter().find(|e| e.path == file && Some(e.stamp) == stamp) {
+                Some(entry) => results.push((file, entry.found.clone().unwrap_or_default())),
+                None => to_scan.push((file, stamp)),
+            }
+        }
+        // Each file in a helper of its own, a few at once.
+        let at_once = std::thread::available_parallelism().map_or(4, |n| n.get().min(8));
+        for chunk in to_scan.chunks(at_once) {
+            let scanned: Vec<_> = std::thread::scope(|scope| {
+                let handles: Vec<_> = chunk
+                    .iter()
+                    .map(|(file, stamp)| scope.spawn(|| (file.clone(), *stamp, self.scan_one(Some(file)))))
+                    .collect();
+                handles.into_iter().filter_map(|h| h.join().ok()).collect()
+            });
+            for (file, stamp, infos) in scanned {
+                if let Some(stamp) = stamp {
+                    cache.retain(|e| e.path != file);
+                    cache.push(scan_cache::Entry {
+                        path: file.clone(),
+                        stamp,
+                        found: infos.clone(),
+                    });
+                }
+                results.push((file, infos.unwrap_or_default()));
+            }
+        }
+        if cached {
+            scan_cache::save(&cache);
+        }
         for (file, infos) in results {
             for info in infos {
                 if !found.iter().any(|(p, _)| p.id == info.id) {
@@ -155,20 +195,6 @@ impl Backend for IsolatedBackend {
     }
 }
 
-/// Names the files of shared blocks.
-static BLOCKS: AtomicU64 = AtomicU64::new(0);
-
-fn block_path() -> PathBuf {
-    let dir = Path::new("/dev/shm");
-    let dir = if dir.is_dir() {
-        dir.to_path_buf()
-    } else {
-        std::env::temp_dir()
-    };
-    let n = BLOCKS.fetch_add(1, Ordering::Relaxed);
-    dir.join(format!("mdaw-{}-{n}", std::process::id()))
-}
-
 struct Helper {
     process: std::process::Child,
     stdin: ChildStdin,
@@ -207,12 +233,11 @@ impl IsolatedInstance {
         settings: Settings,
         waker: Option<Waker>,
     ) -> Result<Self, PluginError> {
-        let path = block_path();
-        let shared = Arc::new(Shared::create(&path).map_err(|e| error(format!("a shared block: {e}")))?);
-        let result = Self::spawn(helper, file, id, settings, &path, shared, waker);
-        // Both sides have it mapped, or it is of no use: the name can go.
-        let _ = std::fs::remove_file(&path);
-        result
+        let (shared, memory) = Shared::create().map_err(|e| error(format!("a shared block: {e}")))?;
+        // The helper gets the memory as a descriptor of the same number, and opens it there.
+        let fd = memory.as_raw_fd();
+        Self::spawn(helper, file, id, settings, fd, Arc::new(shared), waker)
+        // `memory` closes here: both sides have it mapped by now, or the start failed.
     }
 
     fn spawn(
@@ -220,14 +245,23 @@ impl IsolatedInstance {
         file: Option<&Path>,
         id: &str,
         settings: Settings,
-        path: &Path,
+        fd: RawFd,
         shared: Arc<Shared>,
         waker: Option<Waker>,
     ) -> Result<Self, PluginError> {
-        let mut process = Command::new(helper)
-            .arg("run")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
+        let mut command = Command::new(helper);
+        command.arg("run").stdin(Stdio::piped()).stdout(Stdio::piped());
+        // SAFETY: only an async-signal-safe call, in the child between fork and exec: the shared
+        // memory, closed on exec everywhere else, stays open in this helper alone.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut process = command
             .spawn()
             .map_err(|e| error(format!("starting {}: {e}", helper.display())))?;
         let stdin = process.stdin.take().expect("piped");
@@ -305,10 +339,11 @@ impl IsolatedInstance {
             changed: false,
         };
         let request = Request::Create {
+            format: PluginFormat::Clap,
             file: file.map(|f| f.display().to_string()),
             id: id.to_string(),
             settings,
-            shm: path.display().to_string(),
+            shm: format!("/proc/self/fd/{fd}"),
         };
         match instance.ask(request, LONG_ANSWER) {
             Some(Reply::Created {
@@ -594,13 +629,17 @@ impl ExternalDevice for IsolatedProcessor {
         }
         self.stuck_since.store(0, Ordering::Release);
         let frames = left.len().min(MAX_BLOCK);
-        block.events[..self.pending_len].copy_from_slice(&self.pending[..self.pending_len]);
-        block.events_len = self.pending_len as u32;
+        {
+            // SAFETY: `done` equals `request`: the DAW's turn, until it raises `request`.
+            let data = unsafe { block.data() };
+            data.events[..self.pending_len].copy_from_slice(&self.pending[..self.pending_len]);
+            data.events_len = self.pending_len as u32;
+            data.frames = frames as u32;
+            data.left[..frames].copy_from_slice(&left[..frames]);
+            data.right[..frames].copy_from_slice(&right[..frames]);
+            data.set_time(time);
+        }
         self.pending_len = 0;
-        block.frames = frames as u32;
-        block.left[..frames].copy_from_slice(&left[..frames]);
-        block.right[..frames].copy_from_slice(&right[..frames]);
-        block.set_time(time);
         let seq = asked.wrapping_add(1);
         block.request.store(seq, Ordering::Release);
         shm::wake(&block.request);
@@ -634,7 +673,68 @@ impl ExternalDevice for IsolatedProcessor {
         if self.dead.load(Ordering::Acquire) {
             return;
         }
-        left[..frames].copy_from_slice(&block.left[..frames]);
-        right[..frames].copy_from_slice(&block.right[..frames]);
+        // SAFETY: `done` reached `request`: the DAW's turn again.
+        let data = unsafe { block.data() };
+        left[..frames].copy_from_slice(&data.left[..frames]);
+        right[..frames].copy_from_slice(&data.right[..frames]);
+    }
+}
+
+/// What scans of plugin files found, kept between runs: a file is scanned again only once it
+/// changed. A file whose scan failed is remembered too, and left alone until it changes.
+mod scan_cache {
+    use crate::PluginInfo;
+    use serde::{Deserialize, Serialize};
+    use std::path::{Path, PathBuf};
+
+    #[derive(Serialize, Deserialize)]
+    pub struct Entry {
+        pub path: PathBuf,
+        /// The file's length and time of change, in nanoseconds.
+        pub stamp: (u64, u128),
+        /// `None`: the scan failed.
+        pub found: Option<Vec<PluginInfo>>,
+    }
+
+    /// Bumped when what is kept changes.
+    const VERSION: u32 = 1;
+
+    fn file() -> Option<PathBuf> {
+        let dir = std::env::var_os("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| Some(PathBuf::from(std::env::var_os("HOME")?).join(".cache")))?;
+        Some(dir.join("mdaw").join("clap-scan"))
+    }
+
+    pub fn stamp(path: &Path) -> Option<(u64, u128)> {
+        let meta = std::fs::metadata(path).ok()?;
+        let changed = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
+        Some((meta.len(), changed.as_nanos()))
+    }
+
+    pub fn load() -> Vec<Entry> {
+        let Some(bytes) = file().and_then(|f| std::fs::read(f).ok()) else {
+            return Vec::new();
+        };
+        match postcard::from_bytes::<(u32, Vec<Entry>)>(&bytes) {
+            Ok((VERSION, entries)) => entries,
+            _ => Vec::new(),
+        }
+    }
+
+    pub fn save(entries: &[Entry]) {
+        let Some(file) = file() else {
+            return;
+        };
+        let Ok(bytes) = postcard::to_stdvec(&(VERSION, entries)) else {
+            return;
+        };
+        if let Some(dir) = file.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let part = file.with_extension("part");
+        if std::fs::write(&part, bytes).is_ok() {
+            let _ = std::fs::rename(&part, &file);
+        }
     }
 }

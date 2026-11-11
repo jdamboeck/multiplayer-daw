@@ -545,3 +545,37 @@ fn joining_a_server_that_is_not_there_gives_up_with_a_reason() {
     assert!(error.to_string().contains("could not join"), "{error}");
     assert!(started.elapsed() < Duration::from_secs(15));
 }
+
+#[test]
+fn a_huge_first_message_is_turned_away_before_the_token_is_checked() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = serve(dir.path(), "127.0.0.1:0");
+    let info = server.join_info().clone();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let answered = runtime.block_on(async move {
+        let (_endpoint, connection) = mdaw_net::connect(&info).await.unwrap();
+        let (mut send, mut recv) = connection.open_bi().await.unwrap();
+        let hello = mdaw_proto::ClientMsg::Hello(mdaw_proto::Hello {
+            proto_version: mdaw_proto::PROTO_VERSION,
+            token: "wrong".into(),
+            user_key: [1; 16],
+            // A megabyte of name: far more than any hello needs.
+            name: "x".repeat(1 << 20),
+            resume: None,
+        });
+        let _ = mdaw_net::write_frame(&mut send, &hello).await;
+        let answer = tokio::time::timeout(
+            Duration::from_secs(5),
+            mdaw_net::read_frame::<mdaw_proto::ServerMsg>(&mut recv),
+        )
+        .await;
+        matches!(answer, Ok(Ok(Some(_))))
+    });
+    assert!(!answered, "no answer, the connection is just ended");
+    // And the server goes on as before.
+    let mut ann = join(&server, "ann");
+    settle(&mut [&mut ann]);
+}

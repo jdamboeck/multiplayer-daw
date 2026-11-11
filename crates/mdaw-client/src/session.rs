@@ -141,6 +141,8 @@ struct Commit {
 /// Results of work done on other threads.
 enum Job {
     Plan(CommitPlan),
+    /// The commit could not be prepared; it is given up, and the user told why.
+    CommitFailed(String),
     /// A downloaded stem, decoded at the engine's rate with its gain applied; `None` if it was
     /// not one.
     Stem {
@@ -864,9 +866,9 @@ impl Session {
         }
         let rate = self.engine.sample_rate();
         if self.commit.as_ref().is_some_and(|c| c.track == track) {
-            self.spawn(move || {
-                let stem = checkout::make_stem(&audio, tempo_hash, rate);
-                Job::Plan(checkout::plan_commit(&confirmed, &workspace, Some((stem, audio))))
+            self.spawn(move || match checkout::make_stem(&audio, tempo_hash, rate) {
+                Ok(stem) => Job::Plan(checkout::plan_commit(&confirmed, &workspace, Some((stem, audio)))),
+                Err(why) => Job::CommitFailed(why),
             });
         }
     }
@@ -1035,10 +1037,11 @@ impl Session {
         if !self.engine.is_playing() {
             return None;
         }
-        // The private transport: back from where the playhead is now.
-        let ago = (clock::now_micros() - micros).max(0) as f64 / 1e6;
-        let now = self.tempo.tick_to_seconds(self.engine.position());
-        Some(self.tempo.seconds_to_tick((now - ago).max(0.0)))
+        // The private transport: from where the playhead was at the time it was heard.
+        let (tick, heard_at) = self.engine.position_heard();
+        let since = (micros - heard_at) as f64 / 1e6;
+        let then = self.tempo.tick_to_seconds(tick) + since;
+        Some(self.tempo.seconds_to_tick(then.max(0.0)))
     }
 
     /// Whether this client takes part in the shared transport. `None` without a server.
@@ -1854,6 +1857,11 @@ impl Session {
                         let id = self.engine.preview(audio);
                         self.playing = Some((hash, id));
                     }
+                }
+                Job::CommitFailed(why) => {
+                    let text = format!("The commit was not made: {why}. The track stays checked out.");
+                    notice(&mut self.notices, &text);
+                    self.cancel_commit();
                 }
                 Job::Nothing => {}
             }

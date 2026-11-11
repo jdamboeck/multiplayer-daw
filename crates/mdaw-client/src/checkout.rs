@@ -60,11 +60,12 @@ const STEM_PEAK: f32 = 0.891;
 
 /// Makes a stem of `audio`: interleaved stereo at [`SAMPLE_RATE`], as rendered. `rate` is the
 /// rate to keep it at for playing here.
-pub fn make_stem(audio: &[f32], tempo_hash: u64, rate: u32) -> StemRender {
+pub fn make_stem(audio: &[f32], tempo_hash: u64, rate: u32) -> Result<StemRender, String> {
     let peak = audio.iter().fold(0.0f32, |m, s| m.max(s.abs()));
     let scale = if peak > STEM_PEAK { STEM_PEAK / peak } else { 1.0 };
     let scaled: Vec<f32> = audio.iter().map(|s| s * scale).collect();
-    let bytes = flac::encode_bits(&scaled, SAMPLE_RATE, 24).expect("encoding a stem");
+    let bytes = flac::encode_bits(&scaled, SAMPLE_RATE, 24)
+        .map_err(|e| format!("the stem could not be encoded: {e}"))?;
     let at_rate = flac::resample(
         &flac::Audio {
             samples: audio.to_vec(),
@@ -72,7 +73,7 @@ pub fn make_stem(audio: &[f32], tempo_hash: u64, rate: u32) -> StemRender {
         },
         rate,
     );
-    StemRender {
+    Ok(StemRender {
         stem: Stem {
             blob: blob_hash(&bytes),
             tempo_hash,
@@ -81,7 +82,7 @@ pub fn make_stem(audio: &[f32], tempo_hash: u64, rate: u32) -> StemRender {
         },
         flac: bytes.into(),
         audio: at_rate.into(),
-    }
+    })
 }
 
 /// The range a stem covers: from the start of the timeline to the end of the track's last clip.

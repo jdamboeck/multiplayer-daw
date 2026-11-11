@@ -4,7 +4,7 @@
 use super::protocol::{self, Reply, Request};
 use super::shm::{self, NOTE_OFF, NOTE_ON, Shared};
 use crate::clap::ClapBackend;
-use crate::{Backend, ExternalDevice, Instance};
+use crate::{Backend, ExternalDevice, Instance, PluginFormat};
 use mdaw_dsp::MAX_BLOCK;
 use std::fs::File;
 use std::io::Write;
@@ -67,8 +67,12 @@ fn run(mut out: File) -> ExitCode {
                 return;
             }
         }
-        // The DAW is gone.
+        // The DAW is gone. Quit, and should a plugin keep the main loop from getting there, end
+        // regardless: a helper never outlives its DAW for long.
         let _ = requests.send(Request::Quit);
+        std::thread::sleep(Duration::from_secs(2));
+        // SAFETY: ending the process at once, without unwinding: nothing of it is needed any more.
+        unsafe { libc::_exit(0) };
     });
     let mut running: Option<Running> = None;
     // What the DAW was last told about the instance.
@@ -128,6 +132,7 @@ fn run(mut out: File) -> ExitCode {
 fn handle(running: &mut Option<Running>, request: Request) -> Reply {
     let error = |what: String| Reply::Error(what);
     if let Request::Create {
+        format,
         file,
         id,
         settings,
@@ -136,6 +141,10 @@ fn handle(running: &mut Option<Running>, request: Request) -> Reply {
     {
         if running.is_some() {
             return error("an instance runs already".into());
+        }
+        // Another format is another backend here, beside CLAP.
+        match format {
+            PluginFormat::Clap => {}
         }
         let builtin = file.is_none();
         let mut backend = ClapBackend::files(file.map(PathBuf::from).into_iter().collect(), builtin);
@@ -229,8 +238,10 @@ fn serve_audio(mut device: Box<dyn ExternalDevice>, shared: &Shared) {
         if seq == last {
             continue;
         }
-        let events = (block.events_len as usize).min(block.events.len());
-        for event in &block.events[..events] {
+        // SAFETY: a new `request`: the helper's turn, until it raises `done`.
+        let data = unsafe { block.data() };
+        let events = (data.events_len as usize).min(data.events.len());
+        for event in &data.events[..events] {
             match event.kind {
                 NOTE_ON => device.note_on(
                     event.offset,
@@ -242,9 +253,9 @@ fn serve_audio(mut device: Box<dyn ExternalDevice>, shared: &Shared) {
                 _ => {}
             }
         }
-        let frames = (block.frames as usize).min(MAX_BLOCK);
-        let time = block.time();
-        let (left, right) = (&mut block.left, &mut block.right);
+        let frames = (data.frames as usize).min(MAX_BLOCK);
+        let time = data.time();
+        let (left, right) = (&mut data.left, &mut data.right);
         device.process(&mut left[..frames], &mut right[..frames], &time);
         block.done.store(seq, Ordering::Release);
         shm::wake(&block.done);

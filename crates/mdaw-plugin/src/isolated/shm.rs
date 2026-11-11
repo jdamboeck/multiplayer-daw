@@ -8,7 +8,9 @@
 //! several slow helpers the callback can run late and the whole output drop out.
 
 use mdaw_dsp::{BlockTime, MAX_BLOCK};
-use std::fs::OpenOptions;
+use std::cell::UnsafeCell;
+use std::fs::{File, OpenOptions};
+use std::os::fd::FromRawFd;
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -38,6 +40,13 @@ pub struct Block {
     pub done: AtomicU32,
     /// Set by the DAW: the helper's audio thread is to end.
     pub quit: AtomicU32,
+    /// Written by one side at a time, as the counters say whose turn it is.
+    data: UnsafeCell<Data>,
+}
+
+/// The part of a [`Block`] the two sides take turns with.
+#[repr(C)]
+pub struct Data {
     pub frames: u32,
     pub events_len: u32,
     pub playing: u32,
@@ -50,6 +59,21 @@ pub struct Block {
 }
 
 impl Block {
+    /// The block's audio and events.
+    ///
+    /// # Safety
+    ///
+    /// Only the side whose turn it is may call this: the DAW while `done` equals `request`, until
+    /// it raises `request`; the helper from seeing a new `request` until it raises `done`. Neither
+    /// keeps the reference past its turn.
+    #[allow(clippy::mut_from_ref)]
+    pub unsafe fn data(&self) -> &mut Data {
+        // SAFETY: as the caller promises, nobody else uses the data meanwhile.
+        unsafe { &mut *self.data.get() }
+    }
+}
+
+impl Data {
     pub fn time(&self) -> BlockTime {
         BlockTime {
             playing: self.playing != 0,
@@ -68,7 +92,7 @@ impl Block {
     }
 }
 
-/// A [`Block`] in a file both processes map.
+/// A [`Block`] in memory both processes map.
 pub struct Shared {
     map: memmap2::MmapMut,
 }
@@ -78,15 +102,18 @@ unsafe impl Send for Shared {}
 unsafe impl Sync for Shared {}
 
 impl Shared {
-    /// Makes the file at `path` and maps it.
-    pub fn create(path: &Path) -> std::io::Result<Self> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(path)?;
+    /// Makes the block in anonymous memory and maps it. The file it returns is how a helper gets
+    /// at it: no name anywhere, nothing left behind, nobody else can open it.
+    pub fn create() -> std::io::Result<(Self, File)> {
+        // SAFETY: a plain call with a valid name; the descriptor is owned from here.
+        let fd = unsafe { libc::memfd_create(c"mdaw-block".as_ptr(), libc::MFD_CLOEXEC) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: a descriptor just made, owned by nobody else.
+        let file = unsafe { File::from_raw_fd(fd) };
         file.set_len(std::mem::size_of::<Block>() as u64)?;
-        Self::map(&file)
+        Ok((Self::map(&file)?, file))
     }
 
     /// Maps the file a DAW made.
@@ -118,12 +145,11 @@ impl Shared {
         Ok(Self { map })
     }
 
-    #[allow(clippy::mut_from_ref)]
-    pub fn block(&self) -> &mut Block {
+    pub fn block(&self) -> &Block {
         // SAFETY: the mapping is as large as a `Block`, page-aligned, and every bit pattern of
-        // it is a valid `Block` (atomics, integers, floats). The two sides take turns as the
-        // counters say; the atomics are the only fields both touch at once.
-        unsafe { &mut *(self.map.as_ptr() as *mut Block) }
+        // it is a valid `Block` (atomics, integers, floats). Only the atomics are touched by
+        // both sides at once; the rest is behind `Block::data`.
+        unsafe { &*(self.map.as_ptr() as *const Block) }
     }
 }
 

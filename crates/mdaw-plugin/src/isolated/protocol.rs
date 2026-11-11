@@ -2,7 +2,7 @@
 //! `u32` length and postcard. The helper points its own stdout at stderr first, so that what
 //! plugins print cannot get in between.
 
-use crate::{ParamInfo, PluginInfo, Settings};
+use crate::{ParamInfo, PluginFormat, PluginInfo, Settings};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
@@ -15,6 +15,7 @@ pub enum Request {
     /// Makes the instance: from `file`, or the built-in test synth without one. The audio goes
     /// through the shared block at `shm`.
     Create {
+        format: PluginFormat,
         file: Option<String>,
         id: String,
         settings: Settings,

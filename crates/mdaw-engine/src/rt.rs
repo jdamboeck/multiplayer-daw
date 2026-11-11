@@ -107,6 +107,8 @@ pub(crate) struct Shared {
     pub preview_id: AtomicU64,
     /// Frames of the preview played so far, or `u64::MAX` once it is over or stopped.
     pub preview_pos: AtomicU64,
+    /// When the playhead in `tick` is heard, on the engine's clock.
+    pub tick_heard_at: AtomicI64,
     /// The listener's own volume, as `f32` bits: applied to everything this engine outputs,
     /// and nowhere else.
     pub output_gain: AtomicU32,
@@ -438,6 +440,10 @@ impl RtCore {
 
         let shared = &self.shared;
         shared.tick.store(self.graph.tick_at(self.pos).to_bits(), Relaxed);
+        // The playhead as published is where the next buffer starts: heard after this one.
+        let rate = self.graph.sample_rate().max(1) as i64;
+        let heard = play_micros + total as i64 * 1_000_000 / rate;
+        shared.tick_heard_at.store(heard, Relaxed);
         shared.playing.store(self.playing, Relaxed);
         for (slot, value) in shared.peak.iter().zip(peak) {
             // Positive floats order like their bit patterns.

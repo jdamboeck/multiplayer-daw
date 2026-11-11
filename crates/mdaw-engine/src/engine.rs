@@ -497,6 +497,14 @@ impl Engine {
         f64::from_bits(self.shared.tick.load(Relaxed))
     }
 
+    /// The playhead in ticks, with when it is heard on [`clock::now_micros`]: later than now,
+    /// by what the device takes to play what it was given.
+    pub fn position_heard(&self) -> (f64, i64) {
+        let at = self.shared.tick_heard_at.load(Relaxed);
+        let at = if at == 0 { clock::now_micros() } else { at };
+        (self.position(), at)
+    }
+
     /// Sets the listener's own volume: applied to everything this engine plays, and to nothing
     /// that is rendered or shared.
     pub fn set_output_gain(&mut self, gain: f32) {

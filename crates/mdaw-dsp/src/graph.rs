@@ -248,10 +248,19 @@ impl Graph {
     /// to remap its timeline position. Call [`Graph::retire`] on the old graph afterwards.
     pub fn adopt_from(&mut self, old: &mut Graph) -> bool {
         let tempo_changed = !Arc::ptr_eq(&self.tempo, &old.tempo);
+        // Tracks mostly keep their order: each search starts where the last one ended, so this
+        // is linear in the number of tracks as long as that holds.
+        let mut hint = 0;
         for track in &mut self.tracks {
-            let Some(old_track) = old.tracks.iter_mut().find(|t| t.compiled.id == track.compiled.id) else {
+            let count = old.tracks.len();
+            let Some(at) = (0..count)
+                .map(|i| (hint + i) % count)
+                .find(|&i| old.tracks[i].compiled.id == track.compiled.id)
+            else {
                 continue;
             };
+            hint = at + 1;
+            let old_track = &mut old.tracks[at];
             for (state, device) in track.devices.iter_mut().zip(&track.compiled.devices) {
                 if !matches!(state, DeviceState::Adopt) {
                     continue;

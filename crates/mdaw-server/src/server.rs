@@ -28,6 +28,11 @@ const BLOBS_PER_CLIENT: usize = 4;
 
 /// How long a new connection has to say hello.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+/// Largest first message, sent before the token is checked.
+const MAX_HELLO: usize = 64 << 10;
+/// Live-note datagrams one player may send per second, on average, and at once.
+const MIDI_PER_SECOND: f64 = 400.0;
+const MIDI_BURST: f64 = 200.0;
 
 pub struct Config {
     /// Where the project lives. Created if missing.
@@ -181,14 +186,25 @@ fn run_hub(mut hub: Hub, inbox: std_mpsc::Receiver<Command>, relay: Relay) {
             Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
         };
         let head = hub.head();
-        match command {
+        // A project the disk will not take can only be stopped: going on without it would
+        // lose what clients are told is kept.
+        if matches!(command, Command::Stop) {
+            break;
+        }
+        let handled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match command {
             Command::Join { hello, sink, reply } => {
                 let joined = hub.join(hello, sink).map(|actor| (actor, hub.user_of(actor)));
                 let _ = reply.send(joined);
             }
             Command::Msg { actor, msg, .. } => hub.handle(actor, msg),
             Command::Leave { actor } => hub.leave(actor),
-            Command::Stop => break,
+            Command::Stop => {}
+        }));
+        if handled.is_err() {
+            eprintln!(
+                "mdaw-server: the project could not be kept, so the server stops. Everything it confirmed to clients is on disk; start it again once the cause is gone."
+            );
+            std::process::exit(1);
         }
         if hub.head() != head {
             relay.set_checkouts(hub.doc());
@@ -225,7 +241,12 @@ async fn serve(
     relay: &Relay,
 ) -> Result<()> {
     let (mut send, mut recv) = connection.accept_bi().await?;
-    let first = tokio::time::timeout(HELLO_TIMEOUT, read_frame::<ClientMsg>(&mut recv)).await??;
+    // Before the token is checked, a message may be no more than a hello needs.
+    let first = tokio::time::timeout(
+        HELLO_TIMEOUT,
+        mdaw_net::read_frame_max::<ClientMsg>(&mut recv, MAX_HELLO),
+    )
+    .await??;
     let Some(ClientMsg::Hello(hello)) = first else {
         write_frame(&mut send, &ServerMsg::Refused(RefuseReason::Protocol)).await?;
         return finish(send).await;
@@ -277,13 +298,24 @@ async fn serve(
     // clients' estimates. For live notes: every millisecond is heard.
     relay.add(actor, user, connection.clone());
     let datagrams = async {
+        // A player's live notes are passed on at a sane rate: a token bucket.
+        let (mut tokens, mut filled) = (MIDI_BURST, std::time::Instant::now());
         loop {
             match mdaw_net::read_datagram(connection).await? {
                 Some(Datagram::Ping { t0 }) => {
                     let server_micros = clock.micros();
                     mdaw_net::send_datagram(connection, &Datagram::Pong { t0, server_micros });
                 }
-                Some(Datagram::Midi(packet)) => relay.forward(actor, packet),
+                Some(Datagram::Midi(packet)) => {
+                    let now = std::time::Instant::now();
+                    tokens =
+                        (tokens + now.duration_since(filled).as_secs_f64() * MIDI_PER_SECOND).min(MIDI_BURST);
+                    filled = now;
+                    if tokens >= 1.0 {
+                        tokens -= 1.0;
+                        relay.forward(actor, packet);
+                    }
+                }
                 Some(Datagram::Pong { .. }) | None => {}
             }
         }
@@ -323,10 +355,19 @@ async fn blob_stream(mut send: quinn::SendStream, mut recv: quinn::RecvStream, b
                 write_frame(&mut send, &BlobAnswer::Refused).await?;
             } else {
                 write_frame(&mut send, &BlobAnswer::Send).await?;
-                let bytes = recv.read_to_end(len as usize).await?;
-                let blobs2 = blobs.clone();
-                let stored = bytes.len() as u64 == len
-                    && tokio::task::spawn_blocking(move || blobs2.put(&hash, &bytes)).await??;
+                // Onto the disk as it arrives: an upload never sits in memory whole.
+                let mut writer = tokio::task::block_in_place(|| blobs.writer(hash))?;
+                let mut got = 0u64;
+                let mut whole = true;
+                while let Some(chunk) = recv.read_chunk(1 << 20, true).await? {
+                    got += chunk.bytes.len() as u64;
+                    if got > len {
+                        whole = false;
+                        break;
+                    }
+                    tokio::task::block_in_place(|| writer.write(&chunk.bytes))?;
+                }
+                let stored = whole && got == len && tokio::task::block_in_place(|| writer.finish())?;
                 let answer = if stored {
                     BlobAnswer::Stored
                 } else {

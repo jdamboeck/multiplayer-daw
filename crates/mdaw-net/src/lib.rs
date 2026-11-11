@@ -87,6 +87,29 @@ pub async fn read_frame<T: Framed>(stream: &mut RecvStream) -> Result<Option<T>>
     Ok(read_frame_sized(stream).await?.map(|(msg, _)| msg))
 }
 
+/// As [`read_frame`], but a frame longer than `max` is an error, whatever its type allows.
+pub async fn read_frame_max<T: Framed>(stream: &mut RecvStream, max: usize) -> Result<Option<T>> {
+    let mut header = [0u8; 4];
+    let mut filled = 0;
+    while filled < header.len() {
+        match stream.read(&mut header[filled..]).await? {
+            Some(n) => filled += n,
+            None if filled == 0 => return Ok(None),
+            None => bail!("the stream ended inside a frame"),
+        }
+    }
+    let len = payload_len::<T>(header)?;
+    if len > max {
+        bail!("a frame of {len} bytes where at most {max} are expected");
+    }
+    let mut payload = vec![0u8; len];
+    stream
+        .read_exact(&mut payload)
+        .await
+        .context("the stream ended inside a frame")?;
+    Ok(Some(mdaw_proto::decode(&payload)?))
+}
+
 /// As [`read_frame`], with the size of the frame's payload in bytes.
 pub async fn read_frame_sized<T: Framed>(stream: &mut RecvStream) -> Result<Option<(T, usize)>> {
     let mut header = [0u8; 4];

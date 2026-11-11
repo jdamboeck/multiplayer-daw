@@ -36,6 +36,8 @@ Resume { prev_actor, session_secret, last_seq }
 `user_key` is a random key the client install made once and keeps in its profile. The server maps
 it to a `UserId` that stays the same across connections. `name` is a display name; the server
 trims it, drops control characters, cuts it to 32 characters and calls an empty one "anonymous".
+The first message may be at most 64 KiB; a larger one ends the connection without an answer,
+before the token is looked at.
 
 The server answers with one of:
 
@@ -257,7 +259,8 @@ LiveEvent  { seq: u32, pitch: u8, vel: u8 }      // vel 1..=127 starts the note,
   project thread. It sets `actor` to the sender's; what the client put there is ignored. It sends
   the packet to every other connection except one whose user has the track checked out while
   the sender is someone else: a checked-out track hears only its owner until the commit or the
-  release. The owner's own notes on the track are passed on as usual.
+  release. The owner's own notes on the track are passed on as usual. A connection's packets
+  are passed on at most 400 a second on average, with bursts of 200; more are dropped.
 - **Receiving.** A receiver keeps, per stream, the highest `stream_seq` and event `seq` seen and
   the pitches it plays. A packet not newer than the last is dropped. Of a newer one it plays the
   events it has not seen, in order; a start only if `held` still has the pitch, since a note that
@@ -431,8 +434,14 @@ Track.stem: Option<Stem { blob, tempo_hash, len_samples, gain }>
   (The document's master volume stays, at 1 unless an older project set it.)
 - **A client with no plugins** (`--no-plugins`) plays every such track from its stem.
 - **Crashes.** On Linux each plugin instance runs in a helper process (`mdaw-plugin-host`),
-  also for scanning, one file at a time. The audio thread hands it each block through shared
-  memory and waits at most the block's length plus 2 ms; a late block goes without the plugin.
+  also for scanning, one file at a time and a few files at once. What a scan found is kept in
+  `~/.cache/mdaw/clap-scan` and a file is scanned again only once it changed; one whose scan
+  failed is left out until it changes. Helpers start on threads of their own, so the client
+  does not wait for them; meanwhile the track header says "loading plugin…". The audio thread
+  hands a helper each block through anonymous shared memory (a `memfd` only that helper gets)
+  and waits at most the block's length plus 2 ms, and never past 60% of the audio callback for
+  all plugins together; a late block goes without the plugin. Helpers report changes to their
+  state and window themselves. A helper whose client is gone ends within two seconds.
   A helper that crashes or stops answering is ended: the client says so, the track plays its
   stem (or is silent), and the user can restart the plugin, which comes back with its settings
   as kept aside at most two seconds before. A plugin that does not start or will not take its
@@ -454,7 +463,8 @@ BlobRequest::Get { hash }       ->  Found { len } + bytes | Missing
 ```
 
 The server answers `Stored` at once if it has the blob, checks that uploaded bytes hash to the
-announced hash, and refuses blobs over 256 MiB. The client checks the hash of every download.
+announced hash, and refuses blobs over 256 MiB. Uploads go to disk as they arrive; the server
+never holds one in memory whole. The client checks the hash of every download.
 Blobs are kept as files under `blobs/` in the data directory, each upload written to a file of its
 own, flushed to disk and then renamed, so a stored blob is whole even after a crash. Halves left
 by a crash are removed when the server starts. Blobs are never deleted. A client may have four
