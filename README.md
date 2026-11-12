@@ -7,6 +7,10 @@ Prototype of a server/client DAW for collaborative editing. Working name.
 - `docs/protocol.md`: the wire protocol and sync rules as built.
 - `docs/manual-tests/`: test protocols to run through by hand after a milestone.
 - `docs/spikes/`: spike reports.
+- `docs/architecture.md`: where the project is going — Tracktion Engine for local audio, Rust for
+  everything shared — and what the audit of the current code found.
+- `docs/tracktion-integration.md`: pinned versions, how to build the native part, test results.
+- `docs/decisions/`: decision records. `docs/migration-checklist.md`: what is kept and what goes.
 
 ## Status
 
@@ -27,6 +31,25 @@ Prototype of a server/client DAW for collaborative editing. Working name.
 - **M6** done: plugins and stems. CLAP plugins go onto a track through a checkout; the commit
   carries their state and a stem. Clients with the plugin run it, the others play the stem. The
   host sits behind a format-neutral interface, so VST3 can be added as another backend.
+
+**In progress** (branch `tracktion-integration`): moving local audio to Tracktion Engine and
+dropping shared transport, live MIDI and checkout in favour of plain concurrent editing. So far
+a native spike under `native/` and the documents above; the app itself is unchanged.
+
+## Native build (Tracktion spike)
+
+Needs CMake, Ninja, a C++20 compiler and the packages listed in `docs/tracktion-integration.md`.
+
+```sh
+git -c url."https://github.com/".insteadOf="git@github.com:" submodule update --init --recursive --depth 1
+cmake -S native -B target/native -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build target/native --target mdaw-te-spike
+S=target/native/spike/mdaw-te-spike_artefacts/RelWithDebInfo/mdaw-te-spike
+$S play                     # eight seconds of MIDI through the default audio device
+$S render --out demo.wav    # the same, rendered to a file without a device
+```
+
+The Rust build and tests do not depend on it yet.
 
 ## Downloads
 
