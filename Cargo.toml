@@ -1,6 +1,23 @@
 [workspace]
 resolver = "3"
 members = ["crates/*", "spikes/*", "xtask"]
+# Everything but the Tracktion bridge crates, which build native code with CMake (submodules,
+# a C++ toolchain, ~10 minutes cold). Plain `cargo build` / `cargo test` leave them out;
+# `-p mdaw-tracktion` or `--workspace` take them in. New crates must be added here too.
+default-members = [
+    "crates/mdaw-client",
+    "crates/mdaw-dsp",
+    "crates/mdaw-engine",
+    "crates/mdaw-model",
+    "crates/mdaw-net",
+    "crates/mdaw-plugin",
+    "crates/mdaw-proto",
+    "crates/mdaw-server",
+    "crates/mdaw-sync",
+    "crates/mdaw-test-plugin",
+    "spikes/clap-host",
+    "xtask",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -18,8 +35,11 @@ mdaw-engine = { path = "crates/mdaw-engine" }
 mdaw-net = { path = "crates/mdaw-net" }
 mdaw-server = { path = "crates/mdaw-server" }
 mdaw-plugin = { path = "crates/mdaw-plugin" }
+mdaw-tracktion-sys = { path = "crates/mdaw-tracktion-sys" }
+mdaw-tracktion = { path = "crates/mdaw-tracktion" }
 imbl = { version = "7", features = ["serde"] }
 serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
 postcard = { version = "1.1", features = ["use-std"] }
 proptest = "1.12"
 tempfile = "3"

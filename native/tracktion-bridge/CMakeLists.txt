@@ -1,10 +1,9 @@
 # The C ABI between the Rust application and Tracktion Engine (include/mdaw_engine.h).
 #
-# A static library that carries everything it needs: the bridge, and the JUCE and Tracktion
-# module sources (they come in as interface sources of mdaw_engine_config). The engine
-# libraries are linked PRIVATE, so a consumer gets the archive and the system libraries to link
-# against, not a second copy of the module sources to compile. That is how a Rust binary will
-# link it, and the C test below links it the same way.
+# A static library holding the bridge and the JUCE and Tracktion module sources (they come in
+# as interface sources of mdaw_engine_config). The engine libraries are linked PRIVATE, so a
+# consumer links two archives — this one and mdaw_clap_format — plus system libraries, and
+# compiles no module source again. The Rust build script and the C test below link it so.
 add_library(mdaw_tracktion_bridge STATIC
     src/bridge.cpp
     src/engine_thread.cpp

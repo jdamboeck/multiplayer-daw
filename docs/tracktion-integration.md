@@ -233,6 +233,29 @@ a project by id, rendering, idempotent repeats, note updates, mute, gain, bypass
 map, parameters and state for the built-in synth and a CLAP plugin, no echo of own changes,
 and creating the engine twice in one process.
 
+From Rust: `crates/mdaw-tracktion-sys` (hand-written declarations; its build script runs the
+CMake build in `target/native`, or in `MDAW_NATIVE_BUILD_DIR`) and `crates/mdaw-tracktion`
+(safe `Engine`, plus `load_project` and `apply_op`, which bring a canonical `mdaw_model`
+project into the engine whole or one operation at a time).
+
+```sh
+cargo test -p mdaw-tracktion-sys -p mdaw-tracktion
+```
+
+Plain `cargo build` and `cargo test` leave these two crates out (`default-members`), and CI
+excludes them, because they need the submodules and a C++ toolchain. The integration test
+applies model operations to the model and the engine side by side, renders after each step,
+and checks that the incremental result matches a fresh load. After moving a submodule pin,
+run `cmake --build target/native` once: the build script does not watch third-party sources.
+
+Gaps in the C interface found from the Rust side, to close before the client uses it:
+the plugin list does not carry the plugin's own id (CLAP id), so matching goes through a hash;
+parameters have no range or plain-value conversion, so model parameter values are not applied
+yet (`DeviceSetParam` is reported as not mapped); no call to ask whether a device exists, to
+rename a clip, or to reset a plugin's state; the engine's tempo range (20–300 bpm) is narrower
+than the model's (20–400); the known-plugin list persists in the settings folder and can list
+plugins that no longer load.
+
 Built but not yet exercised by any test: plugin editor windows through the bridge; everything
 that needs an open audio device (device switching, meters, xruns, loop, restart after a
 device-list change, the stalled-audio event); parameter events from a plugin's own window; the
