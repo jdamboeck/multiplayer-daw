@@ -6,10 +6,14 @@
 //! model is. The engine addresses everything by the model's own ids.
 //!
 //! What the engine cannot take does not fail the call: it is left out and reported as a
-//! [`Problem`]. Model data the engine has no use for (project name, track colour, clip name,
-//! checkouts, stems) is ignored without a report.
+//! [`Problem`]. Model data the engine has no use for (project name, track colour, checkouts,
+//! stems) is ignored without a report.
+//!
+//! A plugin device's settings are its state blob and its parameter values; the state is applied
+//! first, then the values (which the model keeps in the plugin's own units, converted here with
+//! the range the engine reports).
 
-use crate::{Engine, Error, Note as EngineNote, PluginInfo, Status};
+use crate::{Engine, EntityKind, Error, Note as EngineNote, ParamInfo, PluginInfo, Status};
 use mdaw_model::{
     BlobHash, BuiltinKind, ClipId, ClipProp, Device, DeviceId, DeviceKind, MAX_MILLI_BPM, MAX_TICK,
     MIN_MILLI_BPM, Note, NoteId, Op, PluginFormat, Project, ShellProp, TempoId, TrackContent, TrackId,
@@ -36,9 +40,8 @@ pub enum Problem {
         plugin: String,
         reason: String,
     },
-    /// A device parameter the engine cannot be given. The built-in Pocket synth is played by
-    /// the engine's own synth, which has other parameters; a plugin's model value is in the
-    /// plugin's own units while the engine takes 0..1 and reports no range to convert with.
+    /// A device parameter the engine cannot be given: one of the built-in Pocket synth, which
+    /// the engine plays with its own synth (other parameters), or one the plugin does not have.
     ParamNotMapped {
         track: TrackId,
         device: DeviceId,
@@ -138,25 +141,12 @@ pub fn apply_op(
     Ok(sync.problems)
 }
 
-/// Finds the engine's identifier for a model plugin. For CLAP the engine reports JUCE's
-/// identifier string, which carries a 32-bit hash of the CLAP id at its end, not the id itself:
-/// the match is on that hash (a collision would pick the wrong plugin; nothing better is
-/// possible through the current interface).
+/// Finds a model plugin in the engine's list: the engine's identifier is the plugin's own id
+/// (for CLAP the CLAP id), which is what the model stores.
 pub fn find_plugin<'a>(plugins: &'a [PluginInfo], format: PluginFormat, id: &str) -> Option<&'a PluginInfo> {
-    match format {
-        PluginFormat::Clap => {
-            let suffix = format!("-{:x}", juce_string_hash(id));
-            plugins
-                .iter()
-                .find(|p| p.format == format.name() && p.identifier.to_ascii_lowercase().ends_with(&suffix))
-        }
-    }
-}
-
-/// `juce::String::hashCode()`: 31 * hash + code point, over the UTF-32 code points, as u32.
-fn juce_string_hash(text: &str) -> u32 {
-    text.chars()
-        .fold(0u32, |hash, c| hash.wrapping_mul(31).wrapping_add(c as u32))
+    plugins
+        .iter()
+        .find(|p| p.format == format.name() && p.identifier == id)
 }
 
 // ---- ids ---------------------------------------------------------------------------------------
@@ -314,8 +304,7 @@ impl<'a> Sync<'a> {
                             self.put_clip(*track, *id, clip)?;
                         }
                     }
-                    // The engine has no call for a clip's name.
-                    ClipProp::Name(_) => {}
+                    ClipProp::Name(_) => engine.clip_set_name(raw_clip(*id), &clip.name)?,
                 }
             }
             Op::NoteAdd { track, clip, id, .. } | Op::NoteSet { track, clip, id, .. } => {
@@ -350,12 +339,21 @@ impl<'a> Sync<'a> {
                 }
             }
             Op::DeviceSetParam { track, id, param, .. } => {
-                if content(after, *track).is_some_and(|c| c.device(*id).is_some()) {
-                    self.problems.push(Problem::ParamNotMapped {
+                let Some(device) = content(after, *track).and_then(|c| c.device(*id)) else {
+                    return Ok(());
+                };
+                match &device.kind {
+                    DeviceKind::Builtin { .. } => self.problems.push(Problem::ParamNotMapped {
                         track: *track,
                         device: *id,
                         param: *param,
-                    });
+                    }),
+                    DeviceKind::Plugin { .. } => {
+                        if engine.has(EntityKind::Device, raw_device(*id)) {
+                            let params = engine.device_params(raw_device(*id))?;
+                            self.put_param(*track, *id, &params, *param, device.params.get(param).copied())?;
+                        }
+                    }
                 }
             }
             Op::DeviceSetBypass { track, id, .. } => {
@@ -367,24 +365,20 @@ impl<'a> Sync<'a> {
                 let Some(device) = content(after, *track).and_then(|c| c.device(*id)) else {
                     return Ok(());
                 };
-                match &device.kind {
-                    DeviceKind::Plugin {
-                        state: Some(blob), ..
-                    } => {
-                        if engine.has_device(raw_device(*id)) {
-                            self.put_state(*track, *id, *blob);
-                        }
-                    }
-                    DeviceKind::Plugin { state: None, .. } => {
-                        // No saved state: the plugin as it starts. The engine cannot reset a
-                        // plugin, so the device is made again in its place.
-                        engine.device_remove(raw_device(*id))?;
-                        let behind = self.device_predecessor(after, *track, *id);
-                        self.put_device(*track, device, behind)?;
-                    }
+                let DeviceKind::Plugin { state, .. } = &device.kind else {
                     // The model ignores state for built-in devices.
-                    DeviceKind::Builtin { .. } => {}
+                    return Ok(());
+                };
+                if !engine.has(EntityKind::Device, raw_device(*id)) {
+                    return Ok(());
                 }
+                match state {
+                    Some(blob) => self.put_state(*track, *id, *blob),
+                    // No saved state: the plugin as it starts.
+                    None => engine.device_reset_state(raw_device(*id))?,
+                }
+                // The parameter values go on top of the state, as when the project is loaded.
+                self.put_params(*track, device)?;
             }
         }
         Ok(())
@@ -455,8 +449,9 @@ impl<'a> Sync<'a> {
         }
         self.engine
             .clip_add(raw_track(track), raw, clip.start.0, clip.length.0, &clip.name)?;
-        // A no-op when the clip was just added; sets the range when it was already there.
+        // No-ops when the clip was just added; set range and name when it was already there.
         self.engine.clip_set_range(raw, clip.start.0, clip.length.0)?;
+        self.engine.clip_set_name(raw, &clip.name)?;
         self.put_notes(track, id, clip.notes.iter().map(|(id, note)| (*id, note)))
     }
 
@@ -507,7 +502,7 @@ impl<'a> Sync<'a> {
             .take(index)
             .rev()
             .map(|d| raw_device(d.id))
-            .find(|&raw| self.engine.has_device(raw))
+            .find(|&raw| self.engine.has(EntityKind::Device, raw))
             .unwrap_or(0)
     }
 
@@ -565,20 +560,55 @@ impl<'a> Sync<'a> {
             return Ok(false);
         }
         self.engine.device_set_bypass(raw, device.bypass)?;
-        for param in device.params.keys() {
-            self.problems.push(Problem::ParamNotMapped {
-                track,
-                device: device.id,
-                param: *param,
-            });
-        }
         if let DeviceKind::Plugin {
             state: Some(blob), ..
         } = &device.kind
         {
             self.put_state(track, device.id, *blob);
         }
+        self.put_params(track, device)?;
         Ok(true)
+    }
+
+    /// Gives the device the parameter values the model holds for it.
+    fn put_params(&mut self, track: TrackId, device: &Device) -> Result<(), Error> {
+        if device.params.is_empty() {
+            return Ok(());
+        }
+        let params = match &device.kind {
+            DeviceKind::Plugin { .. } => self.engine.device_params(raw_device(device.id))?,
+            // The engine's synth has other parameters than Pocket: none can be mapped.
+            DeviceKind::Builtin { .. } => Vec::new(),
+        };
+        for (param, value) in &device.params {
+            self.put_param(track, device.id, &params, *param, Some(*value))?;
+        }
+        Ok(())
+    }
+
+    /// Sets one parameter of a plugin device. `plain` is the model's value, in the plugin's own
+    /// units; `None` is the parameter's default. `params` is the device's list from the engine.
+    fn put_param(
+        &mut self,
+        track: TrackId,
+        device: DeviceId,
+        params: &[ParamInfo],
+        param: u32,
+        plain: Option<f64>,
+    ) -> Result<(), Error> {
+        let id = param.to_string();
+        let found = params.iter().find(|p| p.id == id);
+        let value = found.and_then(|p| match plain {
+            Some(plain) => Some(p.normalise(plain)),
+            None => p.default,
+        });
+        let Some(value) = value else {
+            self.problems
+                .push(Problem::ParamNotMapped { track, device, param });
+            return Ok(());
+        };
+        self.engine
+            .device_set_param(raw_device(device), &id, value as f32)
     }
 
     /// A state the plugin refuses is a problem, not an error: the plugin is in the engine either
@@ -609,21 +639,22 @@ mod tests {
     use mdaw_model::{ActorId, IdGen, TempoPoint, Tick};
 
     #[test]
-    fn juce_hash_matches_the_engines_identifier_for_the_test_synth() {
-        // From the C bridge test: "CLAP-mdaw Test Synth-d11e4944-9de17b8".
-        assert_eq!(
-            format!("{:x}", juce_string_hash("org.mdaw.test-synth")),
-            "9de17b8"
-        );
-        let list = vec![PluginInfo {
-            format: "CLAP".into(),
-            identifier: "CLAP-mdaw Test Synth-d11e4944-9de17b8".into(),
+    fn plugins_are_found_by_format_and_own_id() {
+        let info = |format: &str, identifier: &str| PluginInfo {
+            format: format.into(),
+            identifier: identifier.into(),
             name: "mdaw Test Synth".into(),
             vendor: String::new(),
             instrument: true,
-        }];
-        assert!(find_plugin(&list, PluginFormat::Clap, "org.mdaw.test-synth").is_some());
-        assert!(find_plugin(&list, PluginFormat::Clap, "org.mdaw.other").is_none());
+        };
+        let list = vec![
+            info("LV2", "org.mdaw.test-synth"),
+            info("CLAP", "org.mdaw.test-synth"),
+        ];
+        let found = find_plugin(&list, PluginFormat::Clap, "org.mdaw.test-synth");
+        assert_eq!(found.map(|p| p.format.as_str()), Some("CLAP"));
+        assert!(find_plugin(&list, PluginFormat::Clap, "org.mdaw.test").is_none());
+        assert!(find_plugin(&list, PluginFormat::Clap, "org.mdaw.test-synth.x").is_none());
     }
 
     #[test]

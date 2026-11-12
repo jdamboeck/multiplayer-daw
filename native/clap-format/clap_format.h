@@ -15,6 +15,15 @@ namespace mdaw
 {
     std::unique_ptr<juce::AudioPluginFormat> createClapFormat();
 
+    /// The CLAP plugin id ("org.example.synth") of a plugin this format described, read from
+    /// the plugin's library (loaded once and kept, as for an instance). Empty if the description
+    /// is not a CLAP one or the library no longer has that plugin.
+    juce::String clapPluginId (const juce::PluginDescription&);
+
+    /// The plugin's own plain range of a parameter of a CLAP instance made by this format.
+    /// False, leaving min and max as they are, for any other parameter.
+    bool clapParameterRange (const juce::AudioProcessorParameter*, double& min, double& max);
+
     /// Things the host did that CLAP does not allow, counted so that a test can see them.
     struct ClapHostCounters
     {

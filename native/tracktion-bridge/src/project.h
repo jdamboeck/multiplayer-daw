@@ -4,6 +4,7 @@
 #pragma once
 
 #include "mdaw_engine.h"
+#include "plugin_ids.h"
 
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <tracktion_engine/tracktion_engine.h>
@@ -71,6 +72,8 @@ public:
     /// the destructor is the engine.
     Steps shutDownSteps();
 
+    bool has (int32_t kind, uint64_t id) const;
+
     void tempoPut (uint64_t id, int64_t tick, uint32_t milliBpm);
     void tempoRemove (uint64_t id);
     void masterSetGain (float gain);
@@ -84,6 +87,7 @@ public:
     void clipAdd (uint64_t track, uint64_t id, int64_t start, int64_t length, const juce::String& name);
     void clipRemove (uint64_t id);
     void clipSetRange (uint64_t id, int64_t start, int64_t length);
+    void clipSetName (uint64_t id, const juce::String& name);
 
     void notesPut (uint64_t clip, const mdaw_note* notes, size_t count);
     void notesRemove (uint64_t clip, const uint64_t* ids, size_t count);
@@ -95,8 +99,10 @@ public:
     void deviceSetParam (uint64_t id, const juce::String& param, float value);
     float deviceGetParam (uint64_t id, const juce::String& param);
     juce::String deviceParams (uint64_t id);
+    juce::String deviceParamText (uint64_t id, const juce::String& param, float value);
     juce::MemoryBlock deviceGetState (uint64_t id);
     void deviceSetState (uint64_t id, const void* data, size_t size);
+    void deviceResetState (uint64_t id);
     void deviceShowEditor (uint64_t id, bool show);
 
     void pluginsScan (const juce::String& format);
@@ -128,6 +134,7 @@ private:
     std::unique_ptr<te::Engine> engine;
     std::unique_ptr<te::Edit> edit;
     std::unique_ptr<te::Edit> retiring;   // between the steps that drop an edit
+    std::unique_ptr<PluginIds> pluginIds;
 
     std::map<uint64_t, juce::ReferenceCountedObjectPtr<te::AudioTrack>> tracks;
     std::map<uint64_t, Clip> clips;
@@ -168,6 +175,10 @@ private:
     bool deviceRuns() const;
     void startTransportIfWanted();
     void removeDevice (uint64_t id);
+    void restoreState (Device&, const void* data, size_t size);
+    /// The plugins that can be loaded now, each (format, own id) once: the first description
+    /// in the known-plugin list wins.
+    std::vector<std::pair<juce::PluginDescription, juce::String>> loadablePlugins();
     void closeEditor (uint64_t id);
     void closeAllEditors();
     int insertIndexFor (te::AudioTrack&, uint64_t after, const te::Plugin* moving) const;

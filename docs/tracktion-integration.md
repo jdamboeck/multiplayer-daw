@@ -214,6 +214,15 @@ These were all found by running into them.
     the same value; the bridge filters it so the application sees no echo.
 21. **`Edit::Options::defaultMasterVolumedB` is -3 dB.** That is the 3 dB of point 10's level
     difference; the bridge sets 0. `PluginList::insertPlugin` can refuse without an error.
+22. **JUCE's identifier string for a plugin contains a hash of its file path,** so it differs
+    between machines. A shared project needs the plugin's own id. For VST3, JUCE keeps only a
+    32-bit hash of the class id; the bridge reads the full id from the plugin's factory
+    (library loaded, no instance made). That code handles Linux only: on Windows the bytes are
+    ordered differently, and until it is ported VST3 plugins would not be listed there or on
+    macOS.
+23. **Reading a CLAP or VST3 id loads the plugin's library on the message thread** the first
+    time (afterwards it comes from `plugin-ids.xml`). A library that crashes on load takes the
+    process down there, as it would during an in-process scan.
 
 ## The bridge
 
@@ -248,13 +257,22 @@ applies model operations to the model and the engine side by side, renders after
 and checks that the incremental result matches a fresh load. After moving a submodule pin,
 run `cmake --build target/native` once: the build script does not watch third-party sources.
 
-Gaps in the C interface found from the Rust side, to close before the client uses it:
-the plugin list does not carry the plugin's own id (CLAP id), so matching goes through a hash;
-parameters have no range or plain-value conversion, so model parameter values are not applied
-yet (`DeviceSetParam` is reported as not mapped); no call to ask whether a device exists, to
-rename a clip, or to reset a plugin's state; the engine's tempo range (20–300 bpm) is narrower
-than the model's (20–400); the known-plugin list persists in the settings folder and can list
-plugins that no longer load.
+ABI 2 closed the gaps found from the Rust side. Plugins are named by their own id, the same
+on every machine (CLAP id, LV2 URI, VST3 class id as 32 hex digits; see
+`src/plugin_ids.h`): JUCE's identifier string contains a hash of the file path. The ids of
+CLAP and VST3 plugins are read from their libraries once and kept in `plugin-ids.xml` in the
+settings folder. The list offers only plugins whose file is still there, each id once. CLAP
+parameters report their plain range, so the model's values (plain, by CLAP id) are applied,
+after the state. `mdaw_project_has`, `mdaw_clip_set_name`, `mdaw_device_reset_state` (back to
+the state captured when the device was made) and `mdaw_last_status` are new. The engine's
+tempo range (20–300 bpm) is still narrower than the model's (20–400); the Pocket synth's
+parameters are still not mapped to the engine's synth.
+
+One VST3 and one LV2 instrument each were loaded and rendered through the bridge by hand
+(ChowKick and Vital as VST3; Dexed and String machine as LV2), not by the committed tests.
+
+Open model question: after a parameter is put back to "default" in the model and the project
+is reloaded, the value in the plugin's stored state wins over the default.
 
 Built but not yet exercised by any test: plugin editor windows through the bridge; everything
 that needs an open audio device (device switching, meters, xruns, loop, restart after a

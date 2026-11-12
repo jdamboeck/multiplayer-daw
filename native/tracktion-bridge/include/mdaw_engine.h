@@ -33,7 +33,7 @@
 extern "C" {
 #endif
 
-#define MDAW_ABI_VERSION 1
+#define MDAW_ABI_VERSION 2
 #define MDAW_TICKS_PER_QUARTER 960
 
 typedef struct mdaw_engine mdaw_engine;
@@ -69,16 +69,30 @@ void mdaw_engine_destroy(mdaw_engine* engine);
 uint32_t mdaw_abi_version(void);
 /* Text of the calling thread's last failed call; returns the length needed. */
 size_t mdaw_last_error(char* buffer, size_t capacity);
+/* Status of the calling thread's last failed call, for functions that cannot return one
+ * (mdaw_engine_create, the functions returning a length). MDAW_OK if none failed yet; a
+ * later successful call does not clear it. */
+mdaw_status mdaw_last_status(void);
 /* "Tracktion Engine v… / JUCE v…"; returns the length needed. */
 size_t mdaw_engine_versions(char* buffer, size_t capacity);
 
 /* ---- the project: derived from the application's canonical project ----------------------- */
 
+typedef enum mdaw_entity_kind {
+    MDAW_ENTITY_TRACK = 1,
+    MDAW_ENTITY_CLIP = 2,
+    MDAW_ENTITY_DEVICE = 3,
+    MDAW_ENTITY_TEMPO = 4
+} mdaw_entity_kind;
+/* 1 if the engine has something of this kind under this id, 0 if not (or on bad arguments). */
+int32_t mdaw_project_has(mdaw_engine* engine, int32_t kind, uint64_t id);
+
 /* Removes everything: tracks, tempo points, mappings. Playback stops. */
 mdaw_status mdaw_project_clear(mdaw_engine* engine);
 
 /* Tempo map. A point at tick 0 always exists (120 bpm until put). bpm in thousandths. One
- * point per tick: a put at a tick another id holds replaces that point. Tempo changes in steps. */
+ * point per tick: a put at a tick another id holds replaces that point. Tempo changes in steps.
+ * The engine plays 20 to 300 bpm; anything else is MDAW_ERR_ARGUMENT. */
 mdaw_status mdaw_tempo_put(mdaw_engine* engine, uint64_t tempo_id, int64_t tick, uint32_t milli_bpm);
 mdaw_status mdaw_tempo_remove(mdaw_engine* engine, uint64_t tempo_id);
 
@@ -97,6 +111,7 @@ mdaw_status mdaw_clip_add(mdaw_engine* engine, uint64_t track, uint64_t clip,
                           int64_t start_tick, int64_t length_ticks, const char* name);
 mdaw_status mdaw_clip_remove(mdaw_engine* engine, uint64_t clip);
 mdaw_status mdaw_clip_set_range(mdaw_engine* engine, uint64_t clip, int64_t start_tick, int64_t length_ticks);
+mdaw_status mdaw_clip_set_name(mdaw_engine* engine, uint64_t clip, const char* name);
 
 /* Notes; start is relative to the clip's start. velocity 1..127. */
 typedef struct mdaw_note {
@@ -113,7 +128,10 @@ mdaw_status mdaw_notes_remove(mdaw_engine* engine, uint64_t clip, const uint64_t
 /* Devices: instruments and effects on a track, in order.
  * format "builtin" with identifier "4osc" is the engine's own synth and always available.
  * Otherwise format is "VST3", "LV2" or "CLAP" and identifier is the plugin's identifier as
- * mdaw_plugins_list reports it. A plugin that is not installed gives MDAW_ERR_NOT_FOUND, one
+ * mdaw_plugins_list reports it: the plugin's OWN id, the same on every machine that has the
+ * plugin installed, wherever it is installed — for CLAP the plugin id ("org.example.synth"),
+ * for LV2 the plugin URI, for VST3 the class id as 32 hex digits. The pair (format, identifier)
+ * is what a shared project stores. A plugin that is not installed gives MDAW_ERR_NOT_FOUND, one
  * that fails to load MDAW_ERR_PLUGIN; in both cases the device is NOT created. */
 mdaw_status mdaw_device_add(mdaw_engine* engine, uint64_t track, uint64_t device, uint64_t after_device,
                             const char* format, const char* identifier);
@@ -121,18 +139,28 @@ mdaw_status mdaw_device_remove(mdaw_engine* engine, uint64_t device);
 mdaw_status mdaw_device_move(mdaw_engine* engine, uint64_t device, uint64_t after_device);
 mdaw_status mdaw_device_set_bypass(mdaw_engine* engine, uint64_t device, int32_t bypass);
 /* Parameters are named by the plugin's own parameter id, never by name or index (for CLAP the
- * decimal clap_id). value is normalised 0..1. Unknown parameter: MDAW_ERR_NOT_FOUND; so is
+ * decimal clap_id, for LV2 "sym:" and the port symbol). value is normalised 0..1. Unknown parameter: MDAW_ERR_NOT_FOUND; so is
  * mdaw_device_get_param on a device that does not exist, as it has no value to give.
  * A value set here reaches the plugin with the next block it processes: state read before
  * that still holds the old value. */
 mdaw_status mdaw_device_set_param(mdaw_engine* engine, uint64_t device, const char* param_id, float value);
 mdaw_status mdaw_device_get_param(mdaw_engine* engine, uint64_t device, const char* param_id, float* value);
-/* JSON array of {"id","name","value","default","steps"}; returns the length needed. */
+/* JSON array of {"id","name","value","default","steps","min","max","text"}; returns the
+ * length needed. value and default are normalised. min and max are the plugin's own range for
+ * the parameter where the format has one (CLAP), so that plain = min + normalised * (max - min);
+ * otherwise 0 and 1. steps is 0 for a continuous parameter. text is the current value as the
+ * plugin displays it ("440 Hz"). */
 size_t mdaw_device_params(mdaw_engine* engine, uint64_t device, char* buffer, size_t capacity);
+/* How the plugin displays this normalised value of the parameter; returns the length needed. */
+size_t mdaw_device_param_text(mdaw_engine* engine, uint64_t device, const char* param_id, float value,
+                              char* buffer, size_t capacity);
 /* The plugin's opaque state. Reading flushes it from the plugin first. Returns the length
  * needed; 0 if the device does not exist or has no state. */
 size_t mdaw_device_get_state(mdaw_engine* engine, uint64_t device, uint8_t* buffer, size_t capacity);
 mdaw_status mdaw_device_set_state(mdaw_engine* engine, uint64_t device, const uint8_t* bytes, size_t length);
+/* Back to the state the plugin had when the device was made. The device keeps its id and
+ * place. A plugin that saves no state at all cannot be reset: MDAW_ERR_PLUGIN. */
+mdaw_status mdaw_device_reset_state(mdaw_engine* engine, uint64_t device);
 /* The plugin's own window. Opening one that is open brings it to the front. */
 mdaw_status mdaw_device_show_editor(mdaw_engine* engine, uint64_t device, int32_t show);
 
@@ -141,7 +169,10 @@ mdaw_status mdaw_device_show_editor(mdaw_engine* engine, uint64_t device, int32_
 /* Scans the usual folders for one format ("VST3", "LV2", "CLAP"). Blocks until done. For now
  * in this process: a plugin that crashes while being scanned takes the application with it. */
 mdaw_status mdaw_plugins_scan(mdaw_engine* engine, const char* format);
-/* JSON array of {"format","identifier","name","vendor","instrument"}; returns the length needed. */
+/* JSON array of {"format","identifier","name","vendor","instrument"}; returns the length needed.
+ * identifier is as described at mdaw_device_add. The engine remembers scan results between
+ * runs (in settings_dir), but lists only plugins it can load now: the format is enabled and
+ * the plugin's file is still there. */
 size_t mdaw_plugins_list(mdaw_engine* engine, char* buffer, size_t capacity);
 
 /* ---- local playback: never part of the project ------------------------------------------- */

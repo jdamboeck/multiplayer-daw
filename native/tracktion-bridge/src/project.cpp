@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstring>
 #include <optional>
+#include <set>
 
 #if JUCE_LINUX
  #include <dlfcn.h>
@@ -216,6 +217,25 @@ struct Project::Device : te::AutomatableParameter::Listener,
         return nullptr;
     }
 
+    /// How the plugin shows a normalised value of the parameter, with its unit if it gives one
+    /// apart.
+    juce::String textOf (te::AutomatableParameter& p, float normalised) const
+    {
+        juce::String text, label;
+        if (auto* hosted = hostedOf (p))
+        {
+            text = hosted->getText (normalised, 1024);
+            label = hosted->getLabel();
+        }
+        else
+        {
+            text = p.valueToString (p.valueRange.convertFrom0to1 (normalised));
+            label = p.getLabel();
+        }
+        label = label.trim();
+        return label.isEmpty() || text.endsWith (label) ? text : text + " " + label;
+    }
+
     void curveHasChanged (te::AutomatableParameter&) override {}
     void parameterChanged (te::AutomatableParameter& p, float) override { owner.parameterMoved (*this, p); }
 
@@ -235,6 +255,10 @@ struct Project::Device : te::AutomatableParameter::Listener,
     te::Plugin::Ptr plugin;
     std::vector<Param> params;
     std::map<juce::String, float> known;   // last value of each parameter the application knows of
+    // What mdaw_device_reset_state goes back to: the plugin's state (external) or the device's
+    // tree (built-in) as they were right after the device was made.
+    juce::MemoryBlock initialState;
+    juce::ValueTree initialTree;
     std::atomic<bool> stateChanged { false };
     juce::uint32 ignoreStateUntil = 0;
 };
@@ -274,6 +298,7 @@ Project::Project (const Config& c, Shared& s) : config (c), shared (s)
     if (config.enablePlugins)
         engine->getPluginManager().pluginFormatManager.addFormat (mdaw::createClapFormat().release());
 
+    pluginIds = std::make_unique<PluginIds> (config.settingsDir.getChildFile ("plugin-ids.xml"));
     engine->getDeviceManager().addChangeListener (this);
     edit = makeEdit();
 
@@ -401,6 +426,18 @@ void Project::placeClip (Clip& c)
     c.clip->setPosition ({ { timeOf (c.start), timeOf (c.start + c.length) }, te::TimeDuration() });
 }
 
+bool Project::has (int32_t kind, uint64_t id) const
+{
+    switch (kind)
+    {
+        case MDAW_ENTITY_TRACK:  return tracks.count (id) > 0;
+        case MDAW_ENTITY_CLIP:   return clips.count (id) > 0;
+        case MDAW_ENTITY_DEVICE: return devices.count (id) > 0;
+        case MDAW_ENTITY_TEMPO:  return tempos.count (id) > 0;
+        default:                 fail (MDAW_ERR_ARGUMENT, "unknown entity kind " + juce::String (kind));
+    }
+}
+
 //==============================================================================
 void Project::tempoPut (uint64_t id, int64_t tick, uint32_t milliBpm)
 {
@@ -408,7 +445,8 @@ void Project::tempoPut (uint64_t id, int64_t tick, uint32_t milliBpm)
     if (tick < 0) fail (MDAW_ERR_ARGUMENT, "negative tempo position");
     const double bpm = milliBpm / 1000.0;
     if (bpm < te::TempoSetting::minBPM || bpm > te::TempoSetting::maxBPM)
-        fail (MDAW_ERR_ARGUMENT, "tempo out of range (" + juce::String (te::TempoSetting::minBPM) + " to " + juce::String (te::TempoSetting::maxBPM) + " bpm)");
+        fail (MDAW_ERR_ARGUMENT, "tempo " + juce::String (bpm, 3) + " bpm is outside the engine's range of "
+                                   + juce::String ((int) te::TempoSetting::minBPM) + " to " + juce::String ((int) te::TempoSetting::maxBPM) + " bpm");
 
     // One point per position: a point put where another one is takes its place.
     for (auto it = tempos.begin(); it != tempos.end();)
@@ -573,6 +611,12 @@ void Project::clipSetRange (uint64_t id, int64_t start, int64_t length)
     }
 }
 
+void Project::clipSetName (uint64_t id, const juce::String& name)
+{
+    if (auto* c = clip (id))
+        c->clip->setName (name);
+}
+
 //==============================================================================
 namespace
 {
@@ -676,11 +720,17 @@ void Project::deviceAdd (uint64_t trackId, uint64_t id, uint64_t after, const ju
     {
         if (! config.enablePlugins)
             fail (MDAW_ERR_NOT_FOUND, "plugins are switched off in this engine");
-        // Tracktion only loads plugins that are in its list of known plugins.
+        // Tracktion only loads plugins that are in its list of known plugins. The identifier is
+        // the plugin's own id (see plugin_ids.h); of several files with the same plugin the
+        // first in the list is taken.
         std::optional<juce::PluginDescription> found;
-        for (auto& d : engine->getPluginManager().knownPluginList.getTypes())
-            if (d.pluginFormatName == format && d.createIdentifierString() == identifier)
+        for (auto& [d, ownId] : loadablePlugins())
+            if (d.pluginFormatName == format && ownId == identifier)
+            {
                 found = d;
+                break;
+            }
+        pluginIds->save();
         if (! found)
             fail (MDAW_ERR_NOT_FOUND, format + " plugin '" + identifier + "' is not installed (or not scanned)");
         pinModule (*found);
@@ -699,7 +749,13 @@ void Project::deviceAdd (uint64_t trackId, uint64_t id, uint64_t after, const ju
         plugin->deleteFromParent();
         fail (MDAW_ERR_PLUGIN, "could not load " + identifier + ": " + error);
     }
-    devices[id] = std::make_unique<Device> (*this, id, trackId, plugin);
+    auto d = std::make_unique<Device> (*this, id, trackId, plugin);
+    // Taken before anything is applied: what mdaw_device_reset_state returns to.
+    if (auto* pi = d->instance())
+        pi->getStateInformation (d->initialState);
+    else
+        d->initialTree = plugin->state.createCopy();
+    devices[id] = std::move (d);
 }
 
 void Project::removeDevice (uint64_t id)
@@ -792,11 +848,14 @@ juce::String Project::deviceParams (uint64_t id)
         auto& p = *param;
         juce::var defaultValue;
         int steps = p.getNumberOfStates();
-        if (auto* hosted = d->hostedOf (p))
+        double min = 0.0, max = 1.0;
+        auto* hosted = d->hostedOf (p);
+        if (hosted != nullptr)
         {
             defaultValue = hosted->getDefaultValue();
             if (hosted->isDiscrete() || hosted->isBoolean())
                 steps = hosted->getNumSteps();
+            mdaw::clapParameterRange (hosted, min, max);   // CLAP has a plain range; others stay 0..1
         }
         else if (auto def = p.getDefaultValue())
         {
@@ -806,9 +865,24 @@ juce::String Project::deviceParams (uint64_t id)
                             { "name", p.getParameterName() },
                             { "value", p.getCurrentNormalisedValue() },
                             { "default", defaultValue },
-                            { "steps", steps } }));
+                            { "steps", steps },
+                            { "min", min },
+                            { "max", max },
+                            { "text", d->textOf (p, p.getCurrentNormalisedValue()) } }));
     }
     return json (list);
+}
+
+juce::String Project::deviceParamText (uint64_t id, const juce::String& paramId, float value)
+{
+    if (! std::isfinite (value) || value < 0.0f || value > 1.0f) fail (MDAW_ERR_ARGUMENT, "parameter value must be 0..1");
+    auto* d = device (id);
+    if (d == nullptr)
+        fail (MDAW_ERR_NOT_FOUND, "no such device");
+    auto* p = d->find (paramId);
+    if (p == nullptr)
+        fail (MDAW_ERR_NOT_FOUND, "the device has no parameter '" + paramId + "'");
+    return d->textOf (*p, value);
 }
 
 juce::MemoryBlock Project::deviceGetState (uint64_t id)
@@ -832,9 +906,35 @@ juce::MemoryBlock Project::deviceGetState (uint64_t id)
 
 void Project::deviceSetState (uint64_t id, const void* data, size_t size)
 {
+    if (auto* d = device (id))
+        restoreState (*d, data, size);
+}
+
+void Project::deviceResetState (uint64_t id)
+{
     auto* d = device (id);
     if (d == nullptr)
         return;
+    if (d->instance() != nullptr)
+    {
+        // A plugin that saves no state has nothing to go back to through it.
+        if (d->initialState.isEmpty())
+            fail (MDAW_ERR_PLUGIN, "the plugin gave no state when it was loaded, so it cannot be reset");
+        restoreState (*d, d->initialState.getData(), d->initialState.getSize());
+    }
+    else
+    {
+        juce::MemoryBlock block;
+        juce::MemoryOutputStream out (block, false);
+        d->initialTree.writeToStream (out);
+        out.flush();
+        restoreState (*d, block.getData(), block.getSize());
+    }
+}
+
+void Project::restoreState (Device& device, const void* data, size_t size)
+{
+    auto* d = &device;
     const juce::ScopedValueSetter<bool> own (ownChange, true);
     d->ignoreStateUntil = juce::Time::getMillisecondCounter() + 500;
 
@@ -934,21 +1034,52 @@ void Project::pluginsScan (const juce::String& format)
         juce::String name;
         while (scanner.scanNextFile (true, name)) {}
         engine->getPropertyStorage().flushSettingsToDisk();
+        // Reads the own ids of what was found while the libraries are fresh, and keeps them.
+        loadablePlugins();
+        pluginIds->save();
         return;
     }
     fail (MDAW_ERR_NOT_FOUND, "no plugin format '" + format + "'");
 }
 
+std::vector<std::pair<juce::PluginDescription, juce::String>> Project::loadablePlugins()
+{
+    std::vector<std::pair<juce::PluginDescription, juce::String>> result;
+    if (! config.enablePlugins)
+        return result;
+    auto& pm = engine->getPluginManager();
+    std::set<std::pair<juce::String, juce::String>> seen;
+    // The remembered list may hold plugins scanned on an earlier run (or with an older bridge):
+    // only those whose format is here and whose file is still there are offered, and only under
+    // an own id read from the plugin itself.
+    for (auto& d : pm.knownPluginList.getTypes())
+    {
+        if (d.pluginFormatName != "CLAP" && d.pluginFormatName != "VST3" && d.pluginFormatName != "LV2")
+            continue;
+        juce::AudioPluginFormat* format = nullptr;
+        for (auto* f : pm.pluginFormatManager.getFormats())
+            if (f->getName() == d.pluginFormatName)
+                format = f;
+        if (format == nullptr || ! format->doesPluginStillExist (d))
+            continue;
+        auto ownId = pluginIds->of (d);
+        if (ownId.isEmpty() || ! seen.insert ({ d.pluginFormatName, ownId }).second)
+            continue;
+        result.emplace_back (d, ownId);
+    }
+    return result;
+}
+
 juce::String Project::pluginsList()
 {
     juce::Array<juce::var> list;
-    if (config.enablePlugins)
-        for (auto& d : engine->getPluginManager().knownPluginList.getTypes())
-            list.add (object ({ { "format", d.pluginFormatName },
-                                { "identifier", d.createIdentifierString() },
-                                { "name", d.name },
-                                { "vendor", d.manufacturerName },
-                                { "instrument", d.isInstrument } }));
+    for (auto& [d, ownId] : loadablePlugins())
+        list.add (object ({ { "format", d.pluginFormatName },
+                            { "identifier", ownId },
+                            { "name", d.name },
+                            { "vendor", d.manufacturerName },
+                            { "instrument", d.isInstrument } }));
+    pluginIds->save();
     return json (list);
 }
 

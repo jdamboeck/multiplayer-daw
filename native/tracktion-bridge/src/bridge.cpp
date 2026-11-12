@@ -21,11 +21,16 @@ struct mdaw_engine
 namespace
 {
 thread_local std::string lastError;
+thread_local mdaw_status lastStatus = MDAW_OK;
 
 std::mutex lifeMutex;
 mdaw_engine* liveEngine = nullptr;   // one engine per process
 
-void setError (std::string message) { lastError = std::move (message); }
+void setError (mdaw_status status, std::string message)
+{
+    lastStatus = status;
+    lastError = std::move (message);
+}
 
 /// Runs `fn` and turns whatever it throws into a status and the calling thread's error text.
 template <typename Fn>
@@ -36,9 +41,9 @@ mdaw_status guarded (Fn&& fn) noexcept
         fn();
         return MDAW_OK;
     }
-    catch (const Failure& f)            { setError (f.what()); return f.status; }
-    catch (const std::exception& e)     { setError (e.what()); return MDAW_ERR_INTERNAL; }
-    catch (...)                         { setError ("unknown C++ exception"); return MDAW_ERR_INTERNAL; }
+    catch (const Failure& f)            { setError (f.status, f.what()); return f.status; }
+    catch (const std::exception& e)     { setError (MDAW_ERR_INTERNAL, e.what()); return MDAW_ERR_INTERNAL; }
+    catch (...)                         { setError (MDAW_ERR_INTERNAL, "unknown C++ exception"); return MDAW_ERR_INTERNAL; }
 }
 
 [[noreturn]] void argumentError (const char* what) { throw Failure (MDAW_ERR_ARGUMENT, what); }
@@ -81,7 +86,7 @@ size_t textFrom (mdaw_engine* engine, char* buffer, size_t capacity, Fn&& fn) no
     }
     catch (...)
     {
-        setError ("could not copy the result");
+        setError (MDAW_ERR_INTERNAL, "could not copy the result");
         return 0;
     }
 }
@@ -98,12 +103,13 @@ mdaw_engine* mdaw_engine_create (const mdaw_engine_config* config)
 {
     try
     {
-        if (config == nullptr) { setError ("config is NULL"); return nullptr; }
-        if (config->abi_version != MDAW_ABI_VERSION) { setError ("abi_version " + std::to_string (config->abi_version) + " is not " + std::to_string (MDAW_ABI_VERSION)); return nullptr; }
-        if (config->settings_dir == nullptr || *config->settings_dir == 0) { setError ("settings_dir is empty"); return nullptr; }
+        if (config == nullptr) { setError (MDAW_ERR_ARGUMENT, "config is NULL"); return nullptr; }
+        if (config->abi_version != MDAW_ABI_VERSION) { setError (MDAW_ERR_ARGUMENT, "abi_version " + std::to_string (config->abi_version) + " is not " + std::to_string (MDAW_ABI_VERSION)); return nullptr; }
+        if (config->settings_dir == nullptr || *config->settings_dir == 0) { setError (MDAW_ERR_ARGUMENT, "settings_dir is empty"); return nullptr; }
 
         const std::scoped_lock lock (lifeMutex);
-        if (liveEngine != nullptr) { setError ("an engine already exists in this process"); return nullptr; }
+        // Not a bad argument and nothing missing: "anything else".
+        if (liveEngine != nullptr) { setError (MDAW_ERR_INTERNAL, "an engine already exists in this process"); return nullptr; }
 
         mdaw::bridge::Config c;
         c.appName = config->app_name != nullptr && *config->app_name != 0 ? text (config->app_name) : juce::String ("mdaw");
@@ -118,8 +124,9 @@ mdaw_engine* mdaw_engine_create (const mdaw_engine_config* config)
         liveEngine = engine.release();
         return liveEngine;
     }
-    catch (const std::exception& e) { setError (e.what()); }
-    catch (...) { setError ("unknown C++ exception"); }
+    catch (const Failure& f) { setError (f.status, f.what()); }
+    catch (const std::exception& e) { setError (MDAW_ERR_INTERNAL, e.what()); }
+    catch (...) { setError (MDAW_ERR_INTERNAL, "unknown C++ exception"); }
     return nullptr;
 }
 
@@ -152,20 +159,31 @@ size_t mdaw_last_error (char* buffer, size_t capacity)
     return length;
 }
 
+mdaw_status mdaw_last_status (void) { return lastStatus; }
+
 size_t mdaw_engine_versions (char* buffer, size_t capacity)
 {
     try
     {
-        return copyOut ("Tracktion Engine " + tracktion::Engine::getVersion() + " / " + juce::SystemStats::getJUCEVersion(), buffer, capacity);
+        // Both already say what they are: "Tracktion Engine v3.1.0", "JUCE v8.0.6".
+        return copyOut (tracktion::Engine::getVersion() + " / " + juce::SystemStats::getJUCEVersion(), buffer, capacity);
     }
     catch (...)
     {
-        setError ("could not build the version text");
+        setError (MDAW_ERR_INTERNAL, "could not build the version text");
         return 0;
     }
 }
 
 //==============================================================================
+int32_t mdaw_project_has (mdaw_engine* engine, int32_t kind, uint64_t id)
+{
+    bool result = false;
+    if (onEngine (engine, [&] (Project& p) { result = p.has (kind, id); }) != MDAW_OK)
+        return 0;
+    return result ? 1 : 0;
+}
+
 mdaw_status mdaw_project_clear (mdaw_engine* engine)
 {
     return guarded ([engine]
@@ -229,6 +247,11 @@ mdaw_status mdaw_clip_remove (mdaw_engine* engine, uint64_t clip)
 mdaw_status mdaw_clip_set_range (mdaw_engine* engine, uint64_t clip, int64_t start_tick, int64_t length_ticks)
 {
     return onEngine (engine, [&] (Project& p) { p.clipSetRange (clip, start_tick, length_ticks); });
+}
+
+mdaw_status mdaw_clip_set_name (mdaw_engine* engine, uint64_t clip, const char* name)
+{
+    return onEngine (engine, [&] (Project& p) { p.clipSetName (clip, text (name)); });
 }
 
 mdaw_status mdaw_notes_put (mdaw_engine* engine, uint64_t clip, const mdaw_note* notes, size_t count)
@@ -297,6 +320,16 @@ size_t mdaw_device_params (mdaw_engine* engine, uint64_t device, char* buffer, s
     return textFrom (engine, buffer, capacity, [&] (Project& p) { return p.deviceParams (device); });
 }
 
+size_t mdaw_device_param_text (mdaw_engine* engine, uint64_t device, const char* param_id, float value,
+                               char* buffer, size_t capacity)
+{
+    return textFrom (engine, buffer, capacity, [&] (Project& p)
+    {
+        if (param_id == nullptr) argumentError ("param_id is NULL");
+        return p.deviceParamText (device, text (param_id), value);
+    });
+}
+
 size_t mdaw_device_get_state (mdaw_engine* engine, uint64_t device, uint8_t* buffer, size_t capacity)
 {
     juce::MemoryBlock state;
@@ -314,6 +347,11 @@ mdaw_status mdaw_device_set_state (mdaw_engine* engine, uint64_t device, const u
         if (bytes == nullptr || length == 0) argumentError ("no state given");
         p.deviceSetState (device, bytes, length);
     });
+}
+
+mdaw_status mdaw_device_reset_state (mdaw_engine* engine, uint64_t device)
+{
+    return onEngine (engine, [&] (Project& p) { p.deviceResetState (device); });
 }
 
 mdaw_status mdaw_device_show_editor (mdaw_engine* engine, uint64_t device, int32_t show)
@@ -402,7 +440,7 @@ int32_t mdaw_engine_poll_event (mdaw_engine* engine, mdaw_event* out)
 {
     if (engine == nullptr || out == nullptr)
     {
-        setError ("engine or out is NULL");
+        setError (MDAW_ERR_ARGUMENT, "engine or out is NULL");
         return 0;
     }
     try
@@ -411,7 +449,7 @@ int32_t mdaw_engine_poll_event (mdaw_engine* engine, mdaw_event* out)
     }
     catch (...)
     {
-        setError ("could not read the event queue");
+        setError (MDAW_ERR_INTERNAL, "could not read the event queue");
         return 0;
     }
 }

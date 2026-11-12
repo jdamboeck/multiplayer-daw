@@ -9,7 +9,7 @@
 
 use std::ffi::c_char;
 
-pub const MDAW_ABI_VERSION: u32 = 1;
+pub const MDAW_ABI_VERSION: u32 = 2;
 pub const MDAW_TICKS_PER_QUARTER: i64 = 960;
 
 /// Opaque engine handle.
@@ -30,6 +30,13 @@ pub const MDAW_ERR_DEVICE: mdaw_status = 3;
 pub const MDAW_ERR_PLUGIN: mdaw_status = 4;
 pub const MDAW_ERR_IO: mdaw_status = 5;
 pub const MDAW_ERR_INTERNAL: mdaw_status = 6;
+
+/// `mdaw_entity_kind`, as `mdaw_project_has` takes it.
+pub type mdaw_entity_kind = i32;
+pub const MDAW_ENTITY_TRACK: mdaw_entity_kind = 1;
+pub const MDAW_ENTITY_CLIP: mdaw_entity_kind = 2;
+pub const MDAW_ENTITY_DEVICE: mdaw_entity_kind = 3;
+pub const MDAW_ENTITY_TEMPO: mdaw_entity_kind = 4;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -102,9 +109,11 @@ unsafe extern "C" {
     pub fn mdaw_engine_destroy(engine: *mut mdaw_engine);
     pub safe fn mdaw_abi_version() -> u32;
     pub fn mdaw_last_error(buffer: *mut c_char, capacity: usize) -> usize;
+    pub safe fn mdaw_last_status() -> mdaw_status;
     pub fn mdaw_engine_versions(buffer: *mut c_char, capacity: usize) -> usize;
 
     // ---- the project
+    pub fn mdaw_project_has(engine: *mut mdaw_engine, kind: i32, id: u64) -> i32;
     pub fn mdaw_project_clear(engine: *mut mdaw_engine) -> mdaw_status;
     pub fn mdaw_tempo_put(engine: *mut mdaw_engine, tempo_id: u64, tick: i64, milli_bpm: u32) -> mdaw_status;
     pub fn mdaw_tempo_remove(engine: *mut mdaw_engine, tempo_id: u64) -> mdaw_status;
@@ -142,6 +151,7 @@ unsafe extern "C" {
         start_tick: i64,
         length_ticks: i64,
     ) -> mdaw_status;
+    pub fn mdaw_clip_set_name(engine: *mut mdaw_engine, clip: u64, name: *const c_char) -> mdaw_status;
 
     pub fn mdaw_notes_put(
         engine: *mut mdaw_engine,
@@ -185,6 +195,14 @@ unsafe extern "C" {
         buffer: *mut c_char,
         capacity: usize,
     ) -> usize;
+    pub fn mdaw_device_param_text(
+        engine: *mut mdaw_engine,
+        device: u64,
+        param_id: *const c_char,
+        value: f32,
+        buffer: *mut c_char,
+        capacity: usize,
+    ) -> usize;
     pub fn mdaw_device_get_state(
         engine: *mut mdaw_engine,
         device: u64,
@@ -197,6 +215,7 @@ unsafe extern "C" {
         bytes: *const u8,
         length: usize,
     ) -> mdaw_status;
+    pub fn mdaw_device_reset_state(engine: *mut mdaw_engine, device: u64) -> mdaw_status;
     pub fn mdaw_device_show_editor(engine: *mut mdaw_engine, device: u64, show: i32) -> mdaw_status;
 
     // ---- plugins on this machine
@@ -237,6 +256,12 @@ mod tests {
     #[test]
     fn abi_version_matches() {
         assert_eq!(mdaw_abi_version(), MDAW_ABI_VERSION);
+    }
+
+    #[test]
+    fn no_failure_yet_is_ok() {
+        // A fresh thread has made no call that failed.
+        assert_eq!(std::thread::spawn(|| mdaw_last_status()).join().unwrap(), MDAW_OK);
     }
 
     /// Verified against the header with a C program (`sizeof`, `_Alignof`, `offsetof`) on

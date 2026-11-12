@@ -183,6 +183,82 @@ static const char* stringValue (const char* from, const char* key, char* out, si
     return p;
 }
 
+/* The number value of "key" at or after `from`; NAN if there is none. */
+static double realValue (const char* from, const char* key)
+{
+    char quoted[64];
+    snprintf (quoted, sizeof quoted, "\"%s\"", key);
+    const char* p = strstr (from, quoted);
+    if (p == NULL) return NAN;
+    p += strlen (quoted);
+    while (*p == ' ' || *p == ':') ++p;
+    char* end = NULL;
+    double v = strtod (p, &end);
+    return end == p ? NAN : v;
+}
+
+/* The object of the parameter with this id in a parameter list, copied into out; 0 if none. */
+static int paramObject (const char* json, const char* id, char* out, size_t capacity)
+{
+    char wanted[96];
+    snprintf (wanted, sizeof wanted, "\"id\": \"%s\"", id);
+    const char* p = strstr (json, wanted);
+    if (p == NULL) return 0;
+    while (p > json && *p != '{') --p;
+    const char* end = strchr (p, '}');
+    if (end == NULL) return 0;
+    size_t n = (size_t) (end - p + 1);
+    if (n + 1 > capacity) return 0;
+    memcpy (out, p, n);
+    out[n] = 0;
+    return 1;
+}
+
+/* How often `needle` occurs in `text`. */
+static int occurrences (const char* text, const char* needle)
+{
+    int n = 0;
+    for (const char* p = strstr (text, needle); p != NULL; p = strstr (p + 1, needle)) ++n;
+    return n;
+}
+
+static int copyFile (const char* from, const char* to)
+{
+    FILE* in = fopen (from, "rb");
+    if (in == NULL) return 0;
+    FILE* out = fopen (to, "wb");
+    if (out == NULL) { fclose (in); return 0; }
+    char block[65536];
+    size_t n;
+    int ok = 1;
+    while ((n = fread (block, 1, sizeof block, in)) > 0) ok &= fwrite (block, 1, n, out) == n;
+    fclose (in);
+    return fclose (out) == 0 && ok;
+}
+
+static char* paramText (mdaw_engine* e, uint64_t device, const char* param, float value)
+{
+    size_t n = mdaw_device_param_text (e, device, param, value, NULL, 0);
+    char* text = malloc (n + 1);
+    text[0] = 0;
+    mdaw_device_param_text (e, device, param, value, text, n + 1);
+    return text;
+}
+
+#define TEST_SYNTH_ID "org.mdaw.test-synth"
+
+/* The identifier of the plugin named `name` in a plugin list, copied into out. */
+static void identifierOf (const char* list, const char* name, char* out, size_t capacity)
+{
+    char quoted[256];
+    snprintf (quoted, sizeof quoted, "\"%s\"", name);
+    out[0] = 0;
+    const char* at = strstr (list, quoted);
+    if (at == NULL) return;
+    while (at > list && *at != '{') --at;
+    stringValue (at, "identifier", out, capacity);
+}
+
 static long numberValue (const char* from, const char* key)
 {
     char quoted[64];
@@ -263,6 +339,30 @@ static mdaw_engine* create (void)
     return mdaw_engine_create (&config);
 }
 
+/* After a restart, with no scan: the test synth is listed under the same identifier and loads. */
+static void restartedPluginList (mdaw_engine* e, int haveExternal)
+{
+    if (! haveExternal) return;
+    char* list = pluginsJson (e);
+    char identifier[1024] = "";
+    identifierOf (list, "mdaw Test Synth", identifier, sizeof identifier);
+    printf ("plugins after restart: %s\n", list);
+    check (strcmp (identifier, TEST_SYNTH_ID) == 0 && occurrences (list, "\"" TEST_SYNTH_ID "\"") == 1, "restart_same_identifier");
+    free (list);
+    mdaw_note extNotes[8];
+    quarterNotes (extNotes, 2000);
+    mdaw_status s = mdaw_track_add (e, EXT_TRACK, TRACK, "External");
+    s |= mdaw_device_add (e, EXT_TRACK, EXT, 0, "CLAP", TEST_SYNTH_ID);
+    if (s != MDAW_OK) printLastError ("device_add after restart");
+    s |= mdaw_clip_add (e, EXT_TRACK, EXT_CLIP, 0, 8 * Q, "Ext");
+    s |= mdaw_notes_put (e, EXT_CLIP, extNotes, 8);
+    mdaw_track_set_mix (e, TRACK, 1.0f, 0.0f, 1);
+    Wav w = render (e, "external_after_restart", 0, 8 * Q);
+    measure ("external_after_restart_peak", peakOf (&w));
+    check (s == MDAW_OK && peakOf (&w) > 0.01, "restart_plugin_loads");
+    freeWav (&w);
+}
+
 int main (void)
 {
     setvbuf (stdout, NULL, _IOLBF, 0);
@@ -276,17 +376,38 @@ int main (void)
         size_t n = mdaw_engine_versions (versions, sizeof versions);
         printf ("versions: %s\n", versions);
         check (n > 0 && n < sizeof versions, "versions");
+        check (strstr (versions, "Tracktion Engine v") != NULL && strstr (versions, "Tracktion Engine Tracktion Engine") == NULL
+               && strstr (versions, "JUCE v") != NULL, "versions_text");
+        check (mdaw_last_status() == MDAW_OK, "last_status_ok_before_any_failure");
         mdaw_engine* second = create();
         char error[512];
         size_t errorLength = mdaw_last_error (error, sizeof error);
+        mdaw_status status = mdaw_last_status();
+        printf ("second create: status %d, %s\n", (int) status, error);
         check (second == NULL && errorLength > 0, "second_create_refused");
+        check (status == MDAW_ERR_INTERNAL, "second_create_last_status");
         if (second != NULL) mdaw_engine_destroy (second);
+        mdaw_engine_config bad;
+        memset (&bad, 0, sizeof bad);
+        bad.abi_version = 1;
+        bad.settings_dir = SCRATCH "/settings";
+        check (mdaw_engine_create (&bad) == NULL && mdaw_last_status() == MDAW_ERR_ARGUMENT, "old_abi_refused_as_argument");
     }
 
     /* 2. A project, rendered --------------------------------------------------------------- */
     mdaw_note notes[8];
     quarterNotes (notes, 1000);
     build (e, notes);
+    check (mdaw_project_has (e, MDAW_ENTITY_TRACK, TRACK) == 1 && mdaw_project_has (e, MDAW_ENTITY_CLIP, CLIP) == 1
+           && mdaw_project_has (e, MDAW_ENTITY_DEVICE, SYNTH) == 1 && mdaw_project_has (e, MDAW_ENTITY_TEMPO, TEMPO0) == 1,
+           "has_after_build");
+    check (mdaw_project_has (e, MDAW_ENTITY_TRACK, CLIP) == 0 && mdaw_project_has (e, MDAW_ENTITY_DEVICE, TRACK) == 0
+           && mdaw_project_has (e, MDAW_ENTITY_TEMPO, TEMPO2) == 0 && mdaw_project_has (e, MDAW_ENTITY_CLIP, 999) == 0,
+           "has_not_for_other_kinds_or_ids");
+    check (mdaw_project_has (e, 99, TRACK) == 0 && mdaw_last_status() == MDAW_ERR_ARGUMENT && mdaw_project_has (NULL, MDAW_ENTITY_TRACK, TRACK) == 0,
+           "has_bad_arguments");
+    check (mdaw_clip_set_name (e, CLIP, "Renamed clip") == MDAW_OK && mdaw_clip_set_name (e, 999, "x") == MDAW_OK
+           && mdaw_clip_set_name (e, CLIP, NULL) == MDAW_OK, "clip_set_name");
     Wav w = render (e, "first", 0, 8 * Q);
     measure ("first_seconds", seconds (&w));
     measure ("first_peak", peakOf (&w));
@@ -348,6 +469,14 @@ int main (void)
         bad &= mdaw_render (e, NULL, 0, Q, 44100.0) == MDAW_ERR_ARGUMENT;
         bad &= mdaw_device_add (e, TRACK, 5, 0, NULL, "4osc") == MDAW_ERR_ARGUMENT;
         bad &= mdaw_tempo_put (e, 3, 0, 0) == MDAW_ERR_ARGUMENT;
+        {
+            char tempoError[512];
+            mdaw_status t = mdaw_tempo_put (e, 3, 0, 301000);
+            mdaw_last_error (tempoError, sizeof tempoError);
+            printf ("tempo error: %s\n", tempoError);
+            check (t == MDAW_ERR_ARGUMENT && strstr (tempoError, "20 to 300") != NULL && mdaw_tempo_put (e, 3, Q, 300000) == MDAW_OK
+                   && mdaw_tempo_remove (e, 3) == MDAW_OK, "tempo_range_says_range");
+        }
         bad &= mdaw_clip_add (e, TRACK, 6, 0, 0, "empty") == MDAW_ERR_ARGUMENT;
         printf ("last error: %s\n", error);
         check (bad, "bad_arguments_refused");
@@ -522,7 +651,31 @@ int main (void)
         measure ("synth_params_json_bytes", (double) strlen (json));
         check (json[0] == '[' && strlen (json) > 10 && found, "synth_params_listed");
         printf ("param used: %s\n", param);
+        {
+            char object[1024] = "";
+            paramObject (json, param, object, sizeof object);
+            printf ("builtin param: %s\n", object);
+            char text[256] = "";
+            check (realValue (object, "min") == 0.0 && realValue (object, "max") == 1.0
+                   && stringValue (object, "text", text, sizeof text) != NULL && text[0] != 0, "builtin_param_min_max_text");
+        }
         free (json);
+
+        float initial = -1.0f;
+        mdaw_device_get_param (e, SYNTH, param, &initial);
+        {
+            char* text = paramText (e, SYNTH, param, 0.3f);
+            printf ("builtin param text at 0.3: %s\n", text);
+            check (text[0] != 0, "builtin_param_text");
+            free (text);
+            char none[64];
+            size_t n = mdaw_device_param_text (e, SYNTH, "no-such-param", 0.5f, none, sizeof none);
+            check (n == 0 && mdaw_last_status() == MDAW_ERR_NOT_FOUND, "param_text_unknown_last_status_not_found");
+            n = mdaw_device_param_text (e, 999, param, 0.5f, none, sizeof none);
+            check (n == 0 && mdaw_last_status() == MDAW_ERR_NOT_FOUND, "param_text_missing_device_not_found");
+            n = mdaw_device_param_text (e, SYNTH, param, 1.5f, none, sizeof none);
+            check (n == 0 && mdaw_last_status() == MDAW_ERR_ARGUMENT, "param_text_out_of_range");
+        }
 
         float value = -1.0f;
         mdaw_status s = mdaw_device_set_param (e, SYNTH, param, 0.25f);
@@ -545,6 +698,16 @@ int main (void)
         check (s == MDAW_OK && fabsf (value - 0.25f) < 0.01f, "synth_state_restores_param");
         free (state);
 
+        s = mdaw_device_reset_state (e, SYNTH);
+        mdaw_device_get_param (e, SYNTH, param, &value);
+        measure ("synth_param_initial", initial);
+        measure ("synth_param_after_reset", value);
+        check (s == MDAW_OK && fabsf (value - initial) < 0.01f && mdaw_project_has (e, MDAW_ENTITY_DEVICE, SYNTH) == 1, "synth_reset_state");
+        check (mdaw_device_reset_state (e, 999) == MDAW_OK, "reset_missing_device_ok");
+        w = render (e, "after_reset", 0, 8 * Q);
+        check (peakOf (&w) > 0.05, "synth_renders_after_reset");
+        freeWav (&w);
+
         /* 11. Our own changes are not reported back. */
         sleepMs (300);
         int events = drainEvents (e);
@@ -554,26 +717,43 @@ int main (void)
     }
 
     /* 10. An external plugin -------------------------------------------------------------- */
+    int haveExternal = 0;
     {
         check (mdaw_device_add (e, TRACK, 102, 0, "CLAP", "nonsense") == MDAW_ERR_NOT_FOUND, "unknown_plugin_not_found");
         char* nothing = paramsJson (e, 102);
         check (strcmp (nothing, "[]") == 0 && mdaw_device_get_state (e, 102, NULL, 0) == 0, "unknown_plugin_created_nothing");
         free (nothing);
 
+        /* A second file with the same plugin: listed once. Removed after the scan, it stays in
+         * the remembered list, which must not get in the way. */
+        char original[1024] = "", copy[1024] = "";
+        const char* clapPath = getenv ("CLAP_PATH");
+        if (clapPath != NULL && strchr (clapPath, ':') == NULL)
+        {
+            snprintf (original, sizeof original, "%s/mdaw-test-synth.clap", clapPath);
+            snprintf (copy, sizeof copy, "%s/mdaw-test-synth-copy.clap", clapPath);
+            remove (copy);
+            if (! copyFile (original, copy)) copy[0] = 0;
+        }
+
         mdaw_status scan = mdaw_plugins_scan (e, "CLAP");
         if (scan != MDAW_OK) printLastError ("scan");
         check (scan == MDAW_OK, "scan_clap");
         char* list = pluginsJson (e);
+        printf ("plugins: %s\n", list);
         char identifier[1024] = "";
-        const char* name = strstr (list, "\"mdaw Test Synth\"");
-        if (name != NULL)
+        identifierOf (list, "mdaw Test Synth", identifier, sizeof identifier);
+        if (copy[0] != 0)
         {
-            const char* objectStart = name;
-            while (objectStart > list && *objectStart != '{') --objectStart;
-            stringValue (objectStart, "identifier", identifier, sizeof identifier);
+            check (occurrences (list, "\"" TEST_SYNTH_ID "\"") == 1, "same_plugin_twice_listed_once");
+            remove (copy);
+            free (list);
+            list = pluginsJson (e);
+            check (occurrences (list, "\"" TEST_SYNTH_ID "\"") == 1, "removed_file_still_listed_once");
         }
         free (list);
 
+        haveExternal = identifier[0] != 0;
         if (identifier[0] == 0)
         {
             printf ("RESULT external_skipped=1\n");
@@ -581,6 +761,7 @@ int main (void)
         else
         {
             printf ("external identifier: %s\n", identifier);
+            check (strcmp (identifier, TEST_SYNTH_ID) == 0, "clap_identifier_is_clap_id");
             mdaw_note extNotes[8];
             quarterNotes (extNotes, 2000);
             mdaw_status s = mdaw_track_add (e, EXT_TRACK, TRACK, "External");
@@ -597,11 +778,25 @@ int main (void)
             freeWav (&w);
             mdaw_track_set_mix (e, TRACK, 1.0f, 0.0f, 0);
 
+            check (mdaw_project_has (e, MDAW_ENTITY_DEVICE, EXT) == 1, "external_has");
             char* json = paramsJson (e, EXT);
             char param[128] = "";
             int found = continuousParam (json, param, sizeof param);
             printf ("external params: %s\n", json);
             check (found, "external_params_listed");
+            {
+                char level[1024] = "", balance[1024] = "", text[256] = "";
+                int both = paramObject (json, "0", level, sizeof level) && paramObject (json, "1", balance, sizeof balance);
+                check (both && realValue (balance, "min") == -1.0 && realValue (balance, "max") == 1.0
+                       && fabs (realValue (balance, "default") - 0.5) < 1e-6
+                       && realValue (level, "min") == 0.0 && realValue (level, "max") == 1.0, "clap_param_ranges");
+                check (stringValue (level, "text", text, sizeof text) != NULL && text[0] != 0, "clap_param_text_in_list");
+                printf ("level text: %s\n", text);
+                char* t = paramText (e, EXT, "0", 0.25f);
+                printf ("level text at 0.25: %s\n", t);
+                check (t[0] != 0 && strstr (t, "25") != NULL, "clap_param_text");
+                free (t);
+            }
             free (json);
             if (found)
             {
@@ -624,6 +819,30 @@ int main (void)
                 printf ("RESULT external_state_restore_ok=%d\n", r == MDAW_OK);
                 free (state);
 
+                /* Back to the freshly loaded plugin: Level 0.5. Level 0.1 is rendered first so
+                 * that it has reached the plugin (and its state). */
+                mdaw_track_set_mix (e, TRACK, 1.0f, 0.0f, 1);
+                w = render (e, "external_before_quiet", 0, 8 * Q);
+                double loud = peakOf (&w);
+                freeWav (&w);
+                mdaw_device_set_param (e, EXT, "0", 0.1f);
+                w = render (e, "external_quiet", 0, 8 * Q);
+                double quiet = peakOf (&w);
+                freeWav (&w);
+                mdaw_status reset = mdaw_device_reset_state (e, EXT);
+                float level = -1.0f;
+                mdaw_device_get_param (e, EXT, "0", &level);
+                w = render (e, "external_reset", 0, 8 * Q);
+                double afterReset = peakOf (&w);
+                freeWav (&w);
+                mdaw_track_set_mix (e, TRACK, 1.0f, 0.0f, 0);
+                measure ("external_peak_before_quiet", loud);
+                measure ("external_peak_quiet", quiet);
+                measure ("external_level_after_reset", level);
+                measure ("external_peak_after_reset", afterReset);
+                check (reset == MDAW_OK && fabsf (level - 0.5f) < 0.01f && mdaw_project_has (e, MDAW_ENTITY_DEVICE, EXT) == 1, "external_reset_state");
+                check (quiet < 0.5 * afterReset && afterReset > 0.01, "external_reset_state_audible");
+
                 sleepMs (400);
                 int events = drainEvents (e);
                 measure ("events_after_own_external_changes", events);
@@ -633,7 +852,7 @@ int main (void)
             mdaw_status editor = mdaw_device_show_editor (e, EXT, 1);
             printf ("RESULT external_editor_status=%d\n", (int) editor);
             if (editor == MDAW_OK) mdaw_device_show_editor (e, EXT, 0);
-            check (mdaw_device_remove (e, EXT) == MDAW_OK, "external_removed");
+            check (mdaw_device_remove (e, EXT) == MDAW_OK && mdaw_project_has (e, MDAW_ENTITY_DEVICE, EXT) == 0, "external_removed");
         }
     }
 
@@ -645,7 +864,12 @@ int main (void)
         measure ("no_tracks_peak", peakOf (&w));
         check (w.ok && peakOf (&w) < 0.001, "track_remove_silences");
         freeWav (&w);
+        check (mdaw_project_has (e, MDAW_ENTITY_TRACK, TRACK) == 0 && mdaw_project_has (e, MDAW_ENTITY_CLIP, CLIP) == 0
+               && mdaw_project_has (e, MDAW_ENTITY_DEVICE, SYNTH) == 0, "has_after_track_remove");
+        check (mdaw_project_has (e, MDAW_ENTITY_TEMPO, TEMPO0) == 0, "has_tempo_after_remove");
+        mdaw_tempo_put (e, TEMPO0, 0, 120000);
         check (mdaw_project_clear (e) == MDAW_OK, "project_clear");
+        check (mdaw_project_has (e, MDAW_ENTITY_TEMPO, TEMPO0) == 0, "has_after_clear");
     }
 
     /* 12. Destroy, and a second life ---------------------------------------------------- */
@@ -662,8 +886,23 @@ int main (void)
         measure ("second_life_peak", peakOf (&w));
         check (peakOf (&w) > 0.05, "second_life_renders");
         freeWav (&w);
+        restartedPluginList (e, haveExternal);
         mdaw_engine_destroy (e);
         check (1, "second_life_destroyed");
+    }
+
+    /* 13. A third life without the remembered ids: they are read from the plugins again. */
+    if (haveExternal)
+    {
+        remove (SCRATCH "/settings/plugin-ids.xml");
+        e = create();
+        check (e != NULL, "third_life_create");
+        if (e != NULL)
+        {
+            build (e, notes);
+            restartedPluginList (e, haveExternal);
+            mdaw_engine_destroy (e);
+        }
     }
 
     printf ("RESULT failures=%d\n", failures);

@@ -925,4 +925,30 @@ protected:
 } // namespace
 
 std::unique_ptr<juce::AudioPluginFormat> createClapFormat()   { return std::make_unique<Format>(); }
+
+juce::String clapPluginId (const juce::PluginDescription& description)
+{
+    if (description.pluginFormatName != "CLAP")
+        return {};
+    auto* module = Module::get (description.fileOrIdentifier);
+    if (module == nullptr)
+        return {};
+    // The description names its plugin by a hash of the id (uniqueId): see describe().
+    for (uint32_t i = 0; i < module->factory->get_plugin_count (module->factory); ++i)
+        if (auto* d = module->factory->get_plugin_descriptor (module->factory, i))
+            if (d->id != nullptr && idOf (*d) == description.uniqueId)
+                return juce::String (juce::CharPointer_UTF8 (d->id));
+    return {};
+}
+
+bool clapParameterRange (const juce::AudioProcessorParameter* parameter, double& min, double& max)
+{
+    if (auto* p = dynamic_cast<const ClapParameter*> (parameter))
+    {
+        min = p->info.min_value;
+        max = p->info.max_value;
+        return true;
+    }
+    return false;
+}
 } // namespace mdaw

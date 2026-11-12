@@ -14,7 +14,8 @@ use mdaw_model::{
     Note, NoteId, NoteProp, Op, PluginFormat, Project, TempoId, TempoPoint, Tick, TrackContent, TrackId,
     TrackShell,
 };
-use mdaw_tracktion::{Config, Engine, Event, Problem, Status, apply_op, load_project};
+use mdaw_tracktion::{Config, Engine, EntityKind, Event, Problem, Status, apply_op, load_project};
+use mdaw_tracktion_sys as sys;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -110,6 +111,13 @@ impl Wav {
 
     fn peak(&self) -> f64 {
         self.peak_between(0.0, f64::MAX)
+    }
+
+    /// Peaks of the left and the right channel.
+    fn channel_peaks(&self) -> (f64, f64) {
+        self.samples.chunks_exact(2).fold((0.0, 0.0), |(l, r), f| {
+            (f64::max(l, f[0].abs() as f64), f64::max(r, f[1].abs() as f64))
+        })
     }
 
     /// Seconds of the first sample above the threshold.
@@ -329,7 +337,11 @@ fn the_engine_follows_the_model() {
     let engine = Engine::new(config()).expect("create the engine");
     println!("versions: {}", engine.versions());
     assert!(engine.versions().contains("JUCE"), "versions");
-    assert_eq!(mdaw_tracktion::abi_version(), 1);
+    assert_eq!(mdaw_tracktion::abi_version(), 2);
+    assert!(
+        !engine.versions().contains("Tracktion Engine Tracktion Engine"),
+        "versions: name not doubled"
+    );
     one_engine_per_process();
 
     let mut ids_gen = IdGen::new(ActorId(7));
@@ -359,11 +371,29 @@ fn the_engine_follows_the_model() {
 fn one_engine_per_process() {
     let second = Engine::new(config());
     let error = second.expect_err("one engine per process: second create refused");
-    println!("second create: {error}");
+    // Read on this thread right after the failed create, as the Rust side did.
+    let raw = sys::mdaw_last_status();
+    println!("second create: {error} (C status {raw})");
+    assert_eq!(raw, sys::MDAW_ERR_INTERNAL, "second create: the C side's status");
+    assert_eq!(
+        error.status,
+        Status::Internal,
+        "second create: the error carries the C side's status"
+    );
     assert!(
         !error.message.is_empty(),
         "one engine per process: the refusal says why"
     );
+}
+
+/// The raw ids of the first track, its device, its clip and the tempo point at 0.
+fn world_ids(world: &World) -> (u64, u64, u64, u64) {
+    let (track_id, track) = world.model.ordered_tracks().next().expect("a track");
+    let content = track.content.as_ref();
+    let device = content.devices.front().expect("a device").id;
+    let clip = *content.clips.keys().next().expect("a clip");
+    let tempo = *world.model.tempo.keys().next().expect("a tempo point");
+    (track_id.0.0, device.0.0, clip.0.0, tempo.0.0)
 }
 
 /// Step 1: the model project, loaded and rendered: sound where the notes are, silence after.
@@ -377,6 +407,19 @@ fn loaded_project_renders(world: &World) {
         "load: the Pocket parameter is reported as not carried over"
     );
     assert_eq!(problems.len(), 1, "load: no other problems");
+    let engine = &world.engine;
+    let ids = &world_ids(world);
+    assert!(
+        engine.has(EntityKind::Track, ids.0)
+            && engine.has(EntityKind::Device, ids.1)
+            && engine.has(EntityKind::Clip, ids.2)
+            && engine.has(EntityKind::Tempo, ids.3),
+        "load: has each kind"
+    );
+    assert!(
+        !engine.has(EntityKind::Track, ids.1) && !engine.has(EntityKind::Device, ids.0),
+        "load: has nothing of the wrong kind"
+    );
 
     let wav = render(&world.engine, "loaded", 16 * Q);
     assert!(
@@ -475,6 +518,10 @@ fn incremental_ops(world: &mut World, ids: &Ids) {
     );
 
     // A second point, 60 bpm from beat 8: beat 10 is at 2 s + 2 s.
+    assert!(
+        !world.engine.has(EntityKind::Tempo, ids.tempo2.0.0),
+        "has: no second tempo point yet"
+    );
     world.op(Op::TempoPut {
         id: ids.tempo2,
         point: TempoPoint {
@@ -482,12 +529,20 @@ fn incremental_ops(world: &mut World, ids: &Ids) {
             milli_bpm: 60_000,
         },
     });
+    assert!(
+        world.engine.has(EntityKind::Tempo, ids.tempo2.0.0),
+        "has: the second tempo point"
+    );
     let wav = render(&world.engine, "tempo_two_points", 16 * Q);
     assert!(
         near(wav.first_above(SILENT), 4.0, 0.03),
         "two tempo points: the note is at 4 s"
     );
     world.op(Op::TempoRemove { id: ids.tempo2 });
+    assert!(
+        !world.engine.has(EntityKind::Tempo, ids.tempo2.0.0),
+        "has: second tempo point removed"
+    );
     let wav = render(&world.engine, "tempo_point_removed", 16 * Q);
     assert!(
         near(wav.first_above(SILENT), 2.5, 0.03),
@@ -520,6 +575,10 @@ fn other_ops(world: &mut World, ids: &Ids, ids_gen: &mut IdGen) {
 
     // A second device, moved in front and removed again; a second, empty track moved about.
     let extra = ids_gen.device();
+    assert!(
+        !world.engine.has(EntityKind::Device, extra.0.0),
+        "has: no extra device yet"
+    );
     let problems = world.op(Op::DeviceAdd {
         track: ids.track,
         device: Device::new(
@@ -532,6 +591,10 @@ fn other_ops(world: &mut World, ids: &Ids, ids_gen: &mut IdGen) {
         after: Some(ids.synth),
     });
     assert!(problems.is_empty(), "device add: {problems:?}");
+    assert!(
+        world.engine.has(EntityKind::Device, extra.0.0),
+        "has: the extra device"
+    );
     world.op(Op::DeviceMove {
         track: ids.track,
         id: extra,
@@ -541,6 +604,10 @@ fn other_ops(world: &mut World, ids: &Ids, ids_gen: &mut IdGen) {
         track: ids.track,
         id: extra,
     });
+    assert!(
+        !world.engine.has(EntityKind::Device, extra.0.0),
+        "has: extra device removed"
+    );
     let other = ids_gen.track();
     world.op(Op::TrackAdd {
         id: other,
@@ -574,11 +641,12 @@ fn other_ops(world: &mut World, ids: &Ids, ids_gen: &mut IdGen) {
         id: ids.clip,
         prop: ClipProp::Length(Tick(7 * Q)),
     });
-    world.op(Op::ClipSet {
+    let problems = world.op(Op::ClipSet {
         track: ids.track,
         id: ids.clip,
         prop: ClipProp::Name("Renamed".into()),
     });
+    assert!(problems.is_empty(), "clip rename: {problems:?}");
     // The late note: up a tone, softer.
     world.op(Op::NoteSet {
         track: ids.track,
@@ -772,16 +840,31 @@ fn track_removed(world: &mut World, ids: &Ids) {
     );
     let wav = render(&world.engine, "track_removed", 16 * Q);
     assert!(wav.peak() < SILENT, "track removed: silent");
+    let engine = &world.engine;
+    assert!(
+        !engine.has(EntityKind::Track, ids.track.0.0)
+            && !engine.has(EntityKind::Clip, ids.clip.0.0)
+            && !engine.has(EntityKind::Device, ids.synth.0.0),
+        "has: the track and what was on it are gone"
+    );
 }
 
 /// Step 8: plugin devices. One whose plugin is not installed is left out and reported; the
-/// CLAP test synth, if built, plays, and its state comes back through the blob resolver.
+/// CLAP test synth, if built, is found by its CLAP id and plays; its parameters follow the model
+/// (plain values in the plugin's own range) and its state comes back through the blob resolver.
 fn plugins(world: &mut World, ids_gen: &mut IdGen, have_clap: bool) {
     if have_clap {
         let engine = &world.engine;
         engine.plugins_scan("CLAP").expect("scan CLAP");
         let list = engine.plugins().expect("plugin list");
         println!("plugins: {list:?}");
+        let synths: Vec<_> = list.iter().filter(|p| p.identifier == TEST_SYNTH).collect();
+        assert_eq!(
+            synths.len(),
+            1,
+            "plugins: the test synth listed once under its CLAP id"
+        );
+        assert_eq!(synths[0].format, "CLAP");
     } else {
         println!(
             "NOTE: target/bridge-scratch/clap/mdaw-test-synth.clap is missing; the CLAP synth is not played"
@@ -841,25 +924,126 @@ fn plugins(world: &mut World, ids_gen: &mut IdGen, have_clap: bool) {
         !have_clap,
         "plugins: the test synth is skipped only when not built"
     );
+    assert!(
+        !world.engine.has(EntityKind::Device, missing.0.0),
+        "plugins: the missing one is not in the engine"
+    );
     if !have_clap {
         return;
     }
-
-    // Model tempo is still 240 bpm: 4 beats are 1 s.
-    let engine = &world.engine;
-    let wav = render(engine, "clap", 8 * Q);
-    assert!(wav.peak_between(0.0, 1.0) > 0.01, "clap: the test synth sounds");
     let raw = synth.0.0;
-    let params = engine.device_params(raw).expect("clap params");
+    assert!(world.engine.has(EntityKind::Device, raw), "clap: in the engine");
+
+    // Model tempo is still 240 bpm: 4 beats are 1 s. Level 0.5 (the default), balance 0.
+    let wav = render(&world.engine, "clap", 8 * Q);
+    let (base_left, base_right) = wav.channel_peaks();
+    assert!(base_left > 0.01, "clap: the test synth sounds");
+    assert!(
+        (base_left / base_right - 1.0).abs() < 0.05,
+        "clap: centred ({base_left} / {base_right})"
+    );
+
+    let params = world.engine.device_params(raw).expect("clap params");
     println!("clap params: {params:?}");
-    // The test synth's parameter 0 is its level, 0..1, so normalised and plain agree.
-    engine.device_set_param(raw, "0", 0.2).expect("clap set level");
-    render(engine, "clap_level", 8 * Q); // the value reaches the plugin with a processed block
-    let state = engine.device_get_state(raw);
+    let balance = params
+        .iter()
+        .find(|p| p.id == "1")
+        .expect("clap: a balance parameter");
+    assert_eq!((balance.min, balance.max), (-1.0, 1.0), "clap: balance range");
+    assert!(!balance.text.is_empty(), "clap: balance has a text");
+    let text = world
+        .engine
+        .device_param_text(raw, "0", 0.25)
+        .expect("param text");
+    println!("clap level text at 0.25: {text}");
+    assert!(text.contains("25"), "clap: level text ({text})");
+    assert_eq!(
+        world
+            .engine
+            .device_param_text(raw, "99", 0.5)
+            .map_err(|e| e.status),
+        Err(Status::NotFound),
+        "clap: text of an unknown parameter"
+    );
+
+    // Level 0.1 (plain = normalised for 0..1): a fifth of the default level.
+    let set = |param: u32, value: Option<f64>| Op::DeviceSetParam {
+        track,
+        id: synth,
+        param,
+        value,
+    };
+    let problems = world.op(set(0, Some(0.1)));
+    assert!(problems.is_empty(), "clap: level op applied: {problems:?}");
+    let quiet = render(&world.engine, "clap_level_low", 8 * Q).channel_peaks().0;
+    let ratio = quiet / base_left;
+    println!("clap: level 0.1 gives {ratio:.3} of the default level's peak");
+    assert!(
+        (0.17..0.23).contains(&ratio),
+        "clap: level 0.1 is a fifth ({ratio})"
+    );
+
+    // Balance -1 (plain), normalised 0: left only. A plain value used as normalised would
+    // have been clamped to 0 as well, so -0.5 is checked too: normalised 0.25.
+    world.op(set(1, Some(-1.0)));
+    let (left, right) = render(&world.engine, "clap_balance_left", 8 * Q).channel_peaks();
+    assert!(
+        left > 0.01 && right < left * 0.01,
+        "clap: balance -1 is left only ({left} / {right})"
+    );
+    world.op(set(1, Some(-0.5)));
+    let value = world.engine.device_get_param(raw, "1").expect("balance");
+    assert!(
+        (value - 0.25).abs() < 1e-4,
+        "clap: balance -0.5 is normalised 0.25 ({value})"
+    );
+    let (left, right) = render(&world.engine, "clap_balance_half", 8 * Q).channel_peaks();
+    assert!(
+        (right / left - 0.5).abs() < 0.05,
+        "clap: balance -0.5 halves the right ({left} / {right})"
+    );
+    // Out of range in the model: clamped to the plugin's range.
+    world.op(set(1, Some(-7.0)));
+    let value = world.engine.device_get_param(raw, "1").expect("balance");
+    assert!(value.abs() < 1e-6, "clap: balance below range clamped ({value})");
+
+    // A model with stored parameter values, loaded whole: the values are applied.
+    let incremental = render(&world.engine, "clap_incremental", 8 * Q).channel_peaks();
+    let problems = world.load();
+    assert!(
+        problems
+            .iter()
+            .all(|p| matches!(p, Problem::DeviceSkipped { device, .. } if *device == missing)),
+        "clap: reload problems: {problems:?}"
+    );
+    let reloaded = render(&world.engine, "clap_reloaded", 8 * Q).channel_peaks();
+    println!("clap: incremental {incremental:?}, reloaded {reloaded:?}");
+    assert!(
+        (reloaded.0 / incremental.0 - 1.0).abs() < 0.05 && reloaded.1 < reloaded.0 * 0.01,
+        "clap: the loaded params match the incremental ones"
+    );
+    let level = world.engine.device_get_param(raw, "0").expect("level");
+    assert!((level - 0.1).abs() < 1e-4, "clap: level loaded ({level})");
+
+    // Back to the defaults (value None): level 0.5, centred.
+    world.op(set(0, None));
+    world.op(set(1, None));
+    let (left, right) = render(&world.engine, "clap_defaults", 8 * Q).channel_peaks();
+    assert!(
+        (left / base_left - 1.0).abs() < 0.05 && (right / base_right - 1.0).abs() < 0.05,
+        "clap: back to the default level ({left} / {right} vs {base_left} / {base_right})"
+    );
+
+    // A state, through the resolver.
+    world
+        .engine
+        .device_set_param(raw, "0", 0.2)
+        .expect("clap set level");
+    render(&world.engine, "clap_level", 8 * Q); // the value reaches the plugin with a processed block
+    let state = world.engine.device_get_state(raw);
     assert!(!state.is_empty(), "clap: state read");
     let blob = BlobHash([0x5a; 32]);
     world.blobs.insert(blob, state);
-
     world
         .engine
         .device_set_param(raw, "0", 0.9)
@@ -877,7 +1061,7 @@ fn plugins(world: &mut World, ids_gen: &mut IdGen, have_clap: bool) {
         "clap: state restored through the resolver ({level})"
     );
 
-    // Back to no state: the plugin as it starts (level 0.5), made again in place.
+    // Back to no state: the plugin as it starts (level 0.5), in place.
     world.op(Op::DeviceSetState {
         track,
         id: synth,
@@ -888,10 +1072,27 @@ fn plugins(world: &mut World, ids_gen: &mut IdGen, have_clap: bool) {
         (level - 0.5).abs() < 0.01,
         "clap: no state is the default level ({level})"
     );
-    let wav = render(&world.engine, "clap_recreated", 8 * Q);
     assert!(
-        wav.peak_between(0.0, 1.0) > 0.01,
-        "clap: the made-again synth sounds"
+        world.engine.has(EntityKind::Device, raw),
+        "clap: the reset device is still there"
+    );
+    let (left, _) = render(&world.engine, "clap_reset", 8 * Q).channel_peaks();
+    assert!(
+        (left / base_left - 1.0).abs() < 0.05,
+        "clap: the reset synth sounds at the default level ({left} vs {base_left})"
+    );
+
+    // A stored parameter value stays on top of a reset, as on a load.
+    world.op(set(0, Some(0.1)));
+    world.op(Op::DeviceSetState {
+        track,
+        id: synth,
+        state: None,
+    });
+    let level = world.engine.device_get_param(raw, "0").expect("clap get level");
+    assert!(
+        (level - 0.1).abs() < 1e-4,
+        "clap: model value kept over the reset ({level})"
     );
 }
 

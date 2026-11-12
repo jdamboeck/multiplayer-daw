@@ -42,9 +42,8 @@ pub enum Status {
     Plugin,
     /// A file could not be read or written.
     Io,
-    /// Anything else, including a C++ exception caught at the boundary. Also used where the C
-    /// side gives no status (a failed `mdaw_engine_create`) and for JSON it sent that did not
-    /// parse.
+    /// Anything else, including a C++ exception caught at the boundary (and a second engine in
+    /// one process). Also used for JSON the engine sent that did not parse.
     Internal,
     /// A status this crate does not know (a newer library).
     Unknown(i32),
@@ -145,6 +144,26 @@ fn read_buffer(text: bool, mut call: impl FnMut(*mut u8, usize) -> usize) -> Vec
 
 // ---- values ------------------------------------------------------------------------------------
 
+/// What [`Engine::has`] asks about (`mdaw_entity_kind`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum EntityKind {
+    Track,
+    Clip,
+    Device,
+    Tempo,
+}
+
+impl EntityKind {
+    fn raw(self) -> sys::mdaw_entity_kind {
+        match self {
+            EntityKind::Track => sys::MDAW_ENTITY_TRACK,
+            EntityKind::Clip => sys::MDAW_ENTITY_CLIP,
+            EntityKind::Device => sys::MDAW_ENTITY_DEVICE,
+            EntityKind::Tempo => sys::MDAW_ENTITY_TEMPO,
+        }
+    }
+}
+
 /// How to create the engine.
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -188,8 +207,8 @@ pub struct Note {
 #[derive(Clone, PartialEq, Debug, Deserialize)]
 pub struct PluginInfo {
     pub format: String,
-    /// What [`Engine::device_add`] takes. For CLAP this is JUCE's identifier string
-    /// (`CLAP-<name>-<hash of path>-<hash of clap id>`), not the CLAP id.
+    /// What [`Engine::device_add`] takes: the plugin's own id, the same on every machine. CLAP:
+    /// the CLAP plugin id; LV2: the plugin URI; VST3: the class id as 32 hex digits.
     pub identifier: String,
     pub name: String,
     #[serde(default)]
@@ -211,6 +230,31 @@ pub struct ParamInfo {
     /// 0 for a continuous parameter.
     #[serde(default)]
     pub steps: i64,
+    /// The plugin's own range where the format has one (CLAP): plain = min + value * (max - min).
+    /// Otherwise 0 and 1.
+    #[serde(default)]
+    pub min: f64,
+    #[serde(default = "one")]
+    pub max: f64,
+    /// The current value as the plugin shows it ("440 Hz").
+    #[serde(default)]
+    pub text: String,
+}
+
+fn one() -> f64 {
+    1.0
+}
+
+impl ParamInfo {
+    /// The normalised value of a plain value in the plugin's own units, clamped to the range.
+    pub fn normalise(&self, plain: f64) -> f64 {
+        let span = self.max - self.min;
+        if span > 0.0 && plain.is_finite() {
+            ((plain - self.min) / span).clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    }
 }
 
 /// `mdaw_audio_devices`.
@@ -332,10 +376,14 @@ impl Engine {
         };
         // SAFETY: the config and the strings it points to outlive the call.
         let raw = unsafe { sys::mdaw_engine_create(&raw_config) };
-        // A failed create gives no status code, only the text.
-        NonNull::new(raw)
-            .map(|raw| Engine { raw })
-            .ok_or_else(|| Error::last(Status::Internal))
+        // A failed create returns no status; the thread's last status has it.
+        NonNull::new(raw).map(|raw| Engine { raw }).ok_or_else(|| {
+            let status = match sys::mdaw_last_status() {
+                sys::MDAW_OK => Status::Internal,
+                raw => Status::from_raw(raw),
+            };
+            Error::last(status)
+        })
     }
 
     fn ptr(&self) -> *mut sys::mdaw_engine {
@@ -358,6 +406,12 @@ impl Engine {
     }
 
     // ---- the project
+
+    /// Whether the engine has something of this kind under this id.
+    pub fn has(&self, kind: EntityKind, id: u64) -> bool {
+        // SAFETY: valid handle.
+        unsafe { sys::mdaw_project_has(self.ptr(), kind.raw(), id) == 1 }
+    }
 
     /// Removes everything: tracks, tempo points, mappings. Playback stops.
     pub fn clear(&self) -> Result<(), Error> {
@@ -431,6 +485,12 @@ impl Engine {
     pub fn clip_set_range(&self, clip: u64, start_tick: i64, length_ticks: i64) -> Result<(), Error> {
         // SAFETY: valid handle.
         check(unsafe { sys::mdaw_clip_set_range(self.ptr(), clip, start_tick, length_ticks) })
+    }
+
+    pub fn clip_set_name(&self, clip: u64, name: &str) -> Result<(), Error> {
+        let name = c_string(name)?;
+        // SAFETY: valid handle; the string outlives the call.
+        check(unsafe { sys::mdaw_clip_set_name(self.ptr(), clip, name.as_ptr()) })
     }
 
     /// Adds the notes that are new and updates those whose id the clip already has.
@@ -522,17 +582,22 @@ impl Engine {
         self.text(|e, buffer, capacity| unsafe { sys::mdaw_device_params(e, device, buffer, capacity) })
     }
 
-    /// Whether the engine has this device. The header has no call for it: a device exists if it
-    /// lists parameters or has state (all devices seen so far have both; one with neither would
-    /// read as missing).
-    pub(crate) fn has_device(&self, device: u64) -> bool {
-        let params = self.device_params_json(device);
-        let no_params = params
-            .iter()
-            .filter(|b| !b.is_ascii_whitespace())
-            .eq(b"[]".iter());
-        // SAFETY: valid handle; a null buffer with capacity 0 only asks for the length.
-        !no_params || unsafe { sys::mdaw_device_get_state(self.ptr(), device, ptr::null_mut(), 0) } > 0
+    /// How the plugin shows this normalised value of the parameter.
+    pub fn device_param_text(&self, device: u64, param_id: &str, value: f32) -> Result<String, Error> {
+        if !(0.0..=1.0).contains(&value) {
+            return Err(Error::new(Status::Argument, "parameter value must be 0..1"));
+        }
+        let param = c_string(param_id)?;
+        let bytes = self.text(|e, buffer, capacity| {
+            // SAFETY: valid handle; the string outlives the call; `buffer` is valid for
+            // `capacity` bytes.
+            unsafe { sys::mdaw_device_param_text(e, device, param.as_ptr(), value, buffer, capacity) }
+        });
+        if bytes.is_empty() {
+            // Empty text, or a failure: a length gives no status, so ask in a way that does.
+            self.device_get_param(device, param_id)?;
+        }
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 
     /// The plugin's opaque state, flushed from the plugin first. Empty if the device does not
@@ -547,6 +612,12 @@ impl Engine {
     pub fn device_set_state(&self, device: u64, state: &[u8]) -> Result<(), Error> {
         // SAFETY: valid handle; the slice holds `len` bytes.
         check(unsafe { sys::mdaw_device_set_state(self.ptr(), device, state.as_ptr(), state.len()) })
+    }
+
+    /// Back to the state the plugin has when freshly loaded; the device keeps its id and place.
+    pub fn device_reset_state(&self, device: u64) -> Result<(), Error> {
+        // SAFETY: valid handle.
+        check(unsafe { sys::mdaw_device_reset_state(self.ptr(), device) })
     }
 
     /// Shows or hides the plugin's own window.
@@ -564,7 +635,7 @@ impl Engine {
         check(unsafe { sys::mdaw_plugins_scan(self.ptr(), format.as_ptr()) })
     }
 
-    /// The plugins the engine knows (from earlier scans).
+    /// The plugins the engine knows from scans (this run's or earlier ones') and can load now.
     pub fn plugins(&self) -> Result<Vec<PluginInfo>, Error> {
         // SAFETY: valid handle; `buffer` is valid for `capacity` bytes.
         let json = self.text(|e, buffer, capacity| unsafe { sys::mdaw_plugins_list(e, buffer, capacity) });
@@ -738,15 +809,20 @@ mod tests {
     #[test]
     fn json_values_parse() {
         let params: Vec<ParamInfo> = parse_json(
-            br#"[{"id": "0", "name": "Level", "value": 0.5, "default": 0.5, "steps": 0},
+            br#"[{"id": "1", "name": "Balance", "value": 0.5, "default": 0.5, "steps": 0, "min": -1.0, "max": 1.0, "text": "+0.00"},
                  {"id": "x", "name": "N", "value": 1, "default": null, "steps": 3}]"#,
             "test",
         )
         .unwrap();
         assert_eq!(params[1].default, None);
         assert_eq!(params[1].steps, 3);
+        assert_eq!((params[1].min, params[1].max), (0.0, 1.0));
+        assert_eq!(params[0].text, "+0.00");
+        assert_eq!(params[0].normalise(-1.0), 0.0);
+        assert_eq!(params[0].normalise(0.5), 0.75);
+        assert_eq!(params[0].normalise(7.0), 1.0);
         let plugins: Vec<PluginInfo> = parse_json(
-            br#"[{"format": "CLAP", "identifier": "CLAP-a-1-2", "name": "a", "vendor": "v", "instrument": true}]"#,
+            br#"[{"format": "CLAP", "identifier": "org.example.a", "name": "a", "vendor": "v", "instrument": true}]"#,
             "test",
         )
         .unwrap();

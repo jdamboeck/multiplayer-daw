@@ -7,6 +7,7 @@
 add_library(mdaw_tracktion_bridge STATIC
     src/bridge.cpp
     src/engine_thread.cpp
+    src/plugin_ids.cpp
     src/project.cpp)
 target_include_directories(mdaw_tracktion_bridge PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(mdaw_tracktion_bridge PRIVATE mdaw_clap_format mdaw_engine_config)
