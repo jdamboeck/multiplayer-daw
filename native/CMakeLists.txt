@@ -62,6 +62,7 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU")
 endif()
 
 add_subdirectory(clap-format)
+add_subdirectory(tracktion-bridge)
 
 option(MDAW_BUILD_SPIKE "Build the native Tracktion spike application" ON)
 if(MDAW_BUILD_SPIKE)

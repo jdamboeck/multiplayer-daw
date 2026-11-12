@@ -192,6 +192,53 @@ These were all found by running into them.
     timer. The host must accept the request from the first moment; ours first refused it until
     its own object existed, and the editor window stayed black.
 
+### Found while building the bridge
+
+14. **Never run a JUCE dispatch loop from inside a message callback on Linux.** A nested
+    `runDispatchLoopUntil` empties the event list the outer loop is iterating; the outer loop
+    then sleeps for ever. The spike's `pump()` is only safe because `main` calls it. The bridge
+    splits such work into steps with timer gaps instead. Tracktion nests a loop itself in the
+    `PluginManager` destructor, so the engine is deleted only after the loop has ended.
+15. **Tracktion's `paramID` for a hosted plugin is the parameter's index as text.** The
+    plugin's real id is `HostedAudioProcessorParameter::getParameterID()`.
+16. **Without a running device the transport stops itself** and overwrites the position from a
+    playhead that never moves. The bridge keeps the wanted state and position itself.
+17. **Changing the tempo map does not always move clips** (`insertTempo`, `removeTempo` do not;
+    `setBpm` does). The bridge places every clip again from its ticks after any tempo change.
+    A tempo point's curve 0 means a ramp; steps need curve 1.
+18. **Renderer defaults to switch off:** `canRenderInMono` (a mono file when the graph is
+    mono) and `checkNodesForAudio` (rendering silence is an error).
+19. **Tracktion opens every MIDI port, hardware included,** shortly after the first edit, even
+    with no audio device.
+20. **An external parameter set by the host comes back** later as a change "by the plugin" with
+    the same value; the bridge filters it so the application sees no echo.
+21. **`Edit::Options::defaultMasterVolumedB` is -3 dB.** That is the 3 dB of point 10's level
+    difference; the bridge sets 0. `PluginList::insertPlugin` can refuse without an error.
+
+## The bridge
+
+`native/tracktion-bridge/`: the C header `include/mdaw_engine.h` is the whole interface; the
+implementation is a static library that carries JUCE and Tracktion inside it.
+
+```sh
+cmake --build target/native --target mdaw-bridge-test
+cargo build -p mdaw-test-plugin
+mkdir -p target/bridge-scratch/clap
+cp target/debug/libmdaw_test_plugin.so target/bridge-scratch/clap/mdaw-test-synth.clap
+CLAP_PATH=$PWD/target/bridge-scratch/clap target/native/tracktion-bridge/mdaw-bridge-test
+```
+
+The test is written in C, uses no audio device and ends with `RESULT ok=1`. It covers building
+a project by id, rendering, idempotent repeats, note updates, mute, gain, bypass, the tempo
+map, parameters and state for the built-in synth and a CLAP plugin, no echo of own changes,
+and creating the engine twice in one process.
+
+Built but not yet exercised by any test: plugin editor windows through the bridge; everything
+that needs an open audio device (device switching, meters, xruns, loop, restart after a
+device-list change, the stalled-audio event); parameter events from a plugin's own window; the
+resulting order after track and device moves; VST3 and LV2 through the bridge; calls from
+several threads at once. A hung plugin blocks every call: there is no timeout.
+
 ## Not tested yet
 
 - Sample-rate and buffer-size changes on the ALSA backend while running; several output
