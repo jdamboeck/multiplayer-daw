@@ -33,7 +33,7 @@
 extern "C" {
 #endif
 
-#define MDAW_ABI_VERSION 2
+#define MDAW_ABI_VERSION 3
 #define MDAW_TICKS_PER_QUARTER 960
 
 typedef struct mdaw_engine mdaw_engine;
@@ -59,6 +59,10 @@ typedef struct mdaw_engine_config {
                                   mdaw_engine_state.device_open */
     const char* audio_backend; /* "ALSA", "JACK", ... or NULL for the platform default */
     int32_t enable_plugins;    /* 0: built-in instruments only; 1: VST3, LV2 and CLAP as well */
+    const char* scanner_path;  /* the mdaw-plugin-scan executable, or NULL. With it, plugin files
+                                  are examined in a child process, one file at a time, so a
+                                  plugin that crashes or hangs while being examined cannot take
+                                  the application with it. Without it, in this process. */
 } mdaw_engine_config;
 
 /* One engine per process. Returns NULL on failure (see mdaw_last_error). */
@@ -159,21 +163,29 @@ size_t mdaw_device_param_text(mdaw_engine* engine, uint64_t device, const char* 
 size_t mdaw_device_get_state(mdaw_engine* engine, uint64_t device, uint8_t* buffer, size_t capacity);
 mdaw_status mdaw_device_set_state(mdaw_engine* engine, uint64_t device, const uint8_t* bytes, size_t length);
 /* Back to the state the plugin had when the device was made. The device keeps its id and
- * place. A plugin that saves no state at all cannot be reset: MDAW_ERR_PLUGIN. */
+ * place. For a plugin that saves no state, every parameter goes back to its default. */
 mdaw_status mdaw_device_reset_state(mdaw_engine* engine, uint64_t device);
 /* The plugin's own window. Opening one that is open brings it to the front. */
 mdaw_status mdaw_device_show_editor(mdaw_engine* engine, uint64_t device, int32_t show);
 
 /* ---- plugins on this machine -------------------------------------------------------------- */
 
-/* Scans the usual folders for one format ("VST3", "LV2", "CLAP"). Blocks until done. For now
- * in this process: a plugin that crashes while being scanned takes the application with it. */
+/* Scans the usual folders for one format ("VST3", "LV2", "CLAP"). Blocks until done. With a
+ * scanner (mdaw_engine_config.scanner_path) every file is examined in a child process with a
+ * time limit; a file that crashes or hangs it is remembered as failed and not examined again
+ * until the file changes. Everything the engine needs to know about a plugin before loading it
+ * — its description and its own id — is found out during the scan, so listing plugins and
+ * adding a device never load a library just to look at it. Without a scanner all of this
+ * happens in this process, and a plugin that crashes takes the application with it. */
 mdaw_status mdaw_plugins_scan(mdaw_engine* engine, const char* format);
 /* JSON array of {"format","identifier","name","vendor","instrument"}; returns the length needed.
  * identifier is as described at mdaw_device_add. The engine remembers scan results between
  * runs (in settings_dir), but lists only plugins it can load now: the format is enabled and
  * the plugin's file is still there. */
 size_t mdaw_plugins_list(mdaw_engine* engine, char* buffer, size_t capacity);
+/* JSON array of {"format","file","reason"}: files that could not be examined (crashed, hung,
+ * not a plugin). Returns the length needed. */
+size_t mdaw_plugins_failed(mdaw_engine* engine, char* buffer, size_t capacity);
 
 /* ---- local playback: never part of the project ------------------------------------------- */
 

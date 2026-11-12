@@ -76,7 +76,7 @@ pub fn show(app: &mut DawApp, ui: &mut Ui) {
         let response = ui
             .add(
                 DragValue::new(&mut bpm)
-                    .range(20.0..=400.0)
+                    .range(20.0..=300.0)
                     .speed(0.1)
                     .max_decimals(1)
                     .suffix(" bpm"),

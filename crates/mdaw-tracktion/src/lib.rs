@@ -27,6 +27,14 @@ pub fn abi_version() -> u32 {
     sys::mdaw_abi_version()
 }
 
+/// The plugin scanner (`mdaw-plugin-scan`) the build made, for [`Config::scanner_path`]: a path
+/// fixed at compile time, inside the build folder (`target/native`). Right for tests and
+/// development runs; a packaged application will ship the scanner next to its executable and
+/// pass that path instead. `None` if the build gave none.
+pub fn built_scanner_path() -> Option<&'static Path> {
+    option_env!("MDAW_TRACKTION_BUILT_SCANNER").map(Path::new)
+}
+
 // ---- errors ------------------------------------------------------------------------------------
 
 /// Mirrors `mdaw_status`, without `MDAW_OK`.
@@ -178,6 +186,11 @@ pub struct Config {
     pub audio_backend: Option<String>,
     /// VST3, LV2 and CLAP as well as the built-in instruments.
     pub enable_plugins: bool,
+    /// The plugin scanner executable (`mdaw-plugin-scan`, see [`built_scanner_path`]). With it,
+    /// plugin files are examined in child processes, so a plugin that crashes or hangs while it
+    /// is looked at cannot take the application down, and listing plugins or adding a device
+    /// never loads a library just to identify it. `None`: examined in this process.
+    pub scanner_path: Option<PathBuf>,
 }
 
 impl Config {
@@ -189,6 +202,7 @@ impl Config {
             open_audio_device: false,
             audio_backend: None,
             enable_plugins: true,
+            scanner_path: None,
         }
     }
 }
@@ -215,6 +229,16 @@ pub struct PluginInfo {
     pub vendor: String,
     #[serde(default)]
     pub instrument: bool,
+}
+
+/// A plugin file that could not be examined (`mdaw_plugins_failed`): it crashed or hung the
+/// scanner, or holds no plugin. It is not examined again until it changes.
+#[derive(Clone, PartialEq, Eq, Debug, Deserialize)]
+pub struct PluginFailure {
+    pub format: String,
+    /// The file (VST3 bundle, CLAP file) or, for LV2, the plugin URI.
+    pub file: String,
+    pub reason: String,
 }
 
 /// A device parameter (`mdaw_device_params`). Values are normalised to 0..1.
@@ -366,6 +390,7 @@ impl Engine {
         let app_name = c_string(&config.app_name)?;
         let settings_dir = c_path(&config.settings_dir)?;
         let backend = config.audio_backend.as_deref().map(c_string).transpose()?;
+        let scanner = config.scanner_path.as_deref().map(c_path).transpose()?;
         let raw_config = sys::mdaw_engine_config {
             abi_version: sys::MDAW_ABI_VERSION,
             app_name: app_name.as_ptr(),
@@ -373,6 +398,7 @@ impl Engine {
             open_audio_device: i32::from(config.open_audio_device),
             audio_backend: backend.as_ref().map_or(ptr::null(), |b| b.as_ptr()),
             enable_plugins: i32::from(config.enable_plugins),
+            scanner_path: scanner.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
         };
         // SAFETY: the config and the strings it points to outlive the call.
         let raw = unsafe { sys::mdaw_engine_create(&raw_config) };
@@ -628,7 +654,9 @@ impl Engine {
 
     // ---- plugins on this machine
 
-    /// Scans the usual folders for one format ("VST3", "LV2", "CLAP"). Blocks until done.
+    /// Scans the usual folders for one format ("VST3", "LV2", "CLAP"). Blocks until done. With
+    /// a scanner ([`Config::scanner_path`]) each file is examined in a child process with a
+    /// time limit (30 s; `MDAW_SCAN_TIMEOUT_MS` overrides it).
     pub fn plugins_scan(&self, format: &str) -> Result<(), Error> {
         let format = c_string(format)?;
         // SAFETY: valid handle; the string outlives the call.
@@ -640,6 +668,14 @@ impl Engine {
         // SAFETY: valid handle; `buffer` is valid for `capacity` bytes.
         let json = self.text(|e, buffer, capacity| unsafe { sys::mdaw_plugins_list(e, buffer, capacity) });
         parse_json(&json, "plugin list")
+    }
+
+    /// The plugin files that could not be examined, with the reason, as remembered from scans
+    /// (this run's or earlier ones').
+    pub fn plugins_failed(&self) -> Result<Vec<PluginFailure>, Error> {
+        // SAFETY: valid handle; `buffer` is valid for `capacity` bytes.
+        let json = self.text(|e, buffer, capacity| unsafe { sys::mdaw_plugins_failed(e, buffer, capacity) });
+        parse_json(&json, "list of failed plugin files")
     }
 
     // ---- local playback

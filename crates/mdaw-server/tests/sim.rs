@@ -382,7 +382,8 @@ fn edit(view: &Project, ids: &mut IdGen, kind: u8, a: usize, b: u8) -> Vec<Op> {
             id,
             point: TempoPoint {
                 tick: Tick::ZERO,
-                milli_bpm: 60_000 + u32::from(b) * 1000,
+                // 60..=300 bpm: the model's (and the audio engine's) range.
+                milli_bpm: 60_000 + u32::from(b % 241) * 1000,
             },
         }),
         11 => track.map(|id| Op::TrackMove {

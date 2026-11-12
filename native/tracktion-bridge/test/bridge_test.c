@@ -1,15 +1,32 @@
 /* Exercises the Tracktion bridge through mdaw_engine.h alone, written in C to show that the
  * header is usable from C. No audio device is opened. Prints `RESULT key=value` lines and exits
  * non-zero if a check fails. Run from the repository root; files go to target/bridge-scratch/.
- * The CLAP test synth is used if CLAP_PATH points at a folder with it (see the bridge brief). */
+ * The CLAP test synth is used if CLAP_PATH points at a folder with it (see the bridge brief).
+ * The plugin scanner and the test plugins of test/bad_clap.c are found where CMake built them
+ * (MDAW_TEST_SCANNER, MDAW_TEST_CLAP_DIR, compiled in; the environment variables of the same
+ * names override them). */
 #define _POSIX_C_SOURCE 200809L
+#define _DEFAULT_SOURCE
 #include "mdaw_engine.h"
 
+#include <dirent.h>
+#include <errno.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/wait.h>
 #include <time.h>
+#include <unistd.h>
+
+#ifndef MDAW_TEST_SCANNER
+#define MDAW_TEST_SCANNER ""
+#endif
+#ifndef MDAW_TEST_CLAP_DIR
+#define MDAW_TEST_CLAP_DIR ""
+#endif
 
 #define SCRATCH "target/bridge-scratch"
 #define Q MDAW_TICKS_PER_QUARTER
@@ -326,18 +343,21 @@ static void build (mdaw_engine* e, mdaw_note* notes)
     check (s == MDAW_OK, "build_calls_ok");
 }
 
-static mdaw_engine* create (void)
+static mdaw_engine* createWith (const char* settingsDir, const char* scanner)
 {
     mdaw_engine_config config;
     memset (&config, 0, sizeof config);
     config.abi_version = MDAW_ABI_VERSION;
     config.app_name = "mdaw-bridge-test";
-    config.settings_dir = SCRATCH "/settings";
+    config.settings_dir = settingsDir;
     config.open_audio_device = 0;
     config.audio_backend = NULL;
     config.enable_plugins = 1;
+    config.scanner_path = scanner;
     return mdaw_engine_create (&config);
 }
+
+static mdaw_engine* create (void) { return createWith (SCRATCH "/settings", NULL); }
 
 /* After a restart, with no scan: the test synth is listed under the same identifier and loads. */
 static void restartedPluginList (mdaw_engine* e, int haveExternal)
@@ -361,6 +381,227 @@ static void restartedPluginList (mdaw_engine* e, int haveExternal)
     measure ("external_after_restart_peak", peakOf (&w));
     check (s == MDAW_OK && peakOf (&w) > 0.01, "restart_plugin_loads");
     freeWav (&w);
+}
+
+/* -------- the plugin scanner ------------------------------------------------------------ */
+
+static double now (void)
+{
+    struct timespec t;
+    clock_gettime (CLOCK_MONOTONIC, &t);
+    return (double) t.tv_sec + (double) t.tv_nsec / 1.0e9;
+}
+
+static char* failedJson (mdaw_engine* e)
+{
+    size_t n = mdaw_plugins_failed (e, NULL, 0);
+    char* text = malloc (n + 1);
+    text[0] = 0;
+    mdaw_plugins_failed (e, text, n + 1);
+    return text;
+}
+
+/* Whether a file is mapped into this process (a plugin library loaded). */
+static int mapped (const char* path)
+{
+    FILE* f = fopen ("/proc/self/maps", "r");
+    if (f == NULL) return -1;
+    char line[4096];
+    int found = 0;
+    while (! found && fgets (line, sizeof line, f) != NULL)
+        found = strstr (line, path) != NULL;
+    fclose (f);
+    return found;
+}
+
+/* The reason a failed list gives for a file; empty if the file is not in it. */
+static void reasonFor (const char* json, const char* file, char* out, size_t capacity)
+{
+    char quoted[1200];
+    snprintf (quoted, sizeof quoted, "\"%s\"", file);
+    out[0] = 0;
+    const char* at = strstr (json, quoted);
+    if (at == NULL) return;
+    while (at > json && *at != '{') --at;
+    stringValue (at, "reason", out, capacity);
+}
+
+/* No child process of this one, running or unreaped. */
+static int noChildren (void)
+{
+    errno = 0;
+    return waitpid (-1, NULL, WNOHANG) == -1 && errno == ECHILD;
+}
+
+static void emptyFolder (const char* path)
+{
+    DIR* dir = opendir (path);
+    if (dir == NULL) return;
+    struct dirent* entry;
+    while ((entry = readdir (dir)) != NULL)
+    {
+        if (entry->d_name[0] == '.') continue;
+        char file[1200];
+        snprintf (file, sizeof file, "%s/%s", path, entry->d_name);
+        remove (file);
+    }
+    closedir (dir);
+}
+
+static double timedScan (mdaw_engine* e, mdaw_status* status)
+{
+    double start = now();
+    *status = mdaw_plugins_scan (e, "CLAP");
+    if (*status != MDAW_OK) printLastError ("scan with the scanner");
+    return now() - start;
+}
+
+/* Good, crashing, hanging and stateless plugins in one CLAP folder, scanned with the scanner.
+ * The machine's own CLAP folders are scanned as well (the format always looks there). */
+static void scannerChecks (int haveSynth)
+{
+    const char* scanner = getenv ("MDAW_TEST_SCANNER");
+    if (scanner == NULL || *scanner == 0) scanner = MDAW_TEST_SCANNER;
+    const char* testPlugins = getenv ("MDAW_TEST_CLAP_DIR");
+    if (testPlugins == NULL || *testPlugins == 0) testPlugins = MDAW_TEST_CLAP_DIR;
+    const char* clapPath = getenv ("CLAP_PATH");
+    printf ("scanner: %s, test plugins: %s\n", scanner, testPlugins);
+
+    /* The byte order of VST3 class ids, checked by the scanner against the VST3 SDK. */
+    {
+        char command[1400];
+        snprintf (command, sizeof command, "'%s' --self-test > " SCRATCH "/scanner-self-test.txt 2>&1", scanner);
+        check (system (command) == 0, "vst3_id_byte_order");
+    }
+
+    char cwd[1024], dir[1200], crash[1300], hang[1300], stateless[1300], synth[1300], from[1300];
+    if (getcwd (cwd, sizeof cwd) == NULL) cwd[0] = 0;
+    snprintf (dir, sizeof dir, "%s/" SCRATCH "/scan-clap", cwd);
+    mkdir (dir, 0755);
+    emptyFolder (dir);
+    mkdir (SCRATCH "/settings-scanner", 0755);
+    emptyFolder (SCRATCH "/settings-scanner");
+    snprintf (crash, sizeof crash, "%s/bad-crash.clap", dir);
+    snprintf (hang, sizeof hang, "%s/bad-hang.clap", dir);
+    snprintf (stateless, sizeof stateless, "%s/test-stateless.clap", dir);
+    snprintf (synth, sizeof synth, "%s/mdaw-test-synth.clap", dir);
+    int copied = 1;
+    snprintf (from, sizeof from, "%s/bad-crash.clap", testPlugins);
+    copied &= copyFile (from, crash);
+    snprintf (from, sizeof from, "%s/bad-hang.clap", testPlugins);
+    copied &= copyFile (from, hang);
+    snprintf (from, sizeof from, "%s/test-stateless.clap", testPlugins);
+    copied &= copyFile (from, stateless);
+    if (haveSynth && clapPath != NULL)
+    {
+        snprintf (from, sizeof from, "%s/mdaw-test-synth.clap", clapPath);
+        haveSynth = copyFile (from, synth);
+    }
+    check (copied, "scanner_test_plugins_present");
+    setenv ("CLAP_PATH", dir, 1);
+    setenv ("MDAW_SCAN_TIMEOUT_MS", "3000", 1);
+
+    mdaw_engine* e = createWith (SCRATCH "/settings-scanner", scanner);
+    check (e != NULL, "scanner_engine_create");
+    if (e == NULL) { printLastError ("create with the scanner"); return; }
+
+    mdaw_status s;
+    double first = timedScan (e, &s);
+    measure ("scanner_first_scan_seconds", first);
+    check (s == MDAW_OK, "scanner_scan_ok");
+    char* list = pluginsJson (e);
+    char* failed = failedJson (e);
+    printf ("plugins (scanner): %s\nfailed (scanner): %s\n", list, failed);
+    char crashReason[1024], hangReason[1024];
+    reasonFor (failed, crash, crashReason, sizeof crashReason);
+    reasonFor (failed, hang, hangReason, sizeof hangReason);
+    printf ("crash: %s\nhang: %s\n", crashReason, hangReason);
+    check (strstr (crashReason, "crashed") != NULL && strstr (crashReason, "signal 6") != NULL, "scanner_crash_listed_as_crash");
+    check (strstr (hangReason, "hung") != NULL && strstr (hangReason, "3000 ms") != NULL, "scanner_hang_listed_as_hang");
+    check (strstr (list, "org.mdaw.test-bad") == NULL, "scanner_bad_plugins_not_offered");
+    check (strstr (list, "\"org.mdaw.test-stateless\"") != NULL, "scanner_stateless_listed");
+    if (haveSynth)
+        check (occurrences (list, "\"" TEST_SYNTH_ID "\"") == 1, "scanner_synth_listed_by_id");
+    /* Nothing was loaded here to scan or to list: the scanner did it. */
+    check (mapped (crash) == 0 && mapped (hang) == 0 && mapped (stateless) == 0 && mapped (synth) == 0, "scanner_no_library_loaded_here");
+    check (noChildren(), "scanner_children_reaped");
+    check (system ("pgrep -f 'mdaw-plugin-scan CLAP .*/bad[-]' > /dev/null") != 0, "scanner_no_leftover_processes");
+    free (list);
+    free (failed);
+
+    /* Nothing changed: nothing is examined again, the failures stay. */
+    double second = timedScan (e, &s);
+    measure ("scanner_second_scan_seconds", second);
+    failed = failedJson (e);
+    reasonFor (failed, hang, hangReason, sizeof hangReason);
+    reasonFor (failed, crash, crashReason, sizeof crashReason);
+    check (s == MDAW_OK && second < 1.0 && hangReason[0] != 0 && crashReason[0] != 0, "scanner_second_scan_skips_known");
+    free (failed);
+
+    /* A changed file is examined again: the hanging one takes the time limit once more. */
+    {
+        struct timeval times[2];
+        gettimeofday (&times[0], NULL);
+        times[0].tv_sec += 10;
+        times[1] = times[0];
+        utimes (hang, times);
+    }
+    double third = timedScan (e, &s);
+    measure ("scanner_changed_scan_seconds", third);
+    failed = failedJson (e);
+    reasonFor (failed, hang, hangReason, sizeof hangReason);
+    check (s == MDAW_OK && third > 2.5 && strstr (hangReason, "hung") != NULL, "scanner_changed_file_examined_again");
+    free (failed);
+    check (noChildren() && system ("pgrep -f 'mdaw-plugin-scan CLAP .*/bad[-]' > /dev/null") != 0, "scanner_children_reaped_after_kill");
+
+    /* Adding a device loads the plugin, for real. A plugin without state resets to its
+     * parameters' defaults. */
+    {
+        mdaw_status a = mdaw_track_add (e, 50, 0, "Scanned");
+        a |= mdaw_device_add (e, 50, 51, 0, "CLAP", "org.mdaw.test-stateless");
+        if (a != MDAW_OK) printLastError ("add the stateless plugin");
+        check (a == MDAW_OK && mapped (stateless) == 1, "scanner_device_add_loads");
+        float value = -1.0f;
+        a = mdaw_device_set_param (e, 51, "0", 0.9f);
+        a |= mdaw_device_get_param (e, 51, "0", &value);
+        check (a == MDAW_OK && fabsf (value - 0.9f) < 0.01f && mdaw_device_get_state (e, 51, NULL, 0) == 0, "stateless_param_set_no_state");
+        mdaw_status reset = mdaw_device_reset_state (e, 51);
+        if (reset != MDAW_OK) printLastError ("reset the stateless plugin");
+        mdaw_device_get_param (e, 51, "0", &value);
+        measure ("stateless_param_after_reset", value);
+        check (reset == MDAW_OK && fabsf (value - 0.5f) < 0.01f && mdaw_project_has (e, MDAW_ENTITY_DEVICE, 51) == 1, "stateless_reset_to_defaults");
+    }
+    if (haveSynth)
+    {
+        mdaw_note n[8];
+        quarterNotes (n, 3000);
+        mdaw_status a = mdaw_track_add (e, 54, 50, "Scanned synth");
+        a |= mdaw_device_add (e, 54, 52, 0, "CLAP", TEST_SYNTH_ID);
+        a |= mdaw_clip_add (e, 54, 53, 0, 8 * Q, "Scanned");
+        a |= mdaw_notes_put (e, 53, n, 8);
+        Wav w = render (e, "scanned_synth", 0, 8 * Q);
+        measure ("scanned_synth_peak", peakOf (&w));
+        check (a == MDAW_OK && peakOf (&w) > 0.01 && mapped (synth) == 1, "scanner_synth_plays");
+        freeWav (&w);
+    }
+    mdaw_engine_destroy (e);
+
+    /* The failures are remembered across a restart, without a scan. */
+    e = createWith (SCRATCH "/settings-scanner", scanner);
+    if (e != NULL)
+    {
+        failed = failedJson (e);
+        list = pluginsJson (e);
+        reasonFor (failed, hang, hangReason, sizeof hangReason);
+        reasonFor (failed, crash, crashReason, sizeof crashReason);
+        check (hangReason[0] != 0 && crashReason[0] != 0, "scanner_failures_remembered");
+        check (strstr (list, "\"org.mdaw.test-stateless\"") != NULL && (! haveSynth || strstr (list, "\"" TEST_SYNTH_ID "\"") != NULL),
+               "scanner_list_after_restart");
+        free (failed);
+        free (list);
+        mdaw_engine_destroy (e);
+    }
+    check (noChildren(), "scanner_no_children_at_end");
 }
 
 int main (void)
@@ -904,6 +1145,9 @@ int main (void)
             mdaw_engine_destroy (e);
         }
     }
+
+    /* 14. Plugins examined by the scanner, in child processes ---------------------------- */
+    scannerChecks (haveExternal);
 
     printf ("RESULT failures=%d\n", failures);
     printf ("RESULT ok=%d\n", failures == 0 ? 1 : 0);

@@ -337,7 +337,7 @@ fn the_engine_follows_the_model() {
     let engine = Engine::new(config()).expect("create the engine");
     println!("versions: {}", engine.versions());
     assert!(engine.versions().contains("JUCE"), "versions");
-    assert_eq!(mdaw_tracktion::abi_version(), 2);
+    assert_eq!(mdaw_tracktion::abi_version(), 3);
     assert!(
         !engine.versions().contains("Tracktion Engine Tracktion Engine"),
         "versions: name not doubled"
@@ -358,6 +358,7 @@ fn the_engine_follows_the_model() {
     incremental_equals_reload(&mut world, &ids, &mut ids_gen);
     repeated_ops_are_idempotent(&mut world, &ids, &mut ids_gen);
     params_and_state(&world, &ids);
+    pocket_params(&mut world, &ids);
     no_events_for_own_changes(&world);
     track_removed(&mut world, &ids);
     plugins(&mut world, &mut ids_gen, have_clap);
@@ -400,13 +401,8 @@ fn world_ids(world: &World) -> (u64, u64, u64, u64) {
 fn loaded_project_renders(world: &World) {
     let problems = world.load();
     println!("load problems: {problems:?}");
-    assert!(
-        problems
-            .iter()
-            .any(|p| matches!(p, Problem::ParamNotMapped { param: 0, .. })),
-        "load: the Pocket parameter is reported as not carried over"
-    );
-    assert_eq!(problems.len(), 1, "load: no other problems");
+    // The Pocket parameter (Osc 1 wave) is carried over to the engine's synth.
+    assert!(problems.is_empty(), "load: no problems: {problems:?}");
     let engine = &world.engine;
     let ids = &world_ids(world);
     assert!(
@@ -698,11 +694,7 @@ fn incremental_equals_reload(world: &mut World, ids: &Ids, ids_gen: &mut IdGen) 
 
     let problems = world.load();
     let reloaded = render(&world.engine, "reloaded", 16 * Q);
-    assert_eq!(
-        problems.len(),
-        1,
-        "reload: only the Pocket parameter is a problem"
-    );
+    assert!(problems.is_empty(), "reload: no problems: {problems:?}");
     assert_same_envelope(&incremental, &reloaded, "incremental vs reloaded");
 }
 
@@ -808,6 +800,121 @@ fn params_and_state(world: &World, ids: &Ids) {
         (value - 0.25).abs() < 0.01,
         "state: restoring it restores the param ({value})"
     );
+}
+
+/// A crude measure of high-frequency content: the RMS of the sample-to-sample difference of
+/// the left channel over its RMS. A low-passed signal changes less from sample to sample.
+fn brightness(wav: &Wav) -> f64 {
+    let left: Vec<f64> = wav.samples.chunks_exact(2).map(|f| f64::from(f[0])).collect();
+    let rms = (left.iter().map(|s| s * s).sum::<f64>() / left.len() as f64).sqrt();
+    let diff = (left.windows(2).map(|w| (w[1] - w[0]).powi(2)).sum::<f64>() / left.len() as f64).sqrt();
+    diff / rms.max(1e-12)
+}
+
+/// Step 5b: Pocket's parameters reach the engine's synth (Tracktion's 4osc, an approximation of
+/// Pocket, apply.rs). The texts 4osc shows for the converted values confirm the conversions;
+/// release, volume and cutoff are heard in renders.
+fn pocket_params(world: &mut World, ids: &Ids) {
+    // A Pocket parameter set through the model, then back to its default.
+    let set = |world: &mut World, param: u32, value: Option<f64>| {
+        let problems = world.op(Op::DeviceSetParam {
+            track: ids.track,
+            id: ids.synth,
+            param,
+            value,
+        });
+        assert!(problems.is_empty(), "pocket param {param}: {problems:?}");
+    };
+    // The state-applying step before may have changed 4osc parameters directly: start from the
+    // model's values again.
+    set(world, 19, None);
+    let device = ids.synth.0.0;
+    let text = |world: &World, id: &str| {
+        let params = world.engine.device_params(device).expect("4osc params");
+        params
+            .iter()
+            .find(|p| p.id == id)
+            .unwrap_or_else(|| panic!("4osc has no {id}: {params:?}"))
+            .text
+            .clone()
+    };
+    // Pocket's defaults as 4osc shows them.
+    for (id, expected) in [
+        ("ampRelease", "300ms"),
+        ("ampAttack", "5ms"),
+        ("ampSustain", "70.0%"),
+        ("filterFreq", "2500Hz"),
+        ("masterLevel", "-3.10"),
+        ("level1", "-6.02dB"),
+        ("tune2", "0st"),
+    ] {
+        assert_eq!(text(world, id), expected, "pocket default on 4osc: {id}");
+    }
+
+    let reference = render(&world.engine, "pocket_reference", 16 * Q);
+    let reference_end = reference.last_above(SILENT).expect("pocket: sounds");
+
+    // Release 2 s instead of 0.3 s: the last note rings on for longer.
+    set(world, 10, Some(2.0));
+    assert_eq!(text(world, "ampRelease"), "2.00s", "pocket release on 4osc");
+    let long = render(&world.engine, "pocket_long_release", 16 * Q);
+    let long_end = long.last_above(SILENT).expect("pocket long release: sounds");
+    println!("pocket release: sound ends at {reference_end:.3} s, with 2 s release at {long_end:.3} s");
+    assert!(
+        long_end > reference_end + 1.0,
+        "pocket release: longer tail ({reference_end} -> {long_end})"
+    );
+    set(world, 10, None);
+
+    // Volume 0.2 instead of 0.7: about 11 dB quieter.
+    set(world, 19, Some(0.2));
+    let quiet = render(&world.engine, "pocket_quiet", 16 * Q);
+    println!(
+        "pocket volume: peak {:.4} -> {:.4}",
+        reference.peak(),
+        quiet.peak()
+    );
+    assert!(
+        quiet.peak() > SILENT && quiet.peak() < 0.5 * reference.peak(),
+        "pocket volume: quieter ({} vs {})",
+        quiet.peak(),
+        reference.peak()
+    );
+    set(world, 19, None);
+
+    // Cutoff 150 Hz (and no filter envelope) against 12 kHz: much less high-frequency content.
+    set(world, 13, Some(0.0));
+    set(world, 11, Some(12_000.0));
+    let bright = brightness(&render(&world.engine, "pocket_bright", 16 * Q));
+    set(world, 11, Some(150.0));
+    assert_eq!(text(world, "filterFreq"), "150Hz", "pocket cutoff on 4osc");
+    let dark = brightness(&render(&world.engine, "pocket_dark", 16 * Q));
+    println!("pocket cutoff: brightness {bright:.4} at 12 kHz, {dark:.4} at 150 Hz");
+    assert!(dark < 0.5 * bright, "pocket cutoff: darker ({bright} -> {dark})");
+    set(world, 11, None);
+    set(world, 13, None);
+
+    // Back at the defaults: as at the start.
+    let again = render(&world.engine, "pocket_defaults_again", 16 * Q);
+    assert_same_envelope(&reference, &again, "pocket defaults again");
+
+    // A parameter Pocket does not have is still reported.
+    let problems = world.op(Op::DeviceSetParam {
+        track: ids.track,
+        id: ids.synth,
+        param: 99,
+        value: Some(1.0),
+    });
+    assert!(
+        matches!(problems.as_slice(), [Problem::ParamNotMapped { param: 99, .. }]),
+        "pocket: unknown parameter reported: {problems:?}"
+    );
+    world.op(Op::DeviceSetParam {
+        track: ids.track,
+        id: ids.synth,
+        param: 99,
+        value: None,
+    });
 }
 
 /// Step 6: the engine's own changes are not echoed as events.

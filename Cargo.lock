@@ -2830,6 +2830,7 @@ dependencies = [
 name = "mdaw-tracktion"
 version = "0.1.0"
 dependencies = [
+ "mdaw-dsp",
  "mdaw-model",
  "mdaw-tracktion-sys",
  "serde",

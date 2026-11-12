@@ -74,13 +74,19 @@ fn main() {
         run(configure, "configure the native build");
     }
 
-    // The bridge archive, and the CLAP plugin format it links (a separate archive in CMake).
+    // The bridge archive, the CLAP plugin format it links (a separate archive in CMake), and
+    // the plugin scanner the engine runs as a child process (`mdaw_engine_config.scanner_path`),
+    // with the test plugins that crash and hang it (for the tests of dependent crates).
     let mut compile = Command::new("cmake");
     compile.arg("--build").arg(&build).args([
         "--parallel",
         "--target",
         "mdaw_tracktion_bridge",
         "mdaw_clap_format",
+        "mdaw-plugin-scan",
+        "mdaw-test-clap-crash",
+        "mdaw-test-clap-hang",
+        "mdaw-test-clap-stateless",
     ]);
     run(
         compile,
@@ -119,6 +125,12 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib={lib}");
     }
     println!("cargo:root={}", build.display());
+    // `links` metadata: DEP_MDAW_TRACKTION_BRIDGE_SCANNER in the build scripts of dependents.
+    let suffix = if target_os == "windows" { ".exe" } else { "" };
+    let scanner = build
+        .join("tracktion-bridge")
+        .join(format!("mdaw-plugin-scan{suffix}"));
+    println!("cargo:scanner={}", scanner.display());
 }
 
 fn run(mut command: Command, what: &str) {

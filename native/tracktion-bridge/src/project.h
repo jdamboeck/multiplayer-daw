@@ -5,6 +5,7 @@
 
 #include "mdaw_engine.h"
 #include "plugin_ids.h"
+#include "plugin_scan.h"
 
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <tracktion_engine/tracktion_engine.h>
@@ -53,6 +54,7 @@ struct Config
     bool openDevice = false;
     juce::String backend;
     bool enablePlugins = false;
+    juce::File scanner;   // mdaw-plugin-scan; none: plugins are examined in this process
 };
 
 class Project : private juce::Timer,
@@ -107,6 +109,7 @@ public:
 
     void pluginsScan (const juce::String& format);
     juce::String pluginsList();
+    juce::String pluginsFailed();
 
     void play();
     void stop();
@@ -135,6 +138,7 @@ private:
     std::unique_ptr<te::Edit> edit;
     std::unique_ptr<te::Edit> retiring;   // between the steps that drop an edit
     std::unique_ptr<PluginIds> pluginIds;
+    std::unique_ptr<ScanRecords> scanRecords;
 
     std::map<uint64_t, juce::ReferenceCountedObjectPtr<te::AudioTrack>> tracks;
     std::map<uint64_t, Clip> clips;
@@ -179,6 +183,12 @@ private:
     /// The plugins that can be loaded now, each (format, own id) once: the first description
     /// in the known-plugin list wins.
     std::vector<std::pair<juce::PluginDescription, juce::String>> loadablePlugins();
+    bool usesScanner() const { return config.scanner != juce::File(); }
+    void scanInProcess (juce::AudioPluginFormat&);
+    void scanWithScanner (juce::AudioPluginFormat&);
+    void examineInChild (juce::AudioPluginFormat&, const juce::String& file, juce::int64 stamp,
+                         const juce::File& result, const juce::File& log, int timeoutMs);
+    juce::int64 candidateStamp (juce::AudioPluginFormat&, const juce::String& file);
     void closeEditor (uint64_t id);
     void closeAllEditors();
     int insertIndexFor (te::AudioTrack&, uint64_t after, const te::Plugin* moving) const;

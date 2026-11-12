@@ -117,6 +117,8 @@ mdaw_engine* mdaw_engine_create (const mdaw_engine_config* config)
         c.openDevice = config->open_audio_device != 0;
         c.backend = text (config->audio_backend);
         c.enablePlugins = config->enable_plugins != 0;
+        if (config->scanner_path != nullptr && *config->scanner_path != 0)
+            c.scanner = fileOf (config->scanner_path);
 
         auto engine = std::make_unique<mdaw_engine>();
         auto* e = engine.get();
@@ -372,6 +374,11 @@ mdaw_status mdaw_plugins_scan (mdaw_engine* engine, const char* format)
 size_t mdaw_plugins_list (mdaw_engine* engine, char* buffer, size_t capacity)
 {
     return textFrom (engine, buffer, capacity, [] (Project& p) { return p.pluginsList(); });
+}
+
+size_t mdaw_plugins_failed (mdaw_engine* engine, char* buffer, size_t capacity)
+{
+    return textFrom (engine, buffer, capacity, [] (Project& p) { return p.pluginsFailed(); });
 }
 
 //==============================================================================

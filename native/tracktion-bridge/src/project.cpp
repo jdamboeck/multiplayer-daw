@@ -299,6 +299,7 @@ Project::Project (const Config& c, Shared& s) : config (c), shared (s)
         engine->getPluginManager().pluginFormatManager.addFormat (mdaw::createClapFormat().release());
 
     pluginIds = std::make_unique<PluginIds> (config.settingsDir.getChildFile ("plugin-ids.xml"));
+    scanRecords = std::make_unique<ScanRecords> (config.settingsDir.getChildFile ("plugin-scan.xml"));
     engine->getDeviceManager().addChangeListener (this);
     edit = makeEdit();
 
@@ -917,9 +918,21 @@ void Project::deviceResetState (uint64_t id)
         return;
     if (d->instance() != nullptr)
     {
-        // A plugin that saves no state has nothing to go back to through it.
         if (d->initialState.isEmpty())
-            fail (MDAW_ERR_PLUGIN, "the plugin gave no state when it was loaded, so it cannot be reset");
+        {
+            // A plugin that saves no state has nothing to go back to through it: every
+            // parameter goes back to the default the plugin gives for it.
+            const juce::ScopedValueSetter<bool> own (ownChange, true);
+            d->refreshParams();
+            for (auto& [pid, param] : d->params)
+                if (auto* hosted = d->hostedOf (*param))
+                {
+                    param->setNormalisedParameter (hosted->getDefaultValue(), juce::sendNotification);
+                    d->known[pid] = param->getCurrentNormalisedValue();
+                }
+            d->stateChanged = false;
+            return;
+        }
         restoreState (*d, d->initialState.getData(), d->initialState.getSize());
     }
     else
@@ -1023,23 +1036,172 @@ void Project::pluginsScan (const juce::String& format)
 {
     if (! config.enablePlugins)
         fail (MDAW_ERR_NOT_FOUND, "plugins are switched off in this engine");
-    auto& pm = engine->getPluginManager();
-    for (auto* fmt : pm.pluginFormatManager.getFormats())
+    for (auto* fmt : engine->getPluginManager().pluginFormatManager.getFormats())
     {
         if (fmt->getName() != format)
             continue;
-        // A plugin that takes the process down during a scan is skipped next time.
-        const auto pedal = config.settingsDir.getChildFile ("scan-" + format + ".pedal");
-        juce::PluginDirectoryScanner scanner (pm.knownPluginList, *fmt, fmt->getDefaultLocationsToSearch(), true, pedal, false);
-        juce::String name;
-        while (scanner.scanNextFile (true, name)) {}
+        if (usesScanner())
+            scanWithScanner (*fmt);
+        else
+            scanInProcess (*fmt);
         engine->getPropertyStorage().flushSettingsToDisk();
-        // Reads the own ids of what was found while the libraries are fresh, and keeps them.
-        loadablePlugins();
         pluginIds->save();
+        scanRecords->save();
         return;
     }
     fail (MDAW_ERR_NOT_FOUND, "no plugin format '" + format + "'");
+}
+
+void Project::scanInProcess (juce::AudioPluginFormat& fmt)
+{
+    auto& pm = engine->getPluginManager();
+    const auto format = fmt.getName();
+    // A plugin that takes the process down during a scan is skipped next time.
+    const auto pedal = config.settingsDir.getChildFile ("scan-" + format + ".pedal");
+    juce::PluginDirectoryScanner scanner (pm.knownPluginList, fmt, fmt.getDefaultLocationsToSearch(), true, pedal, false);
+    juce::String name;
+    while (scanner.scanNextFile (true, name)) {}
+
+    // What could not be examined, for mdaw_plugins_failed. Records a scanner left for this
+    // format no longer hold.
+    scanRecords->forget (format);
+    for (auto& f : scanner.getFailedFiles())
+        scanRecords->put (format, f, { candidateStamp (fmt, f), false, "could not be examined: not a plugin, or it failed to load" });
+    for (auto& f : pm.knownPluginList.getBlacklistedFiles())
+        if (fmt.fileMightContainThisPluginType (f))
+            scanRecords->put (format, f, { candidateStamp (fmt, f), false, "took the application down while it was being examined (in an earlier run)" });
+
+    // Reads the own ids of what was found while the libraries are fresh, and keeps them.
+    loadablePlugins();
+}
+
+juce::int64 Project::candidateStamp (juce::AudioPluginFormat& fmt, const juce::String& file)
+{
+    if (fmt.getName() == "LV2")
+    {
+        // An LV2 candidate is a plugin URI, not a file. JUCE describes an LV2 plugin from its
+        // RDF data alone (lilv; no plugin code runs), so that is done here, for the time its
+        // bundle last changed.
+        juce::OwnedArray<juce::PluginDescription> found;
+        fmt.findAllTypesForFile (found, file);
+        return found.isEmpty() ? 0 : found[0]->lastFileModTime.toMilliseconds();
+    }
+    return juce::File::isAbsolutePath (file) ? stampOf (juce::File (file)) : 0;
+}
+
+/// Every candidate file is examined by mdaw-plugin-scan in a child process, one after the
+/// other, unless it was examined before and has not changed since. This thread waits for each
+/// child with plain blocking waits and runs no message loop meanwhile (doc point 14).
+void Project::scanWithScanner (juce::AudioPluginFormat& fmt)
+{
+    if (! config.scanner.existsAsFile())
+        fail (MDAW_ERR_NOT_FOUND, "the plugin scanner " + config.scanner.getFullPathName() + " does not exist");
+    const auto format = fmt.getName();
+    auto& known = engine->getPluginManager().knownPluginList;
+
+    // Lists the candidates without loading any: the VST3 and CLAP formats list files by name;
+    // the LV2 format reads the bundles' RDF data with lilv, which runs no plugin code (except
+    // an LV2 dynamic manifest, a deprecated extension: JUCE's LV2 format loads those already
+    // when the engine is created, scanner or not).
+    const auto candidates = fmt.searchPathsForPlugins (fmt.getDefaultLocationsToSearch(), true, false);
+    scanRecords->keepOnly (format, candidates);
+
+    const auto timeout = scanTimeoutMs();
+    const auto tag = juce::Uuid().toString();
+    const auto result = config.settingsDir.getChildFile ("scan-result-" + tag + ".xml");
+    const auto log = config.settingsDir.getChildFile ("scan-log-" + tag + ".txt");
+    for (auto& file : candidates)
+    {
+        const auto stamp = candidateStamp (fmt, file);
+        if (auto* record = scanRecords->find (format, file); record != nullptr && record->stamp == stamp)
+        {
+            if (! record->ok)
+                continue;   // crashed, hung or empty, and not changed since
+            // Examined before: still known, with an id for every plugin in it?
+            bool complete = false;
+            for (auto& d : known.getTypes())
+                if (d.pluginFormatName == format && d.fileOrIdentifier == file)
+                {
+                    complete = pluginIds->knows (d);
+                    if (! complete)
+                        break;
+                }
+            if (complete)
+                continue;
+        }
+        examineInChild (fmt, file, stamp, result, log, timeout);
+    }
+    result.deleteFile();
+    result.getSiblingFile (result.getFileName() + ".part").deleteFile();
+    log.deleteFile();
+}
+
+namespace
+{
+/// The last line the scanner wrote to stderr (it says why it gave up), shortened.
+juce::String lastLineOf (const juce::File& log)
+{
+    auto lines = juce::StringArray::fromLines (log.loadFileAsString());
+    lines.removeEmptyStrings();
+    auto last = lines.isEmpty() ? juce::String ("(nothing)") : lines[lines.size() - 1].trim();
+    return last.length() > 300 ? last.substring (0, 300) + "..." : last;
+}
+
+juce::String signalName (int signal)
+{
+   #if JUCE_LINUX || JUCE_MAC || JUCE_BSD
+    if (const char* name = strsignal (signal))
+        return juce::String (signal) + ", " + name;
+   #endif
+    return juce::String (signal);
+}
+} // namespace
+
+void Project::examineInChild (juce::AudioPluginFormat& fmt, const juce::String& file, juce::int64 stamp,
+                              const juce::File& result, const juce::File& log, int timeoutMs)
+{
+    const auto format = fmt.getName();
+    auto& known = engine->getPluginManager().knownPluginList;
+    result.deleteFile();
+    const auto outcome = runChild (config.scanner, { format, file, result.getFullPathName() }, log, timeoutMs);
+    if (! outcome.started)
+        fail (MDAW_ERR_INTERNAL, "the plugin scanner could not be started: " + outcome.error);
+
+    // Whatever was known of the file before goes; what the scanner found now takes its place.
+    for (auto& d : known.getTypes())
+        if (d.pluginFormatName == format && d.fileOrIdentifier == file)
+            known.removeType (d);
+
+    ScanRecords::Entry entry { stamp, false, {} };
+    if (outcome.timedOut)
+        entry.reason = "hung: no result within " + juce::String (timeoutMs) + " ms, so the scanner was stopped";
+    else if (outcome.signalled)
+        entry.reason = "crashed while being examined (signal " + signalName (outcome.signal) + ")";
+    else if (outcome.exited && outcome.code != 0)
+        entry.reason = "the scanner could not examine it (exit status " + juce::String (outcome.code) + "): " + lastLineOf (log);
+    else if (! outcome.exited && ! result.existsAsFile())
+        entry.reason = "the scanner ended without a result; " + outcome.error;
+    else if (auto xml = juce::XmlDocument::parse (result); xml == nullptr || ! xml->hasTagName ("MDAW_PLUGIN_SCAN"))
+        entry.reason = "the scanner gave no readable result";
+    else
+    {
+        // Only plugins whose own id could be read are of use: they are named by it.
+        for (auto* found : xml->getChildWithTagNameIterator ("FOUND"))
+        {
+            juce::PluginDescription d;
+            const auto id = found->getStringAttribute ("id");
+            if (auto* p = found->getChildByName ("PLUGIN"); p != nullptr && d.loadFromXml (*p) && id.isNotEmpty()
+                                                            && d.pluginFormatName == format && d.fileOrIdentifier == file)
+            {
+                known.addType (d);
+                pluginIds->remember (d, id);
+                entry.ok = true;
+            }
+        }
+        if (! entry.ok)
+            entry.reason = "no plugin found in it (not a plugin, or it failed to load)";
+    }
+    scanRecords->put (format, file, entry);
 }
 
 std::vector<std::pair<juce::PluginDescription, juce::String>> Project::loadablePlugins()
@@ -1062,12 +1224,23 @@ std::vector<std::pair<juce::PluginDescription, juce::String>> Project::loadableP
                 format = f;
         if (format == nullptr || ! format->doesPluginStillExist (d))
             continue;
-        auto ownId = pluginIds->of (d);
+        // With a scanner only what a scan stored counts: no library is loaded to find out.
+        auto ownId = pluginIds->of (d, ! usesScanner());
         if (ownId.isEmpty() || ! seen.insert ({ d.pluginFormatName, ownId }).second)
             continue;
         result.emplace_back (d, ownId);
     }
     return result;
+}
+
+juce::String Project::pluginsFailed()
+{
+    juce::Array<juce::var> list;
+    if (config.enablePlugins)
+        for (auto& [key, entry] : scanRecords->all())
+            if (! entry.ok && (! juce::File::isAbsolutePath (key.second) || juce::File (key.second).exists()))
+                list.add (object ({ { "format", key.first }, { "file", key.second }, { "reason", entry.reason } }));
+    return json (list);
 }
 
 juce::String Project::pluginsList()

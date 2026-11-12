@@ -216,13 +216,21 @@ These were all found by running into them.
     difference; the bridge sets 0. `PluginList::insertPlugin` can refuse without an error.
 22. **JUCE's identifier string for a plugin contains a hash of its file path,** so it differs
     between machines. A shared project needs the plugin's own id. For VST3, JUCE keeps only a
-    32-bit hash of the class id; the bridge reads the full id from the plugin's factory
-    (library loaded, no instance made). That code handles Linux only: on Windows the bytes are
-    ordered differently, and until it is ported VST3 plugins would not be listed there or on
-    macOS.
-23. **Reading a CLAP or VST3 id loads the plugin's library on the message thread** the first
-    time (afterwards it comes from `plugin-ids.xml`). A library that crashes on load takes the
-    process down there, as it would during an in-process scan.
+    32-bit hash of the class id; the bridge reads the full id from the bundle's
+    `moduleinfo.json` when there is one, otherwise from the plugin's factory. On Windows the
+    first eight bytes are stored in a different order and are converted, so the text is the
+    same everywhere. The conversion is checked against the VST3 SDK's own code on Linux; the
+    Windows and macOS loading code has never run.
+23. **Examine plugin files in a child process.** `mdaw-plugin-scan` looks at one file and
+    writes what it found; the bridge runs it per file with a time limit (30 s), kills it if it
+    hangs, and remembers a file that crashed or hung until the file changes. With it, listing
+    plugins and adding a device never load a library just to look at it. Scanning this machine
+    that way: VST3 0.75 s (229 plugins), LV2 2.5 s (154), CLAP 0.1 s (17), the same plugins as
+    in-process, no failures; a repeat scan with nothing changed takes about 0.1 s.
+24. **LV2 dynamic manifests are loaded in the application** when the engine starts, scanner or
+    not: JUCE builds lilv with that (deprecated) extension on. None are installed here.
+25. **Do not ignore SIGCHLD in the application.** The bridge then cannot tell a scanner crash
+    from an empty result.
 
 ## The bridge
 
@@ -257,7 +265,7 @@ applies model operations to the model and the engine side by side, renders after
 and checks that the incremental result matches a fresh load. After moving a submodule pin,
 run `cmake --build target/native` once: the build script does not watch third-party sources.
 
-ABI 2 closed the gaps found from the Rust side. Plugins are named by their own id, the same
+ABI 2 and 3 closed the gaps found from the Rust side. Plugins are named by their own id, the same
 on every machine (CLAP id, LV2 URI, VST3 class id as 32 hex digits; see
 `src/plugin_ids.h`): JUCE's identifier string contains a hash of the file path. The ids of
 CLAP and VST3 plugins are read from their libraries once and kept in `plugin-ids.xml` in the
@@ -270,6 +278,14 @@ parameters are still not mapped to the engine's synth.
 
 One VST3 and one LV2 instrument each were loaded and rendered through the bridge by hand
 (ChowKick and Vital as VST3; Dexed and String machine as LV2), not by the committed tests.
+
+The built-in Pocket synth of the model is played by Tracktion's 4osc. All twenty Pocket
+parameters are mapped (table in `crates/mdaw-tracktion/src/apply.rs`); it is an approximation
+for the migration — velocity response, voice count and the exact filter and envelope shapes
+differ. For that table `mdaw-tracktion` depends on `mdaw-dsp`; when the Rust engine is retired
+the table moves or the model's built-in device becomes 4osc itself.
+
+The model's tempo limit is now 20–300 bpm, the range Tracktion plays.
 
 Open model question: after a parameter is put back to "default" in the model and the project
 is reloaded, the value in the plugin's stored state wins over the default.

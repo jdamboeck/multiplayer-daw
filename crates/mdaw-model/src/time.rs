@@ -11,7 +11,9 @@ pub const MAX_TICK: i64 = TICKS_PER_BAR * 100_000;
 
 pub const DEFAULT_MILLI_BPM: u32 = 120_000;
 pub const MIN_MILLI_BPM: u32 = 20_000;
-pub const MAX_MILLI_BPM: u32 = 400_000;
+/// The audio engine (Tracktion Engine, `TempoSetting::maxBPM`) plays 20 to 300 bpm, so the
+/// model allows no more.
+pub const MAX_MILLI_BPM: u32 = 300_000;
 
 /// Musical time at 960 PPQ. Clip positions are absolute; note positions are relative to the clip.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default, Serialize, Deserialize)]

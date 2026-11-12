@@ -114,7 +114,7 @@ fn content() -> impl Strategy<Value = TrackContent> {
 
 fn op() -> impl Strategy<Value = Op> {
     let shell = (name(), 0u32..4).prop_map(|(name, color)| TrackShell { name, color });
-    let tempo_point = (tick(), 20u32..=400).prop_map(|(tick, bpm)| TempoPoint {
+    let tempo_point = (tick(), 20u32..=300).prop_map(|(tick, bpm)| TempoPoint {
         tick,
         milli_bpm: bpm * 1000,
     });

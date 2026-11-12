@@ -4,12 +4,14 @@
 //! `mdaw-tracktion` instead of calling these directly.
 //!
 //! The native library is built by `build.rs` with CMake (see docs/tracktion-integration.md).
+//! The build also makes the plugin scanner, `mdaw-plugin-scan`; its path reaches the build
+//! scripts of dependent crates as `DEP_MDAW_TRACKTION_BRIDGE_SCANNER` (see `mdaw-tracktion`).
 
 #![allow(non_camel_case_types)]
 
 use std::ffi::c_char;
 
-pub const MDAW_ABI_VERSION: u32 = 2;
+pub const MDAW_ABI_VERSION: u32 = 3;
 pub const MDAW_TICKS_PER_QUARTER: i64 = 960;
 
 /// Opaque engine handle.
@@ -47,6 +49,7 @@ pub struct mdaw_engine_config {
     pub open_audio_device: i32,
     pub audio_backend: *const c_char,
     pub enable_plugins: i32,
+    pub scanner_path: *const c_char,
 }
 
 #[repr(C)]
@@ -221,6 +224,7 @@ unsafe extern "C" {
     // ---- plugins on this machine
     pub fn mdaw_plugins_scan(engine: *mut mdaw_engine, format: *const c_char) -> mdaw_status;
     pub fn mdaw_plugins_list(engine: *mut mdaw_engine, buffer: *mut c_char, capacity: usize) -> usize;
+    pub fn mdaw_plugins_failed(engine: *mut mdaw_engine, buffer: *mut c_char, capacity: usize) -> usize;
 
     // ---- local playback
     pub fn mdaw_transport_play(engine: *mut mdaw_engine) -> mdaw_status;
@@ -271,7 +275,7 @@ mod tests {
     fn layouts_match_the_c_header() {
         assert_eq!(
             (size_of::<mdaw_engine_config>(), align_of::<mdaw_engine_config>()),
-            (48, 8)
+            (56, 8)
         );
         assert_eq!(
             [
@@ -280,8 +284,9 @@ mod tests {
                 offset_of!(mdaw_engine_config, open_audio_device),
                 offset_of!(mdaw_engine_config, audio_backend),
                 offset_of!(mdaw_engine_config, enable_plugins),
+                offset_of!(mdaw_engine_config, scanner_path),
             ],
-            [8, 16, 24, 32, 40]
+            [8, 16, 24, 32, 40, 48]
         );
 
         assert_eq!((size_of::<mdaw_note>(), align_of::<mdaw_note>()), (32, 8));

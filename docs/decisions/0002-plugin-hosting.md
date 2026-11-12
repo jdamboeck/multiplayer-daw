@@ -70,7 +70,8 @@ transactions are to be kept durably on the client and resubmitted (phase 5).
   the other process. Decided 2026-11-12: this is a planned phase after the bridge and the
   collaborative slice, not a maybe; the helper and its protocol stay in the tree until then.
 
-Policy items 1–4 are designed, not built. Item 5 is in the spike.
+Item 1 is built and tested (`mdaw-plugin-scan`, with plugins that crash and hang on purpose).
+Items 2–4 are designed, not built. Item 5 is in the bridge.
 
 ## Consequences
 
