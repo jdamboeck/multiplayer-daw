@@ -388,11 +388,25 @@ fn two_clients_build_play_and_tweak_one_song() {
 
     // 4. Ann turns the synth's level down (as with the slider in the device tab); it reaches
     //    Ben as state, his engine plays it, and nothing comes back.
+    // Ben has the synth's parameters on screen.
+    let shown = |ben: &mut Client| -> f64 { ben.get("shown-param Synth 0", "shown").parse().unwrap() };
+    assert!(
+        (shown(&mut ben) - 0.5).abs() < 1e-3,
+        "4: ben sees the level at 0.5"
+    );
     ann.cmd("plugin-param Synth 0 0.2");
     let saved = ann.cmd("save-states");
     let seq4 = ann.seq();
     assert_eq!(seq4, head + 1, "4: one edit for the setting");
     ben.wait_seq(seq4);
+    // Without the device tab asking again: what it shows follows the new settings by itself.
+    ben.cmd("sleep 300");
+    let ben_shows = shown(&mut ben);
+    println!("RESULT 4: ben_shows_level={ben_shows:.3}");
+    assert!(
+        (ben_shows - 0.2).abs() < 1e-3,
+        "4: ben's device tab shows the new level, not {ben_shows}"
+    );
     let state_a = ann.get("plugin-state Synth", "plugin_state");
     assert_ne!(state_a, "none");
     assert_eq!(

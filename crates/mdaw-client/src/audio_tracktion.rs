@@ -810,37 +810,7 @@ impl Worker {
                     engine.device_set_param(raw_device(device), &param, value.clamp(0.0, 1.0)),
                 );
             }
-            Job::Params(device, asked_after) => {
-                let params = engine.device_params(raw_device(device)).unwrap_or_default();
-                let mut list: Vec<ParamEntry> = params
-                    .into_iter()
-                    .map(|p| ParamEntry {
-                        id: p.id,
-                        name: p.name,
-                        value: p.min + p.value * (p.max - p.min),
-                        min: p.min,
-                        max: p.max,
-                        stepped: p.steps > 0,
-                        text: p.text,
-                    })
-                    .collect();
-                let mut shared = lock(&self.shared);
-                // A parameter set here after this reading was asked for may not have reached
-                // the plugin when it was taken: keep the value the set showed.
-                if let Some(shown) = shared.params.get(&device) {
-                    for entry in &mut list {
-                        let newer = shared
-                            .last_set
-                            .get(&(device, entry.id.clone()))
-                            .is_some_and(|number| *number > asked_after);
-                        if newer && let Some(old) = shown.iter().find(|p| p.id == entry.id) {
-                            entry.value = old.value;
-                            entry.text = old.text.clone();
-                        }
-                    }
-                }
-                shared.params.insert(device, list);
-            }
+            Job::Params(device, asked_after) => self.read_params(device, asked_after),
             Job::Editor { device, show } => {
                 self.failed(
                     "open the plugin's window",
@@ -864,6 +834,61 @@ impl Worker {
             Job::Flush(reply) => {
                 let _ = reply.send(());
             }
+        }
+    }
+
+    /// Reads a device's parameters for the device tab; `asked_after` is `sets_sent` when the
+    /// reading was asked for.
+    fn read_params(&self, device: DeviceId, asked_after: u64) {
+        let params = self.engine.device_params(raw_device(device)).unwrap_or_default();
+        let mut list: Vec<ParamEntry> = params
+            .into_iter()
+            .map(|p| ParamEntry {
+                id: p.id,
+                name: p.name,
+                value: p.min + p.value * (p.max - p.min),
+                min: p.min,
+                max: p.max,
+                stepped: p.steps > 0,
+                text: p.text,
+            })
+            .collect();
+        let mut shared = lock(&self.shared);
+        // A parameter set here after this reading was asked for may not have reached the
+        // plugin when it was taken: keep the value the set showed.
+        if let Some(shown) = shared.params.get(&device) {
+            for entry in &mut list {
+                let newer = shared
+                    .last_set
+                    .get(&(device, entry.id.clone()))
+                    .is_some_and(|number| *number > asked_after);
+                if newer && let Some(old) = shown.iter().find(|p| p.id == entry.id) {
+                    entry.value = old.value;
+                    entry.text = old.text.clone();
+                }
+            }
+        }
+        shared.params.insert(device, list);
+    }
+
+    /// After new settings went into plugins: the device tab shows their parameters from what
+    /// was read before, and asks again only when it redraws, which nothing may make it do.
+    /// So the readings of those devices that are shown are taken again now; the window is woken
+    /// when this job is done.
+    fn reread_params(&self, devices: &[DeviceId]) {
+        let (shown, asked_after): (Vec<DeviceId>, u64) = {
+            let shared = lock(&self.shared);
+            (
+                devices
+                    .iter()
+                    .copied()
+                    .filter(|d| shared.params.contains_key(d))
+                    .collect(),
+                shared.sets_sent,
+            )
+        };
+        for device in shown {
+            self.read_params(device, asked_after);
         }
     }
 
@@ -902,6 +927,13 @@ impl Worker {
             })
         };
         let Some(view) = view else { return };
+        let restated: Vec<DeviceId> = plugin_devices(&view)
+            .filter(|(track, d)| {
+                let now = state_in(&view, *track, d.id);
+                self.synced.as_ref().map(|p| state_in(p, *track, d.id)) != Some(now)
+            })
+            .map(|(_, d)| d.id)
+            .collect();
         let engine = self.engine.clone();
         let result = {
             let blobs = self.resolver();
@@ -936,6 +968,7 @@ impl Worker {
             .as_ref()
             .is_none_or(|p| p.master_gain != view.master_gain);
         self.synced = Some(view);
+        self.reread_params(&restated);
         if gain_changed || self.output_gain != 1.0 {
             self.master_gain();
         }
@@ -1124,7 +1157,7 @@ impl Worker {
             .collect();
         let blobs = self.resolver();
         let mut problems = Vec::new();
-        for (track, id) in waiting {
+        for &(track, id) in &waiting {
             let op = Op::DeviceSetState {
                 track,
                 id,
@@ -1136,6 +1169,8 @@ impl Worker {
             }
         }
         drop(blobs);
+        let applied: Vec<DeviceId> = waiting.iter().map(|(_, id)| *id).collect();
+        self.reread_params(&applied);
         self.publish_statuses(&problems);
     }
 

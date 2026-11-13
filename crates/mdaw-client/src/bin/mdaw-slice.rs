@@ -14,7 +14,8 @@
 //! `add-track <name>`, `pocket-param <track> <param> <value>`, `add-clip <track> <clip> <beat> <beats>`,
 //! `add-notes <track> <clip> <beat>:<pitch>[,...]`, `set-note <track> <clip> <index> pitch|vel <value>`,
 //! `note-pitch <track> <clip> <index>`, `add-plugin <track> clap:<id>`,
-//! `plugin-param <track> <param id> <value>`, `plugin-state <track>`, `save-states`,
+//! `plugin-param <track> <param id> <value>`, `shown-param <track> <param id>`,
+//! `plugin-state <track>`, `save-states`,
 //! `device-status <track>`, `render <file> <from tick> <to tick>`, `play`, `stop`, `seek <tick>`,
 //! `state`, `sleep <ms>`, `notices`, `crash`, `quit`.
 
@@ -442,6 +443,30 @@ impl Driver {
                 }
                 self.session.set_plugin_param(track, device, &param, value);
                 Ok(())
+            }
+            "shown-param" => {
+                // What the device tab shows for a parameter right now: the reading it has, not
+                // a new one (asking also starts a new reading, which this does not wait for).
+                let track = self.track(arg(1)?)?;
+                let param = arg(2)?.to_string();
+                let device = self.plugin_device(track)?;
+                // The first look has nothing to show yet: it starts the reading, waited for here.
+                let deadline = Instant::now() + WAIT;
+                loop {
+                    let shown = self
+                        .session
+                        .plugin_params(track, device, usize::MAX)
+                        .and_then(|(list, _)| list.into_iter().find(|p| p.id == param));
+                    if let Some(entry) = shown {
+                        println!("RESULT shown={}", entry.value);
+                        return Ok(());
+                    }
+                    if Instant::now() > deadline {
+                        return Err(format!("the plugin shows no parameter {param}"));
+                    }
+                    self.session.frame();
+                    std::thread::sleep(Duration::from_millis(5));
+                }
             }
             "plugin-state" => {
                 let track = self.track(arg(1)?)?;
