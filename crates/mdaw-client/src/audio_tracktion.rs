@@ -84,8 +84,19 @@ struct Shared {
     /// Per device of the last synced project.
     statuses: HashMap<DeviceId, DeviceStatus>,
     params: HashMap<DeviceId, Vec<ParamEntry>>,
+    /// Numbers the sets of plugin parameters made here, in the order they were sent.
+    sets_sent: u64,
+    /// The number of the last set of each parameter. A reading of a device's parameters that
+    /// was asked for before that set must not overwrite the value the set put in `params`: the
+    /// reading would show the knob back where it was until the next one.
+    last_set: HashMap<(DeviceId, String), u64>,
     /// States read from plugins, for the document.
     captured: Vec<((TrackId, DeviceId), SavedState)>,
+    /// States read from plugins that the engine holds and the document does not show yet.
+    /// Until it does, a view that still shows the state from before is not brought to the
+    /// engine for that device: that would put the plugin back to its old settings for the
+    /// moment between the read and the edit that records it.
+    ahead: HashMap<DeviceId, Ahead>,
     /// State blobs the engine needs and does not have.
     wanted: HashSet<BlobHash>,
     notices: Vec<String>,
@@ -105,7 +116,8 @@ enum Job {
         param: String,
         value: f32,
     },
-    Params(DeviceId),
+    /// Reads a device's parameters; the number is `sets_sent` when it was asked for.
+    Params(DeviceId, u64),
     Editor {
         device: DeviceId,
         show: bool,
@@ -167,11 +179,36 @@ fn raw_device(id: DeviceId) -> u64 {
 }
 
 /// Whether two views are the same project for the engine, judged by shared structure.
+/// A short `Vector` (the track order of a small project) is stored inline and never counts as
+/// shared, so it is compared by value; it is a handful of ids.
 fn same_view(a: &Project, b: &Project) -> bool {
     a.tracks.ptr_eq(&b.tracks)
         && a.tempo.ptr_eq(&b.tempo)
-        && a.track_order.ptr_eq(&b.track_order)
+        && (a.track_order.ptr_eq(&b.track_order) || a.track_order == b.track_order)
         && a.master_gain == b.master_gain
+}
+
+/// The state a plugin device was found in, read here and not yet in the document.
+struct Ahead {
+    track: TrackId,
+    /// What the read found.
+    hash: BlobHash,
+    /// What the document held when it was read.
+    before: Option<BlobHash>,
+    /// The session has taken the read: the next view it gives shows what it made of it.
+    handed_over: bool,
+}
+
+/// A plugin device's state in a project, if it is a plugin device there.
+fn state_in(project: &Project, track: TrackId, device: DeviceId) -> Option<Option<BlobHash>> {
+    project
+        .track(track)?
+        .content
+        .device(device)
+        .and_then(|d| match &d.kind {
+            DeviceKind::Plugin { state, .. } => Some(*state),
+            DeviceKind::Builtin { .. } => None,
+        })
 }
 
 /// The track a device is on.
@@ -402,6 +439,12 @@ impl Audio for TracktionAudio {
         self.given = Some(project.clone());
         let queue = {
             let mut shared = lock(&self.shared);
+            // The session has seen these reads and made its edits: from this view on, what the
+            // document shows is what counts, the old state included if it refused the edit.
+            shared.ahead.retain(|device, ahead| {
+                let now = state_in(project, ahead.track, *device);
+                !ahead.handed_over && now == Some(ahead.before)
+            });
             shared.view = Some(project.clone());
             !std::mem::replace(&mut shared.sync_queued, true)
         };
@@ -583,7 +626,8 @@ impl Audio for TracktionAudio {
             .is_none_or(|at| at.elapsed() >= PARAMS_FRESH);
         if stale {
             self.params_asked.insert(device, Instant::now());
-            self.send(Job::Params(device));
+            let asked_after = lock(&self.shared).sets_sent;
+            self.send(Job::Params(device, asked_after));
         }
         let shared = lock(&self.shared);
         let params = shared.params.get(&device)?;
@@ -602,11 +646,15 @@ impl Audio for TracktionAudio {
             };
             entry.value = value.clamp(entry.min, entry.max);
             let span = entry.max - entry.min;
-            if span > 0.0 {
+            let normalised = if span > 0.0 {
                 (entry.value - entry.min) / span
             } else {
                 0.0
-            }
+            };
+            shared.sets_sent += 1;
+            let number = shared.sets_sent;
+            shared.last_set.insert((device, param.to_string()), number);
+            normalised
         };
         self.send(Job::SetParam {
             device,
@@ -667,7 +715,18 @@ impl Audio for TracktionAudio {
             self.capture_due(true);
             self.wait_idle();
         }
-        let captured = std::mem::take(&mut lock(&self.shared).captured);
+        let captured = {
+            let mut shared = lock(&self.shared);
+            let captured = std::mem::take(&mut shared.captured);
+            for ((_, device), (hash, _)) in &captured {
+                if let Some(ahead) = shared.ahead.get_mut(device)
+                    && ahead.hash == *hash
+                {
+                    ahead.handed_over = true;
+                }
+            }
+            captured
+        };
         captured
             .into_iter()
             .filter(|((track, device), (hash, _))| {
@@ -751,9 +810,9 @@ impl Worker {
                     engine.device_set_param(raw_device(device), &param, value.clamp(0.0, 1.0)),
                 );
             }
-            Job::Params(device) => {
+            Job::Params(device, asked_after) => {
                 let params = engine.device_params(raw_device(device)).unwrap_or_default();
-                let list = params
+                let mut list: Vec<ParamEntry> = params
                     .into_iter()
                     .map(|p| ParamEntry {
                         id: p.id,
@@ -765,7 +824,22 @@ impl Worker {
                         text: p.text,
                     })
                     .collect();
-                lock(&self.shared).params.insert(device, list);
+                let mut shared = lock(&self.shared);
+                // A parameter set here after this reading was asked for may not have reached
+                // the plugin when it was taken: keep the value the set showed.
+                if let Some(shown) = shared.params.get(&device) {
+                    for entry in &mut list {
+                        let newer = shared
+                            .last_set
+                            .get(&(device, entry.id.clone()))
+                            .is_some_and(|number| *number > asked_after);
+                        if newer && let Some(old) = shown.iter().find(|p| p.id == entry.id) {
+                            entry.value = old.value;
+                            entry.text = old.text.clone();
+                        }
+                    }
+                }
+                shared.params.insert(device, list);
             }
             Job::Editor { device, show } => {
                 self.failed(
@@ -811,7 +885,21 @@ impl Worker {
         let view = {
             let mut shared = lock(&self.shared);
             shared.sync_queued = false;
-            shared.view.clone()
+            let ahead: Vec<(TrackId, DeviceId, BlobHash, Option<BlobHash>)> = shared
+                .ahead
+                .iter()
+                .map(|(device, a)| (a.track, *device, a.hash, a.before))
+                .collect();
+            shared.view.clone().map(|mut view| {
+                for (track, device, hash, before) in ahead {
+                    // Only while the document still shows the state from before the read; a
+                    // state that came from elsewhere since wins.
+                    if state_in(&view, track, device) == Some(before) {
+                        set_state(&mut view, track, device, hash);
+                    }
+                }
+                view
+            })
         };
         let Some(view) = view else { return };
         let engine = self.engine.clone();
@@ -1000,11 +1088,27 @@ impl Worker {
         let hash = mdaw_proto::blob_hash(&bytes);
         self.blobs.insert(hash, bytes.clone());
         // The engine holds this state now: the edit that brings it into the document changes
-        // nothing here when it comes back through the view.
+        // nothing here when it comes back through the view, and until then a view showing the
+        // old state does not take it back (see `Shared::ahead`).
+        let before = self
+            .synced
+            .as_ref()
+            .and_then(|p| state_in(p, track, device))
+            .flatten();
         if let Some(synced) = &mut self.synced {
             set_state(synced, track, device, hash);
         }
-        lock(&self.shared).captured.push(((track, device), (hash, bytes)));
+        let mut shared = lock(&self.shared);
+        shared.ahead.insert(
+            device,
+            Ahead {
+                track,
+                hash,
+                before,
+                handed_over: false,
+            },
+        );
+        shared.captured.push(((track, device), (hash, bytes)));
     }
 
     fn blob(&mut self, hash: BlobHash, bytes: Arc<[u8]>) {
