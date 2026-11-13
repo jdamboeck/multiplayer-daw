@@ -30,6 +30,13 @@ fn click(h: &mut App, pos: Pos2) {
     h.run_steps(2);
 }
 
+/// Opens a submenu of an open menu, the way a pointer does: by resting on its button.
+fn open_submenu(h: &mut App, label: &str) {
+    let at = h.get_by_label(label).rect().center();
+    h.hover_at(at);
+    h.run_steps(3);
+}
+
 fn double_click(h: &mut App, pos: Pos2) {
     h.hover_at(pos);
     h.step();
@@ -562,6 +569,17 @@ fn screenshots() {
         .expect("render")
         .save(format!("{dir}/device.png"))
         .expect("save");
+    h.state_mut()
+        .session
+        .enable_plugins(mdaw_plugin::Host::test_synth_only());
+    h.run_steps(3);
+    let add = h.get_by_label("Instrument…").rect().center();
+    click(&mut h, add);
+    open_submenu(&mut h, "CLAP (1)");
+    h.render()
+        .expect("render")
+        .save(format!("{dir}/instrument_menu.png"))
+        .expect("save");
 }
 
 #[test]
@@ -677,6 +695,7 @@ fn a_plugin_is_added_from_the_device_tab_and_its_settings_shown() {
     h.run_steps(2);
     let add = h.get_by_label("Instrument…").rect().center();
     click(&mut h, add);
+    open_submenu(&mut h, "CLAP (1)");
     let synth = h.get_by_label_contains("mdaw Test Synth").rect().center();
     click(&mut h, synth);
     h.run_steps(4);
@@ -716,6 +735,9 @@ fn a_plugin_is_added_from_the_device_tab_and_its_settings_shown() {
     for choice in ["mdaw Test Synth", "Pocket (built in)"] {
         let add = h.get_by_label("Instrument…").rect().center();
         click(&mut h, add);
+        if choice != "Pocket (built in)" {
+            open_submenu(&mut h, "CLAP (1)");
+        }
         let item = h.get_by_label_contains(choice).rect().center();
         click(&mut h, item);
         h.run_steps(4);

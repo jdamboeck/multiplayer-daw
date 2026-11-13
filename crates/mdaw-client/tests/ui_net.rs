@@ -497,6 +497,10 @@ fn a_plugin_added_in_the_device_tab_reaches_the_other_window() {
     press(&mut ann, add);
     ann.drop_at(add);
     ann.run_steps(2);
+    // Plugins are grouped by format; resting on the format opens its submenu.
+    let clap = ann.get_by_label("CLAP (1)").rect().center();
+    ann.hover_at(clap);
+    ann.run_steps(3);
     let synth = ann.get_by_label_contains("mdaw Test Synth").rect().center();
     press(&mut ann, synth);
     ann.drop_at(synth);

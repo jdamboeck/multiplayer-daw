@@ -172,19 +172,33 @@ fn add_plugin(app: &mut DawApp, ui: &mut Ui, track: TrackId) {
         ui.label(RichText::new("Scanning plugins…").color(theme::TEXT_DIM));
     }
     let catalog = app.session.plugin_catalog();
-    let label = |plugin: &PluginEntry| {
-        if plugin.vendor.is_empty() {
-            format!("{} ({})", plugin.name, plugin.format.name())
-        } else {
-            format!("{} - {} ({})", plugin.name, plugin.vendor, plugin.format.name())
-        }
-    };
-    let (instruments, effects): (Vec<_>, Vec<_>) = catalog.iter().partition(|p| p.instrument);
+    let instruments = by_format(&catalog, true);
+    let effects = by_format(&catalog, false);
     enum Pick {
         Pocket,
         Plugin(PluginEntry),
     }
     let mut pick = None;
+    // One submenu per format; the format is in its title, so the items leave it out.
+    let formats = |ui: &mut Ui, groups: &[(PluginFormat, Vec<&PluginEntry>)], pick: &mut Option<Pick>| {
+        for (format, plugins) in groups {
+            ui.menu_button(format!("{} ({})", format.name(), plugins.len()), |ui| {
+                egui::ScrollArea::vertical().max_height(400.0).show(ui, |ui| {
+                    for plugin in plugins {
+                        let label = if plugin.vendor.is_empty() {
+                            plugin.name.clone()
+                        } else {
+                            format!("{} - {}", plugin.name, plugin.vendor)
+                        };
+                        if ui.button(label).on_hover_text(&plugin.location).clicked() {
+                            *pick = Some(Pick::Plugin((*plugin).clone()));
+                            ui.close();
+                        }
+                    }
+                });
+            });
+        }
+    };
     ui.horizontal(|ui| {
         ui.menu_button("Instrument…", |ui| {
             ui.label(RichText::new("A track has one instrument; this one takes its place.").small());
@@ -192,22 +206,13 @@ fn add_plugin(app: &mut DawApp, ui: &mut Ui, track: TrackId) {
                 pick = Some(Pick::Pocket);
                 ui.close();
             }
-            for plugin in &instruments {
-                if ui.button(label(plugin)).on_hover_text(&plugin.location).clicked() {
-                    pick = Some(Pick::Plugin((*plugin).clone()));
-                    ui.close();
-                }
+            if !instruments.is_empty() {
+                ui.separator();
             }
+            formats(ui, &instruments, &mut pick);
         });
         if !effects.is_empty() {
-            ui.menu_button("Add effect…", |ui| {
-                for plugin in &effects {
-                    if ui.button(label(plugin)).on_hover_text(&plugin.location).clicked() {
-                        pick = Some(Pick::Plugin((*plugin).clone()));
-                        ui.close();
-                    }
-                }
-            });
+            ui.menu_button("Add effect…", |ui| formats(ui, &effects, &mut pick));
         }
     });
     match pick {
@@ -219,6 +224,28 @@ fn add_plugin(app: &mut DawApp, ui: &mut Ui, track: TrackId) {
         }
         None => {}
     }
+}
+
+/// The instruments (or effects) of the catalog by format, in the order VST3, LV2, CLAP, each
+/// sorted by name; a format without any is left out.
+fn by_format(catalog: &[PluginEntry], instruments: bool) -> Vec<(PluginFormat, Vec<&PluginEntry>)> {
+    [PluginFormat::Vst3, PluginFormat::Lv2, PluginFormat::Clap]
+        .into_iter()
+        .filter_map(|format| {
+            let mut plugins: Vec<_> = catalog
+                .iter()
+                .filter(|p| p.format == format && p.instrument == instruments)
+                .collect();
+            plugins.sort_by(|a, b| {
+                (a.name.to_lowercase(), a.vendor.to_lowercase(), &a.id).cmp(&(
+                    b.name.to_lowercase(),
+                    b.vendor.to_lowercase(),
+                    &b.id,
+                ))
+            });
+            (!plugins.is_empty()).then_some((format, plugins))
+        })
+        .collect()
 }
 
 fn pocket_panel(app: &mut DawApp, ui: &mut Ui, track: TrackId, device: &Device) {
@@ -441,4 +468,59 @@ fn knob(ui: &mut Ui, info: &ParamInfo, value: f32) -> (Response, Option<Change>)
         info.name
     );
     (response.on_hover_text(hint), change)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(format: PluginFormat, id: &str, name: &str, vendor: &str, instrument: bool) -> PluginEntry {
+        PluginEntry {
+            format,
+            id: id.into(),
+            name: name.into(),
+            vendor: vendor.into(),
+            instrument,
+            location: String::new(),
+        }
+    }
+
+    fn ids(groups: &[(PluginFormat, Vec<&PluginEntry>)]) -> Vec<(PluginFormat, Vec<String>)> {
+        groups
+            .iter()
+            .map(|(f, ps)| (*f, ps.iter().map(|p| p.id.clone()).collect()))
+            .collect()
+    }
+
+    #[test]
+    fn plugins_are_grouped_by_format_and_sorted_by_name() {
+        use PluginFormat::*;
+        let catalog = [
+            entry(Clap, "c1", "zeta", "", true),
+            entry(Lv2, "l1", "Beta", "", true),
+            entry(Vst3, "v1", "beta", "B", true),
+            entry(Vst3, "v2", "Alpha", "", true),
+            entry(Vst3, "v3", "Beta", "a", true),
+            entry(Vst3, "v5", "beta", "a", true),
+            entry(Clap, "c2", "Alpha", "", true),
+            entry(Lv2, "l2", "Reverb", "", false),
+            entry(Clap, "c3", "delay", "", false),
+            entry(Clap, "c4", "Chorus", "", false),
+        ];
+        assert_eq!(
+            ids(&by_format(&catalog, true)),
+            [
+                (Vst3, vec!["v2".into(), "v3".into(), "v5".into(), "v1".into()]),
+                (Lv2, vec!["l1".into()]),
+                (Clap, vec!["c2".into(), "c1".into()]),
+            ],
+            "VST3, LV2, CLAP; by name ignoring case, then vendor, then id"
+        );
+        assert_eq!(
+            ids(&by_format(&catalog, false)),
+            [(Lv2, vec!["l2".into()]), (Clap, vec!["c4".into(), "c3".into()]),],
+            "only effects, and VST3 has none so it is left out"
+        );
+        assert!(by_format(&[], true).is_empty());
+    }
 }
