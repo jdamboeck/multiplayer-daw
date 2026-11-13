@@ -71,7 +71,9 @@ transactions are to be kept durably on the client and resubmitted (phase 5).
   collaborative slice, not a maybe; the helper and its protocol stay in the tree until then.
 
 Item 1 is built and tested (`mdaw-plugin-scan`, with plugins that crash and hang on purpose).
-Items 2–4 are designed, not built. Item 5 is in the bridge.
+Item 4 is built and tested (2026-11-13: the client's outbox, `mdaw-client/src/outbox.rs`; see
+"What the client does" in `docs/protocol.md`). Items 2 and 3 are designed, not built. Item 5 is in
+the bridge.
 
 ## Consequences
 

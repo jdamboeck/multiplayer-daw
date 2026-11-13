@@ -104,6 +104,7 @@ fn kind_of(client: Option<&ClientMsg>, server: Option<&ServerMsg>) -> &'static s
         ServerMsg::Refused(_) => "refused",
         ServerMsg::Event(_) => "event",
         ServerMsg::Rejected { .. } => "rejected",
+        ServerMsg::Accepted { .. } => "accepted",
         ServerMsg::Peers(_) => "peers",
         ServerMsg::Presence { .. } => "presence",
     });

@@ -5,7 +5,7 @@
 //! [`Hello`]. Every further stream it opens carries one blob: a [`BlobRequest`] frame, answered
 //! with [`BlobAnswer`] frames and raw bytes.
 
-use crate::{Event, Txn};
+use crate::{Event, Txn, TxnId};
 use mdaw_model::{ActorId, BlobHash, EntityRef, Project, UserId};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -41,7 +41,9 @@ pub const MAX_BLOB: u64 = 256 << 20;
 pub enum ClientMsg {
     /// First message on the stream.
     Hello(Hello),
-    /// An edit. Every blob its ops name must have been uploaded before.
+    /// An edit. Every blob its ops name must have been uploaded before. Sending the same
+    /// transaction (the same [`Txn::id`]) again is safe: the server answers with what it
+    /// answered the first time and applies nothing.
     Submit(Txn),
     /// Relayed to the other clients, never stored. At most 10 per second.
     Presence(Presence),
@@ -86,7 +88,8 @@ pub struct Hello {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct Resume {
-    /// The actor of the connection being replaced.
+    /// The actor of the connection being replaced. The server drops that connection at once,
+    /// instead of when it times out, so it leaves the list of peers.
     pub prev_actor: ActorId,
     /// Proof that the previous connection was this client's.
     pub session_secret: u64,
@@ -102,11 +105,12 @@ pub enum ServerMsg {
     Refused(RefuseReason),
     /// The next entry of the log. The only way the document changes.
     Event(Event),
-    /// A submitted transaction was not sequenced. Nothing of it was applied.
-    Rejected {
-        client_txn_id: u64,
-        reason: RejectReason,
-    },
+    /// A submitted transaction was not sequenced. Nothing of it was applied, and nothing of it
+    /// ever will be: sent again, it is refused again with the same reason.
+    Rejected { txn: TxnId, reason: RejectReason },
+    /// To the sender alone: a transaction it sent again had been sequenced before, as event
+    /// `seq`. The event itself was sent to everyone at the time; it is not sent again.
+    Accepted { txn: TxnId, seq: u64 },
     /// Everyone connected, including the receiver. Sent whenever the set changes.
     Peers(Vec<Peer>),
     /// Another client's presence.
@@ -123,9 +127,6 @@ pub struct Welcome {
     /// The log position the client is at after applying `sync`.
     pub head_seq: u64,
     pub sync: SyncData,
-    /// When resuming: the highest `client_txn_id` of the previous actor the server has dealt
-    /// with. Pending transactions up to it must not be sent again.
-    pub acked: Option<u64>,
     pub peers: Vec<Peer>,
     /// With a snapshot: the latest events the history shows, oldest first. Their effect on the
     /// document is in the snapshot already.
@@ -277,7 +278,6 @@ mod tests {
             session_secret: 5,
             head_seq: 0,
             sync: SyncData::Snapshot(Project::default()),
-            acked: None,
             peers: vec![Peer {
                 actor: ActorId(1),
                 user: UserId(1),
@@ -287,6 +287,20 @@ mod tests {
         }));
         let frame = encode(&welcome).unwrap();
         assert_eq!(decode::<ServerMsg>(&frame[4..]).unwrap(), welcome);
+    }
+
+    #[test]
+    fn transaction_ids_are_random_and_travel_as_sixteen_bytes() {
+        let (a, b) = (TxnId::random(), TxnId::random());
+        assert_ne!(a, b);
+        assert_eq!(
+            TxnId::from(0xab_u128).to_string(),
+            format!("{}ab", "0".repeat(30))
+        );
+        let msg = ServerMsg::Accepted { txn: a, seq: 7 };
+        let frame = encode(&msg).unwrap();
+        assert_eq!(decode::<ServerMsg>(&frame[4..]).unwrap(), msg);
+        assert_eq!(postcard::to_stdvec(&a).unwrap().len(), 16);
     }
 
     #[test]

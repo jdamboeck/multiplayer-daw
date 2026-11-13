@@ -10,6 +10,6 @@ mod store;
 
 pub use blobs::Blobs;
 pub use hub::{Hub, Sink};
-pub use sequencer::Sequencer;
+pub use sequencer::{Prepared, Sequencer};
 pub use server::{Config, Server};
-pub use store::Store;
+pub use store::{Receipt, Store};

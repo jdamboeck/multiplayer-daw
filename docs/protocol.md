@@ -1,11 +1,14 @@
 # mdaw protocol
 
-What client and server say to each other, as built. Protocol version **6**. The types live in
+What client and server say to each other, as built. Protocol version **7**. The types live in
 `mdaw-proto` (`lib.rs` for transactions and events, `wire.rs` for messages) and in `mdaw-model`
 (ops); this text explains the rules around them. People share the project — tracks, clips,
 notes, devices, tempo — and nothing else: each client plays it back on its own, and nothing
 about playback travels.
 
+Version 7 gives every transaction a random identity the client keeps until it is confirmed, and
+the server a receipt per transaction, so a transaction sent again is never applied twice
+(`Accepted` is new, `Welcome.acked` is gone); events are on disk before anyone hears of them.
 Version 6 removed the shared transport and clock sync, live notes over the network, checkout
 and commit with changelog samples, and stems (all of version 5). Data directories written by an
 earlier server are not readable (see "Server storage").
@@ -45,7 +48,7 @@ before the token is looked at.
 The server answers with one of:
 
 ```
-Welcome { actor, user, session_secret, head_seq, sync, acked, peers, history }
+Welcome { actor, user, session_secret, head_seq, sync, peers, history }
 Refused(BadToken | ProtoVersion(server's) | Protocol)      // then the server closes
 ```
 
@@ -53,7 +56,8 @@ Refused(BadToken | ProtoVersion(server's) | Protocol)      // then the server cl
   `actor << 32 | counter`, so IDs never collide and need no coordination.
 - `sync` is `Snapshot(Project)` at `head_seq`, or on a resume `Events(...)` with everything after
   `last_seq`.
-- `session_secret` proves on the next connection that the previous one was this client's.
+- `session_secret` proves on the next connection that the previous one was this client's, so
+  the server can drop that one at once (see "Resuming").
 - `history`, with a snapshot only: the last 200 events that displaced someone's edit (see
   "Concurrent edits"), as many of the newest as fit in 16 MiB, so a new client can list them.
   Their effect is in the snapshot already; the client does not apply them.
@@ -61,58 +65,85 @@ Refused(BadToken | ProtoVersion(server's) | Protocol)      // then the server cl
 ### Resuming
 
 A client that lost its connection sends `resume` with the actor and secret of its last `Welcome`
-and the seq of the last event it received. If the secret fits and the log still reaches back that
-far (at most 5000 events, and at most 64 MiB of them), the server drops the old connection and
-answers with the missing events. Otherwise the answer carries a snapshot, as for a new client.
+and the seq of the last event it received. If the log still reaches back that far (at most 5000
+events, and at most 64 MiB of them), the server answers with the missing events; otherwise with a
+snapshot, as for a new client. If the secret fits, the server also drops the old connection at
+once, instead of when it times out, so it leaves the peers. A connection always gets a new actor;
+IDs the client mints from then on are minted under it.
 
-Events are written to disk without waiting for each to land, so a crash of the machine can take
-the last few with it, and after the restart other events take their seqs. A client of the run
-before the restart (its `prev_actor` was handed out then) that claims events past the head the
-server started with gets a snapshot. Actor IDs, the token and the session key are written
-durably, so none of them is ever handed out twice.
+Then the client sends **all** its pending transactions again, oldest first, each with its
+original identity, whether or not the old connection got them through. Receipts (below) make
+that safe in every case: one the server had sequenced is answered `Accepted`, one it had refused
+the same `Rejected`, and only the others are sequenced now. The same holds after a restart of the
+server, and after a restart of the client (see "What the client does").
 
-`acked` in the `Welcome` is the highest `client_txn_id` of the previous actor that the server has
-seen, sequenced or rejected. The client drops pending transactions up to that number that the
-catch-up did not confirm (they were rejected while it was away) and submits the rest again under
-its new actor. This works across a server restart too, because the log stores each event's actor
-and transaction number.
-
-Limits of this, accepted for the prototype:
-
-- When the resume is not accepted and the client receives a snapshot, it submits all pending
-  transactions again. One the old connection got through is then applied twice.
-- After a server restart the server no longer knows which transactions it rejected. They come in
-  again and are rejected again.
+An event is on disk before any client hears of it, so a crash of the server cannot take back an
+event a client has. Should it happen anyway (a disk that acknowledges writes it has not made, a
+data directory put back from a backup), a client of an earlier run of the server (its
+`prev_actor` was handed out then) that claims events past the head that run started with gets a
+snapshot rather than events written since under the same seqs. Actor IDs, the token and the
+session key are written durably too, so none of them is ever handed out twice.
 
 ## Edits
 
 ```
-Txn { client_txn_id, base_seq, ops: Vec<Op> }          // client to server, in Submit
-Event { seq, actor, user, wall_ts, client_txn_id, ops, superseded: Vec<Superseded> }
+Txn { id: TxnId, base_seq, ops: Vec<Op> }              // client to server, in Submit
+Event { seq, actor, user, wall_ts, txn: TxnId, ops, superseded: Vec<Superseded> }
                                                        // server to everyone
-Rejected { client_txn_id, reason }                     // server to the sender
+Rejected { txn: TxnId, reason }                        // server to the sender
+Accepted { txn: TxnId, seq }                           // server to the sender
 RejectReason = Invalid(why) | FutureBase | MissingBlob(hash)
 ```
 
 Every change to the project is a transaction, whoever makes it and whatever it touches; there
 are no locks and no other kind of edit. A transaction is one user gesture: applied whole or not
 at all, and one step of undo.
-`client_txn_id` counts up per client. `base_seq` is the last event the client had applied when it
-made the edit.
+`id` is 128 random bits, made by the client when it makes the transaction and never changed: it
+goes with the transaction however often it is sent, across reconnects and restarts of either
+side. `base_seq` is the last event the client had applied when it made the edit.
+
+### Receipts: each transaction once
+
+The server keeps a **receipt** for every transaction it has answered, under the authenticated
+user (from `user_key`, not the connection or actor) and the transaction's `id`: the seq of its
+event, or the reason it was refused. Two users may use the same `id`; their transactions are
+unrelated.
+
+When a transaction arrives whose receipt exists, the server applies nothing and sends nothing to
+anyone else: the sender gets `Accepted { txn, seq }` if it was sequenced (the sender may or may
+not have received the event; it is not sent again) or the same `Rejected { txn, reason }` as the
+first time. **A refused transaction stays refused**, even if the reason is gone (the blob it
+lacked has been uploaded since): a client that wants to try again makes a new transaction with a
+new `id`.
+
+Receipts are kept for ever for now, about 40 bytes each. Pruning them by age is a decision for
+later; a pruned receipt would let a transaction older than the cut be applied again.
+
+### What the server does with a transaction
 
 The server handles one transaction at a time:
 
+0. **Receipt.** If there is one, answer as above and stop.
 1. **Check.** Ops out of range (`Invalid`), an empty transaction (`Invalid`), a `base_seq` ahead
    of the log (`FutureBase`), and an op that names a blob the server does not hold
    (`MissingBlob`: a plugin's state in `DeviceAdd`, `DeviceSetState` or a `TrackAdd`) are
    rejected. So is a transaction that would take the project past its size limits
    (1000 tracks, 10 000 tempo points, 10 000 clips and 32 devices per track, 50 000 notes per
    clip, 4096 parameters per device), checked op by op against what is there. A rejected
-   transaction changes nothing; its sender alone gets `Rejected { client_txn_id, reason }`.
-2. **Apply** to the server's document. Applying is total: an op on something that no longer
-   exists, or an add of an ID that exists, does nothing, on every replica alike.
-3. **Find what it displaced** (below).
-4. **Append** the event to the log on disk, then send `Event` to every client, the sender included.
+   transaction changes nothing; its receipt is written, then its sender alone gets
+   `Rejected { txn, reason }`.
+2. **Decide** the event: its seq, its ops applied to a copy of the document (applying is total:
+   an op on something that no longer exists, or an add of an ID that exists, does nothing, on
+   every replica alike), and what it displaced (below). Nothing is changed yet.
+3. **Commit** the event and its receipt to disk in one SQLite transaction, waiting for the disk
+   (`synchronous=FULL`).
+4. Only then **apply** it to the server's document and **send** `Event` to every client, the
+   sender included.
+
+If the disk refuses the commit, nothing of the transaction is applied or sent, and the sender's
+connection is dropped; it sends the transaction again when it is back. So when a client has been
+told of an event, or of `Accepted`, the event is on disk: **acknowledged means durable**, power
+loss included.
 
 Events are the only way the document changes. Every client applies them in `seq` order, so all
 replicas hold the same document.
@@ -123,15 +154,38 @@ there is room, and QUIC's flow control slows the client down.
 
 ### What the client does
 
-The client keeps the document as of the last event (`confirmed`) and its own transactions the
-server has not answered yet (`pending`). What the user sees is `confirmed` with `pending` applied on
-top, so edits show at once. An event from the client's own actor confirms the oldest pending
-transaction; `Rejected` removes one, and the view falls back to what the server has.
+The client keeps the document as of the last event (`confirmed`) and its own transactions whose
+event it has not received (`pending`). What the user sees is `confirmed` with `pending` applied on
+top, so edits show at once. An event whose `txn` is a pending transaction's `id` confirms that
+transaction, wherever it is in the queue; `Rejected` removes one, and the view falls back to what
+the server has.
+
+`Accepted { txn, seq }` with a `seq` the client has already applied means the event is in
+`confirmed` already (it came inside a snapshot): the pending transaction is dropped. Until that
+answer arrives, such a transaction is applied on top of the snapshot a second time; ops are total
+and an add of something that exists does nothing, so the view stays a valid document for that
+moment. `Accepted` for a `seq` not yet reached marks the transaction; its event confirms it when
+it comes (or a later snapshot past it). `Accepted` or `Rejected` for something no longer pending
+is ignored. Every order in which these can arrive is listed on `Replica` in `mdaw-sync` and tested
+one by one.
 
 Transactions go out in the order they were made. One that names a blob this client is still
 uploading waits, and everything after it waits behind it, until the server has said `Stored`;
-so the server never sees an edit before its blobs. After a reconnect the pending transactions go
-again in the same way, behind the uploads that start over.
+so the server never sees an edit before its blobs. If the server refuses the upload (too large,
+or the bytes are not what the hash says), the transactions that name the blob are taken back with
+a notice, and those behind them go on. After a reconnect the pending transactions go again in the
+same way, behind the uploads that start over.
+
+**Pending edits are on disk.** The desktop client keeps an outbox per project, under its profile
+(`projects/<server fingerprint>/`): each transaction is appended to a file and handed to the
+operating system before it is sent, so a crash of the client never loses it; the file is forced
+to the disk within 250 ms, so a power cut may take the edits of that last moment. Blobs a pending
+transaction names are kept next to it until it is confirmed. Confirmed transactions are dropped
+from the file at most once a second, by writing it anew and renaming it over the old one. On the
+next start the client shows what the outbox holds at once, uploads its blobs again and sends the
+transactions again; the server answers those it had from their receipts. One it had refused is
+refused again and taken back again, with the notice once more. Without a server (the local mode)
+there is no outbox.
 
 ### Concurrent edits: last one wins, the other is kept
 
@@ -154,8 +208,9 @@ do not see entries from before they joined.
 ### Undo
 
 Each client keeps the inverses of its own transactions (500 steps). Undo submits the inverse as a
-normal transaction. An inverse that would set a property is left out when the property no longer
-holds what this client wrote, so undo never takes back someone else's later change.
+normal transaction, with an identity of its own. An inverse that would set a property is left out
+when the property no longer holds what this client wrote, so undo never takes back someone else's
+later change. Transactions taken back from the outbox after a restart are not steps of undo.
 
 ## Presence
 
@@ -263,21 +318,25 @@ transfers at a time; further streams wait.
 
 ## Server storage
 
-One SQLite database (`project.db`, WAL mode) in the data directory, next to the certificate
-(`cert.der`, `key.der`):
+One SQLite database (`project.db`, WAL mode, `synchronous=FULL`) in the data directory, next to
+the certificate (`cert.der`, `key.der`). Every write is a commit that is on disk when it returns.
+On a developer machine (ext4 on NVMe) a commit of an event and its receipt takes 0.23 ms at the
+median and 0.5 ms at p99, some 3400 a second (`mdaw-server/tests/commit_bench.rs`); so each
+transaction is committed by itself, without grouping several into one commit.
 
 | Table | Holds |
 |---|---|
-| `events(seq, actor, txn, data)` | The log. `txn` is the event's `client_txn_id`; `data` is the postcard `Event`. |
+| `events(seq, data)` | The log. `data` is the postcard `Event`. |
+| `receipts(user, txn, seq, reject)` | One per transaction answered, keyed by user and `TxnId`: `seq` of its event, or `reject`, the postcard `RejectReason`. Written in the same SQLite transaction as the event. |
 | `snapshots(seq, data)` | The document every 1000 events, to shorten loading. |
 | `users(id, key, name)` | `UserId` per install key. |
-| `meta(key, value)` | Format version, session token, the key session secrets are derived from, actor counter. |
+| `meta(key, value)` | Format version, session token, the key session secrets are derived from, actor counter, runs. |
 
 Blobs are files in `blobs/`, named by their hash in hex.
 
-The format entry is `<store version>/<protocol version>`, now `2/6`. A database with another
+The format entry is `<store version>/<protocol version>`, now `3/7`. A database with another
 format is not opened; the prototype has no migrations, so a breaking change means a new data
-directory. In particular, data directories of protocol 5 and earlier are not readable: move them
+directory. In particular, data directories of protocol 6 and earlier are not readable: move them
 away and start a new project.
 
 A client whose outgoing queue reaches 4096 messages is disconnected and resumes later.

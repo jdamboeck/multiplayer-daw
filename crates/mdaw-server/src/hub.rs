@@ -1,17 +1,19 @@
 //! One project and everyone connected to it. Runs on a single thread: whatever order commands
 //! arrive in is the order of the log.
+//!
+//! A transaction is decided, then written to disk, and only then applied and told to anyone
+//! (see [`Hub::submit`]): no client ever hears of an event the disk does not have.
 
 use crate::blobs::Blobs;
 use crate::sequencer::Sequencer;
-use crate::store::Run;
-use crate::store::Store;
+use crate::store::{Receipt, Run, Store};
 use anyhow::{Context, Result};
 use mdaw_model::{ActorId, DEFAULT_MILLI_BPM, IdGen, Op, Project, TempoPoint, Tick, UserId, apply};
 use mdaw_proto::{
     ClientMsg, Event, Hello, PROTO_VERSION, Peer, Presence, RefuseReason, ServerMsg, SyncData, Txn, Welcome,
     apply_event,
 };
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// A snapshot of the document is stored every this many events, so opening a project does not
@@ -39,8 +41,6 @@ struct Session {
     user: UserId,
     name: String,
     sink: Sink,
-    /// The highest transaction ID of this connection sequenced or rejected so far.
-    last_txn: Option<u64>,
 }
 
 pub struct Hub {
@@ -49,9 +49,9 @@ pub struct Hub {
     token: String,
     key: [u8; 32],
     sessions: BTreeMap<ActorId, Session>,
-    /// `last_txn` of connections that have ended, for when their clients resume.
-    departed: HashMap<ActorId, Option<u64>>,
     snapshot_seq: u64,
+    /// A client missing more events than this gets the whole document instead.
+    catch_up_limit: u64,
     /// Every start of the server, oldest first.
     runs: Vec<Run>,
     blobs: Blobs,
@@ -64,7 +64,7 @@ impl Hub {
             Some(token) => String::from_utf8(token).context("stored token")?,
             None => {
                 let token = hex(&random::<16>()?);
-                store.set_meta_durably("token", token.as_bytes())?;
+                store.set_meta("token", token.as_bytes())?;
                 token
             }
         };
@@ -72,7 +72,7 @@ impl Hub {
             Some(key) => key.as_slice().try_into().ok().context("stored session key")?,
             None => {
                 let key = random::<32>()?;
-                store.set_meta_durably("session_key", &key)?;
+                store.set_meta("session_key", &key)?;
                 key
             }
         };
@@ -102,11 +102,18 @@ impl Hub {
             token,
             key,
             sessions: BTreeMap::new(),
-            departed: HashMap::new(),
             snapshot_seq,
+            catch_up_limit: CATCH_UP_LIMIT,
             blobs,
             runs,
         })
+    }
+
+    /// Sends a client missing more than `limit` events the whole document instead. For tests
+    /// of the snapshot path, which otherwise takes thousands of events to reach.
+    pub fn with_catch_up_limit(mut self, limit: u64) -> Self {
+        self.catch_up_limit = limit;
+        self
     }
 
     /// The secret clients need to join.
@@ -149,22 +156,15 @@ impl Hub {
             r.session_secret == self.secret(r.prev_actor) && r.last_seq <= head && !lost
         });
         let mut history = Vec::new();
-        let (sync, acked) = match resume {
+        let sync = match resume {
             Some(resume) => {
-                // Whatever connection the client had before is replaced by this one.
+                // Whatever connection the client had before is replaced by this one, so it
+                // leaves the peers at once. What it sent and was not answered comes again on
+                // this one; receipts make that safe.
                 self.remove(resume.prev_actor);
-                let acked = match self.departed.get(&resume.prev_actor) {
-                    Some(last) => *last,
-                    // The server restarted in between. What it rejected back then is forgotten
-                    // and comes in again, to be rejected again.
-                    None => self
-                        .store
-                        .last_txn(resume.prev_actor)
-                        .expect("reading the event log"),
-                };
-                (self.catch_up(resume.last_seq), acked)
+                self.catch_up(resume.last_seq)
             }
-            None => (SyncData::Snapshot(self.seq.doc().clone()), None),
+            None => SyncData::Snapshot(self.seq.doc().clone()),
         };
         if matches!(sync, SyncData::Snapshot(_)) {
             history = self.seq.history(HISTORY);
@@ -189,7 +189,6 @@ impl Hub {
                 user,
                 name,
                 sink: Box::new(|_| true),
-                last_txn: None,
             },
         );
         let welcome = Welcome {
@@ -198,7 +197,6 @@ impl Hub {
             session_secret: self.secret(actor),
             head_seq: head,
             sync,
-            acked,
             peers: self.peers(),
             history,
         };
@@ -221,40 +219,78 @@ impl Hub {
         }
     }
 
-    /// Puts a sequenced event on disk and sends it to everyone.
-    fn record(&mut self, event: Event) {
-        // A log the disk refuses cannot be continued in memory: clients would hold events that
-        // are gone after a restart.
-        self.store.append(&event).expect("appending to the event log");
-        if event.seq - self.snapshot_seq >= SNAPSHOT_EVERY {
-            self.store
-                .put_snapshot(event.seq, self.seq.doc())
-                .expect("storing a snapshot");
-            self.snapshot_seq = event.seq;
-        }
-        self.broadcast(None, &ServerMsg::Event(event));
-    }
-
+    /// Takes a transaction from a client. Exactly one of these happens:
+    ///
+    /// - The sender's user sent this transaction before: the sender alone gets the answer it got
+    ///   then, `Accepted` with the event's seq or the same `Rejected`. Nothing else happens.
+    /// - It is refused: the refusal is stored as its receipt, then the sender gets `Rejected`.
+    /// - It is taken: its event and its receipt are committed to disk together. Only once the
+    ///   commit has returned is the event applied to the document in memory and sent to
+    ///   everyone, the sender included.
+    ///
+    /// If the disk refuses a write, nothing of the transaction is applied or sent, and the
+    /// sender's connection is dropped; it will send the transaction again when it is back.
     pub fn submit(&mut self, actor: ActorId, txn: Txn) {
-        let Some(session) = self.sessions.get_mut(&actor) else {
+        let Some(session) = self.sessions.get(&actor) else {
             return;
         };
-        let client_txn_id = txn.client_txn_id;
-        session.last_txn = session.last_txn.max(Some(client_txn_id));
-        let blobs = &self.blobs;
-        match self
-            .seq
-            .sequence(actor, session.user, now_millis(), txn, |h| blobs.has(h))
-        {
-            Ok(event) => self.record(event),
-            Err(reason) => {
-                if !(session.sink)(ServerMsg::Rejected {
-                    client_txn_id,
-                    reason,
-                }) {
-                    self.leave(actor);
+        let (user, id) = (session.user, txn.id);
+        let receipt = match self.store.receipt(user, id) {
+            Ok(receipt) => receipt,
+            Err(err) => return self.fail(actor, err),
+        };
+        let answer = match receipt {
+            Some(Receipt::Accepted(seq)) => ServerMsg::Accepted { txn: id, seq },
+            Some(Receipt::Rejected(reason)) => ServerMsg::Rejected { txn: id, reason },
+            None => {
+                let blobs = &self.blobs;
+                match self.seq.prepare(actor, user, now_millis(), txn, |h| blobs.has(h)) {
+                    Ok(prepared) => {
+                        // Decided; now on disk, event and receipt in one commit.
+                        if let Err(err) = self.store.append(user, prepared.event()) {
+                            // Dropping `prepared` leaves the document and the log in memory as
+                            // they are on disk.
+                            return self.fail(actor, err);
+                        }
+                        // On disk: from here on it may be applied and told.
+                        let event = self.seq.commit(prepared);
+                        self.snapshot_if_due();
+                        self.broadcast(None, &ServerMsg::Event(event));
+                        return;
+                    }
+                    Err(reason) => {
+                        if let Err(err) = self.store.reject(user, id, &reason) {
+                            return self.fail(actor, err);
+                        }
+                        ServerMsg::Rejected { txn: id, reason }
+                    }
                 }
             }
+        };
+        let session = self.sessions.get_mut(&actor).expect("looked up above");
+        if !(session.sink)(answer) {
+            self.leave(actor);
+        }
+    }
+
+    /// The disk refused a write for `actor`'s transaction. Nothing was applied or sent; the
+    /// client loses its connection, comes back, and sends what it has pending again.
+    fn fail(&mut self, actor: ActorId, err: anyhow::Error) {
+        eprintln!("mdaw-server: an edit could not be stored, dropping its sender ({actor:?}): {err:#}");
+        self.leave(actor);
+    }
+
+    /// Stores the document now and then, so opening the project does not replay the whole log.
+    /// A snapshot is only a shortcut: the events it sums up are on disk already, so one that
+    /// cannot be written is skipped.
+    fn snapshot_if_due(&mut self) {
+        let head = self.seq.head();
+        if head - self.snapshot_seq < SNAPSHOT_EVERY {
+            return;
+        }
+        match self.store.put_snapshot(head, self.seq.doc()) {
+            Ok(()) => self.snapshot_seq = head,
+            Err(err) => eprintln!("mdaw-server: could not store a snapshot at event {head}: {err:#}"),
         }
     }
 
@@ -283,25 +319,18 @@ impl Hub {
     }
 
     fn remove(&mut self, actor: ActorId) -> bool {
-        let Some(session) = self.sessions.remove(&actor) else {
-            return false;
-        };
-        if self.departed.len() >= 4096 {
-            self.departed.clear();
-        }
-        self.departed.insert(actor, session.last_txn);
-        true
+        self.sessions.remove(&actor).is_some()
     }
 
     fn catch_up(&self, last_seq: u64) -> SyncData {
-        if self.seq.head() - last_seq > CATCH_UP_LIMIT {
+        if self.seq.head() - last_seq > self.catch_up_limit {
             return SyncData::Snapshot(self.seq.doc().clone());
         }
         let events = match self.seq.events_after(last_seq) {
             Some(events) => events,
             None => self
                 .store
-                .events_after(last_seq, CATCH_UP_LIMIT)
+                .events_after(last_seq, self.catch_up_limit)
                 .expect("reading the event log"),
         };
         // Large edits make few events many bytes; past the budget a snapshot is smaller.

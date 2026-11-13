@@ -59,7 +59,7 @@ fn rejoin(hub: &mut Hub, key: u8, resume: Option<Resume>) -> (ActorId, Inbox, We
 
 fn rename(n: u64) -> Txn {
     Txn {
-        client_txn_id: n,
+        id: TxnId::from(u128::from(n)),
         base_seq: 0,
         ops: vec![Op::ProjectSetName {
             name: format!("take {n}"),
@@ -78,7 +78,7 @@ fn refused(n: u64) -> Txn {
         },
     );
     Txn {
-        client_txn_id: n,
+        id: TxnId::from(u128::from(n)),
         base_seq: 0,
         ops: vec![Op::DeviceAdd {
             track: TrackId(EntityId(1)),
@@ -131,7 +131,6 @@ fn a_welcome_carries_the_document_and_everyone_learns_who_is_there() {
     let (ann, ann_inbox, welcome) = join(&mut hub, 1);
     assert_eq!(welcome.head_seq, 0);
     assert_eq!(welcome.sync, SyncData::Snapshot(hub.doc().clone()));
-    assert_eq!(welcome.acked, None);
     assert_eq!(
         welcome.peers,
         [Peer {
@@ -172,7 +171,7 @@ fn events_go_to_everyone_and_rejections_to_the_sender() {
     let [ServerMsg::Event(event)] = &ann_inbox.drain()[..] else {
         panic!("expected one event")
     };
-    assert_eq!((event.seq, event.actor, event.client_txn_id), (1, ann, 1));
+    assert_eq!((event.seq, event.actor, event.txn), (1, ann, TxnId::from(1)));
     assert_eq!(ben_inbox.drain(), [ServerMsg::Event(event.clone())]);
     assert_eq!(hub.doc().name, "take 1");
 
@@ -180,7 +179,7 @@ fn events_go_to_everyone_and_rejections_to_the_sender() {
     assert_eq!(
         ann_inbox.drain(),
         [ServerMsg::Rejected {
-            client_txn_id: 2,
+            txn: TxnId::from(2),
             reason: RejectReason::MissingBlob(missing())
         }]
     );
@@ -222,7 +221,7 @@ fn a_resuming_client_gets_what_it_missed() {
         session_secret: ann_welcome.session_secret,
         last_seq: 1,
     };
-    let (ann2, _, welcome) = rejoin(&mut hub, 1, Some(resume));
+    let (ann2, ann2_inbox, welcome) = rejoin(&mut hub, 1, Some(resume));
     assert_ne!(ann2, ann);
     assert_eq!(welcome.user, ann_welcome.user);
     assert_eq!(welcome.head_seq, 3);
@@ -230,11 +229,25 @@ fn a_resuming_client_gets_what_it_missed() {
         panic!("expected events")
     };
     assert_eq!(events.iter().map(|e| e.seq).collect::<Vec<_>>(), [2, 3]);
+
+    // She sends both again, unchanged; each gets the answer it got the first time.
+    ann2_inbox.drain();
+    hub.submit(ann2, rename(2));
+    hub.submit(ann2, refused(3));
     assert_eq!(
-        welcome.acked,
-        Some(3),
-        "everything up to the refused edit has been dealt with"
+        ann2_inbox.drain(),
+        [
+            ServerMsg::Accepted {
+                txn: TxnId::from(2),
+                seq: 2
+            },
+            ServerMsg::Rejected {
+                txn: TxnId::from(3),
+                reason: RejectReason::MissingBlob(missing())
+            }
+        ]
     );
+    assert_eq!(hub.head(), 3);
 }
 
 #[test]
@@ -249,8 +262,7 @@ fn a_resume_replaces_the_connection_it_names() {
         session_secret: ann_welcome.session_secret,
         last_seq: 0,
     };
-    let (ann2, _, welcome) = rejoin(&mut hub, 1, Some(resume));
-    assert_eq!(welcome.acked, Some(1));
+    let (ann2, _, _) = rejoin(&mut hub, 1, Some(resume));
     assert_eq!(hub.peers().iter().map(|p| p.actor).collect::<Vec<_>>(), [ann2]);
 
     // Stragglers from the old connection are dropped; the client sends them again.
@@ -284,7 +296,6 @@ fn a_resume_that_does_not_check_out_is_a_fresh_join() {
     ] {
         let (_, _, welcome) = rejoin(&mut hub, 1, Some(resume));
         assert_eq!(welcome.sync, SyncData::Snapshot(hub.doc().clone()));
-        assert_eq!(welcome.acked, None);
     }
     assert!(
         hub.peers().iter().any(|p| p.actor == ann),
@@ -370,16 +381,15 @@ fn the_project_survives_a_restart() {
     assert_eq!(hub.doc(), &doc);
     assert_eq!(hub.token(), token);
 
-    // Sessions outlive the restart too. What the server refused before it has forgotten.
+    // Sessions outlive the restart too, and so does what the server answered.
     let resume = Resume {
         prev_actor: ann,
         session_secret: ann_welcome.session_secret,
         last_seq: 1000,
     };
-    let (ann2, _, welcome) = rejoin(&mut hub, 1, Some(resume));
+    let (ann2, ann2_inbox, welcome) = rejoin(&mut hub, 1, Some(resume));
     assert!(ann2.0 > ann.0, "actor IDs are never handed out twice");
     assert_eq!(welcome.user, ann_welcome.user);
-    assert_eq!(welcome.acked, Some(1005));
     let SyncData::Events(events) = welcome.sync else {
         panic!("expected events")
     };
@@ -387,6 +397,20 @@ fn the_project_survives_a_restart() {
         events.iter().map(|e| e.seq).collect::<Vec<_>>(),
         [1001, 1002, 1003, 1004, 1005]
     );
+    ann2_inbox.drain();
+    hub.submit(ann2, rename(1005));
+    hub.submit(ann2, refused(1006));
+    assert!(matches!(
+        &ann2_inbox.drain()[..],
+        [
+            ServerMsg::Accepted { seq: 1005, .. },
+            ServerMsg::Rejected {
+                reason: RejectReason::MissingBlob(_),
+                ..
+            }
+        ]
+    ));
+    assert_eq!(hub.head(), 1005);
 }
 
 #[test]

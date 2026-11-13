@@ -74,7 +74,7 @@ fn setup(store: Store) -> (Hub, Client, Client) {
         notes: Default::default(),
     };
     let txn = Txn {
-        client_txn_id: 1,
+        id: TxnId::random(),
         base_seq: 0,
         ops: vec![
             Op::TrackAdd {
@@ -139,7 +139,7 @@ fn a_plugin_and_its_state_arrive_by_ordinary_edits_once_the_state_is_uploaded() 
     let device = plugin(50, None);
     let id = device.id;
     let add = Txn {
-        client_txn_id: 2,
+        id: TxnId::from(2),
         base_seq: 1,
         ops: vec![Op::DeviceAdd {
             track: TRACK,
@@ -154,8 +154,8 @@ fn a_plugin_and_its_state_arrive_by_ordinary_edits_once_the_state_is_uploaded() 
     // A state the server does not have is turned down, for the sender alone.
     let bytes = b"the plugin's own settings".to_vec();
     let blob = blob_hash(&bytes);
-    let set = |client_txn_id| Txn {
-        client_txn_id,
+    let set = |n: u128| Txn {
+        id: TxnId::from(n),
         base_seq: 2,
         ops: vec![Op::DeviceSetState {
             track: TRACK,
@@ -167,7 +167,7 @@ fn a_plugin_and_its_state_arrive_by_ordinary_edits_once_the_state_is_uploaded() 
     assert_eq!(
         ann.inbox.drain(),
         [ServerMsg::Rejected {
-            client_txn_id: 3,
+            txn: TxnId::from(3),
             reason: RejectReason::MissingBlob(blob)
         }]
     );
@@ -175,7 +175,7 @@ fn a_plugin_and_its_state_arrive_by_ordinary_edits_once_the_state_is_uploaded() 
     assert_eq!(state_of(&hub, id), None);
     // So is a plugin added with such a state already.
     let with_state = Txn {
-        client_txn_id: 4,
+        id: TxnId::from(4),
         base_seq: 2,
         ops: vec![Op::DeviceAdd {
             track: TRACK,
@@ -187,7 +187,7 @@ fn a_plugin_and_its_state_arrive_by_ordinary_edits_once_the_state_is_uploaded() 
     assert_eq!(
         ben.inbox.drain(),
         [ServerMsg::Rejected {
-            client_txn_id: 4,
+            txn: TxnId::from(4),
             reason: RejectReason::MissingBlob(blob)
         }]
     );
@@ -204,7 +204,7 @@ fn a_plugin_and_its_state_arrive_by_ordinary_edits_once_the_state_is_uploaded() 
     hub.submit(
         ben.actor,
         Txn {
-            client_txn_id: 5,
+            id: TxnId::from(5),
             base_seq: 3,
             ..with_state
         },
@@ -214,7 +214,7 @@ fn a_plugin_and_its_state_arrive_by_ordinary_edits_once_the_state_is_uploaded() 
 
     // And the track with plugins takes ordinary edits from anyone.
     let notes = Txn {
-        client_txn_id: 6,
+        id: TxnId::from(6),
         base_seq: 4,
         ops: vec![note(1)],
     };
@@ -222,7 +222,7 @@ fn a_plugin_and_its_state_arrive_by_ordinary_edits_once_the_state_is_uploaded() 
     assert_eq!(ann.inbox.events().len(), 1);
     ben.inbox.drain();
     let bypass = Txn {
-        client_txn_id: 7,
+        id: TxnId::from(7),
         base_seq: 5,
         ops: vec![Op::DeviceSetBypass {
             track: TRACK,
@@ -245,8 +245,8 @@ fn displaced_edits_survive_a_restart_and_new_clients_see_them_in_the_history() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("project.db");
     let (mut hub, ann, ben) = setup(Store::open(&path).unwrap());
-    let rename = |client_txn_id, name: &str| Txn {
-        client_txn_id,
+    let rename = |n: u128, name: &str| Txn {
+        id: TxnId::from(n),
         base_seq: 1,
         ops: vec![Op::ClipSet {
             track: TRACK,
@@ -260,7 +260,7 @@ fn displaced_edits_survive_a_restart_and_new_clients_see_them_in_the_history() {
     hub.submit(
         ann.actor,
         Txn {
-            client_txn_id: 3,
+            id: TxnId::from(3),
             base_seq: 3,
             ops: vec![note(1)],
         },
@@ -344,8 +344,8 @@ fn a_clip_does_not_grow_past_its_limit_one_note_at_a_time() {
             vel: 100,
         },
     };
-    let txn = |id: u64, ops: Vec<Op>| Txn {
-        client_txn_id: id,
+    let txn = |id: u128, ops: Vec<Op>| Txn {
+        id: TxnId::from(id),
         base_seq: 1,
         ops,
     };
@@ -367,9 +367,9 @@ fn a_clip_does_not_grow_past_its_limit_one_note_at_a_time() {
         matches!(
             m,
             ServerMsg::Rejected {
-                client_txn_id: 4,
+                txn,
                 reason: RejectReason::Invalid(_)
-            }
+            } if txn == TxnId::from(4)
         )
     });
     assert!(refused);

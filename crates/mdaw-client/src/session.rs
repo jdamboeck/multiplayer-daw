@@ -5,6 +5,7 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -17,11 +18,12 @@ use mdaw_model::{
     TempoPoint, Tick, TickRange, TrackContent, TrackId, TrackShell, UserId, apply, apply_all,
 };
 use mdaw_net::JoinInfo;
-use mdaw_proto::{ClientMsg, Event, Peer, Presence, ServerMsg, Superseded, SyncData, Txn, Welcome};
+use mdaw_proto::{ClientMsg, Event, Peer, Presence, ServerMsg, Superseded, SyncData, Txn, TxnId, Welcome};
 use mdaw_sync::{Gesture, Loopback, Replica};
 
-use crate::link::{Link, LinkEvent, Waker, Who};
+use crate::link::{Link, LinkEvent, Upload, Waker, Who};
 use crate::live::Live;
+use crate::outbox::{self, Outbox};
 use crate::plugins::{self, Plugins, TrackSound};
 use crate::record::{Take, take_ops};
 use crate::theme;
@@ -90,6 +92,9 @@ pub struct Session {
     /// Transactions to send, in order, once none of the blobs they name is still uploading:
     /// the server refuses an edit that names a blob it does not have.
     outgoing: Vec<Txn>,
+    /// Pending transactions and the blobs they name, on disk. `None` when nothing is kept: the
+    /// local mode, or a session joined without a place for it.
+    outbox: Option<Outbox>,
     /// Blobs being downloaded.
     fetching: HashSet<BlobHash>,
     live: Live,
@@ -160,7 +165,32 @@ impl Session {
     /// Joins the project a server holds. Waits until the project has arrived.
     ///
     /// `waker` is called from another thread whenever [`Session::frame`] has something to do.
+    /// Edits not yet confirmed live only in memory: see [`Session::join_with_outbox`].
     pub fn join(join: JoinInfo, who: Who, engine: Engine, waker: Waker) -> Result<Self> {
+        Self::join_inner(join, who, None, engine, waker)
+    }
+
+    /// Joins like [`Session::join`], keeping edits the server has not confirmed in `outbox`, a
+    /// directory of this project's own ([`Outbox::dir_for`]). They are on disk before they are
+    /// sent; what an earlier run left there is shown at once, uploaded and sent again.
+    pub fn join_with_outbox(
+        join: JoinInfo,
+        who: Who,
+        outbox: &Path,
+        engine: Engine,
+        waker: Waker,
+    ) -> Result<Self> {
+        Self::join_inner(join, who, Some(outbox), engine, waker)
+    }
+
+    fn join_inner(
+        join: JoinInfo,
+        who: Who,
+        outbox: Option<&Path>,
+        engine: Engine,
+        waker: Waker,
+    ) -> Result<Self> {
+        let outbox = outbox.map(Outbox::open).transpose()?;
         let link = Link::connect(join, who, waker.clone())?;
         let deadline = Instant::now() + JOIN_TIMEOUT;
         let (epoch, welcome) = loop {
@@ -212,6 +242,21 @@ impl Session {
         );
         session.waker = Some(waker);
         session.absorb_history(history);
+        if let Some((outbox, saved)) = outbox {
+            session.outbox = Some(outbox);
+            // Edits of an earlier run: shown at once, and sent again behind their uploads. Those
+            // the server has already are answered from its receipts.
+            session.replica.restore_pending(saved.txns);
+            if let Backend::Remote(remote) = &session.backend {
+                for (hash, bytes) in &saved.blobs {
+                    remote.link.put(*hash, bytes.clone());
+                }
+            }
+            session.uploads = saved.blobs;
+            session.outgoing = session.replica.pending().cloned().collect();
+            session.flush_outgoing();
+            session.engine.set_project(session.replica.view());
+        }
         Ok(session)
     }
 
@@ -233,6 +278,7 @@ impl Session {
             waker: None,
             uploads: HashMap::new(),
             outgoing: Vec::new(),
+            outbox: None,
             fetching: HashSet::new(),
             live,
             recording: false,
@@ -321,6 +367,7 @@ impl Session {
     /// Call once per UI frame.
     pub fn frame(&mut self) {
         self.receive();
+        self.keep_outbox();
         self.share_presence();
         self.engine.set_project(self.replica.view());
         self.tempo = self.replica.view().tempo_map();
@@ -570,7 +617,8 @@ impl Session {
         }
     }
 
-    /// Uploads a blob made here, once, now or on the next connection.
+    /// Uploads a blob made here, once, now or on the next connection. It is kept on disk with
+    /// the outbox first, so an edit naming it can still be sent after a restart.
     fn put_blob(&mut self, hash: BlobHash, bytes: Arc<[u8]>) {
         let Backend::Remote(remote) = &self.backend else {
             return;
@@ -578,8 +626,61 @@ impl Session {
         if self.uploads.contains_key(&hash) {
             return;
         }
+        if let Some(outbox) = &self.outbox
+            && let Err(err) = outbox.put_blob(hash, &bytes)
+        {
+            notice(
+                &mut self.notices,
+                &format!("Plugin settings could not be saved on this computer: {err:#}."),
+            );
+        }
         self.uploads.insert(hash, bytes.clone());
         remote.link.put(hash, bytes);
+    }
+
+    /// Uploads `bytes` under `hash` without checking that they belong together, so the server
+    /// refuses the upload when they do not. For tests of what a refused upload does.
+    #[doc(hidden)]
+    pub fn put_blob_unchecked(&mut self, hash: BlobHash, bytes: Arc<[u8]>) {
+        self.put_blob(hash, bytes);
+    }
+
+    /// The server will not take a blob: the edits that name it can never be sent. They are
+    /// taken back, and the edits behind them no longer wait.
+    fn upload_refused(&mut self, hash: BlobHash) {
+        self.uploads.remove(&hash);
+        let names = |txn: &Txn| txn.ops.iter().any(|op| op.blobs().contains(&hash));
+        let doomed: Vec<TxnId> = self
+            .replica
+            .pending()
+            .filter(|txn| names(txn))
+            .map(|txn| txn.id)
+            .collect();
+        self.outgoing.retain(|txn| !names(txn));
+        for id in &doomed {
+            self.replica.on_rejected(*id);
+        }
+        if !doomed.is_empty() {
+            notice(
+                &mut self.notices,
+                "An edit was taken back: the server did not accept the data it needs.",
+            );
+        }
+        self.flush_outgoing();
+    }
+
+    /// Drops confirmed edits from the outbox now and then, and puts new ones on the disk.
+    fn keep_outbox(&mut self) {
+        let Some(outbox) = &mut self.outbox else {
+            return;
+        };
+        let pending: Vec<&Txn> = self.replica.pending().collect();
+        if let Err(err) = outbox.keep(&pending) {
+            notice(
+                &mut self.notices,
+                &format!("Unsent edits could not be saved on this computer: {err:#}."),
+            );
+        }
     }
 
     /// Live notes: what this player plays, heard at once.
@@ -792,10 +893,12 @@ impl Session {
             _ => None,
         };
         let others = self.others_next_frame_in();
-        match (plugins, others) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
+        // Edits written to the outbox go to the disk on a later frame.
+        let outbox = self
+            .outbox
+            .as_ref()
+            .and_then(|o| o.unsynced().then_some(outbox::SYNC_EVERY));
+        [plugins, others, outbox].into_iter().flatten().min()
     }
 
     fn others_next_frame_in(&self) -> Option<Duration> {
@@ -850,9 +953,19 @@ impl Session {
                     .on_event(&event)
                     .expect("the loopback delivers events in order");
             }
-            // While the connection is down the edit waits in the replica; it is sent with
-            // everything else pending once the server welcomes us back.
+            // On disk first, then on its way. While the connection is down the edit waits in
+            // the replica; it is sent with everything else pending once the server welcomes us
+            // back.
             Backend::Remote(remote) => {
+                if let Some(outbox) = &mut self.outbox
+                    && let Err(err) = outbox.append(&txn)
+                {
+                    // Sent all the same: on the server it is safe, and it is still shown here.
+                    notice(
+                        &mut self.notices,
+                        &format!("An edit could not be saved on this computer: {err:#}."),
+                    );
+                }
                 if remote.status == Status::Online {
                     self.outgoing.push(txn);
                     self.flush_outgoing();
@@ -879,7 +992,6 @@ impl Session {
                         user,
                         head_seq,
                         sync,
-                        acked,
                         peers,
                         history,
                         ..
@@ -892,7 +1004,7 @@ impl Session {
                     remote.set_peers(peers);
                     remote.presence_sent = Presence::default();
                     self.user = user;
-                    match self.replica.resync(actor, head_seq, sync, acked) {
+                    match self.replica.resync(actor, head_seq, sync) {
                         Ok(resend) => {
                             remote.status = Status::Online;
                             let reloaded = std::mem::take(&mut remote.desynced);
@@ -912,7 +1024,7 @@ impl Session {
                                 }
                                 None => self.absorb_history(history),
                             }
-                            // Everything pending goes again, renumbered, behind its blobs.
+                            // Everything pending goes again, as it was, behind its blobs.
                             self.outgoing = resend;
                             self.flush_outgoing();
                         }
@@ -924,13 +1036,15 @@ impl Session {
                     Ok(()) => record_displaced(&mut self.displaced, event),
                     Err(_) => remote.lose_track(),
                 },
-                LinkEvent::Stored { hash, ok } => {
-                    if ok {
+                LinkEvent::Stored { hash, outcome } => match outcome {
+                    Upload::Stored => {
                         self.uploads.remove(&hash);
                         self.flush_outgoing();
                     }
-                    // Otherwise it goes again with the next connection.
-                }
+                    Upload::Refused => self.upload_refused(hash),
+                    // It goes again with the next connection.
+                    Upload::Failed => {}
+                },
                 LinkEvent::Fetched { hash, bytes } => {
                     self.fetching.remove(&hash);
                     let mut plugins = self.plugins.0.borrow_mut();
@@ -940,15 +1054,15 @@ impl Session {
                         None => plugins.give_up(&hash),
                     }
                 }
-                LinkEvent::Msg(ServerMsg::Rejected {
-                    client_txn_id,
-                    reason,
-                }) => {
-                    self.replica.on_rejected(client_txn_id);
-                    notice(&mut self.notices, &format!("An edit was not accepted: {reason}."));
+                LinkEvent::Msg(ServerMsg::Rejected { txn, reason }) => {
+                    // Refused again after a restart of this client, it was taken back before.
+                    if self.replica.on_rejected(txn) {
+                        notice(&mut self.notices, &format!("An edit was not accepted: {reason}."));
+                    }
                 }
+                LinkEvent::Msg(ServerMsg::Accepted { txn, seq }) => self.replica.on_accepted(txn, seq),
                 LinkEvent::TooLarge(ClientMsg::Submit(txn)) => {
-                    self.replica.on_rejected(txn.client_txn_id);
+                    self.replica.on_rejected(txn.id);
                     notice(
                         &mut self.notices,
                         "An edit was too large to send and has been taken back.",

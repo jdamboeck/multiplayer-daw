@@ -29,7 +29,7 @@ impl Loopback {
             actor,
             user: self.user,
             wall_ts,
-            client_txn_id: txn.client_txn_id,
+            txn: txn.id,
             ops: txn.ops,
             superseded: Vec::new(),
         }

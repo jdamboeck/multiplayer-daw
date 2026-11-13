@@ -39,8 +39,8 @@ pub enum LinkEvent {
     Down(String),
     /// The server turned this client away. No further attempt follows.
     Refused(RefuseReason),
-    /// The answer to [`Link::put`]: whether the server holds the blob now.
-    Stored { hash: BlobHash, ok: bool },
+    /// The answer to [`Link::put`].
+    Stored { hash: BlobHash, outcome: Upload },
     /// The answer to [`Link::get`]: the blob, or `None` if the server lacks it or the
     /// download failed.
     Fetched {
@@ -49,6 +49,18 @@ pub enum LinkEvent {
     },
     /// A message too large for the server to accept; it was not sent.
     TooLarge(ClientMsg),
+}
+
+/// How an upload ended.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Upload {
+    /// The server holds the blob now.
+    Stored,
+    /// The server turned it down (too large, or the bytes are not what the hash says). Trying
+    /// again would not change that.
+    Refused,
+    /// The connection failed on the way. It goes again with the next one.
+    Failed,
 }
 
 enum Out {
@@ -306,8 +318,12 @@ impl Task {
                     Some(Out::Put(hash, bytes)) => {
                         let (connection, events, waker) = (connection.clone(), events.clone(), waker.clone());
                         tokio::spawn(async move {
-                            let ok = matches!(mdaw_net::put_blob(&connection, hash, &bytes).await, Ok(true));
-                            let _ = events.send(LinkEvent::Stored { hash, ok });
+                            let outcome = match mdaw_net::put_blob(&connection, hash, &bytes).await {
+                                Ok(true) => Upload::Stored,
+                                Ok(false) => Upload::Refused,
+                                Err(_) => Upload::Failed,
+                            };
+                            let _ = events.send(LinkEvent::Stored { hash, outcome });
                             waker();
                         });
                     }

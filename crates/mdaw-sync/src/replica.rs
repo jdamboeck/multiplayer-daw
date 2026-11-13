@@ -1,5 +1,5 @@
 use mdaw_model::{ActorId, IdGen, Op, Project, PropKey, apply, apply_all};
-use mdaw_proto::{Event, SyncData, Txn, apply_event};
+use mdaw_proto::{Event, SyncData, Txn, TxnId, apply_event};
 use std::collections::VecDeque;
 use std::fmt;
 
@@ -41,18 +41,48 @@ struct UndoEntry {
     gesture: Option<Gesture>,
 }
 
+/// One of this client's transactions the server has not confirmed yet.
+#[derive(Clone, Debug)]
+struct Pending {
+    txn: Txn,
+    /// The server said it sequenced this transaction as this event, which has not reached the
+    /// replica yet.
+    accepted: Option<u64>,
+}
+
 /// One client's copy of the project.
 ///
 /// `confirmed` is the document as of the last event received. `pending` are this client's own
-/// transactions the server has not sequenced yet. What the user sees and hears is `view`:
+/// transactions whose event has not been received. What the user sees and hears is `view`:
 /// confirmed with pending applied on top.
+///
+/// A pending transaction leaves `pending` in exactly one of these ways, whatever order the
+/// messages about it arrive in:
+///
+/// 1. Its event arrives ([`Replica::on_event`], or among the events of
+///    [`Replica::resync`]): matched by [`TxnId`], wherever it is in the queue. The event is in
+///    `confirmed` now, so the transaction must not stay on top of it.
+/// 2. `Accepted { txn, seq }` arrives ([`Replica::on_accepted`]) with `seq` at or before the
+///    replica's position: the event is in `confirmed` already (it came inside a snapshot), so the
+///    entry goes. That is the only way an entry can be in `confirmed` without its event having
+///    been fed one by one.
+/// 3. `Accepted` arrives with a `seq` the replica has not reached: the event is still on its way.
+///    The entry stays, marked, and goes with case 1 when the event comes; or, should a snapshot
+///    at or past `seq` come first, with the [`Replica::resync`] that takes it in.
+/// 4. `Rejected` arrives ([`Replica::on_rejected`]): the entry goes, and the view falls back.
+///
+/// `Accepted` after the event (the server answers a transaction sent twice), `Accepted` or
+/// `Rejected` for a transaction no longer pending, and an event of this client's after
+/// `Accepted` find nothing to do. Between a snapshot and the `Accepted` that follows it, a
+/// transaction already in the snapshot is applied once more on top for the view; ops are total
+/// and an add of something that exists does nothing, so the view stays a valid document, and it
+/// returns to the server's as soon as the `Accepted` arrives.
 pub struct Replica {
     ids: IdGen,
     confirmed: Project,
     seq: u64,
-    pending: VecDeque<Txn>,
+    pending: VecDeque<Pending>,
     view: Project,
-    next_txn: u64,
     undo: Vec<UndoEntry>,
     redo: Vec<UndoEntry>,
 }
@@ -66,7 +96,6 @@ impl Replica {
             confirmed: project,
             seq,
             pending: VecDeque::new(),
-            next_txn: 1,
             undo: Vec::new(),
             redo: Vec::new(),
         }
@@ -96,9 +125,24 @@ impl Replica {
         self.seq
     }
 
-    /// Own transactions not yet sequenced, oldest first.
+    /// Own transactions not yet confirmed, oldest first.
     pub fn pending(&self) -> impl ExactSizeIterator<Item = &Txn> {
-        self.pending.iter()
+        self.pending.iter().map(|p| &p.txn)
+    }
+
+    /// Takes in transactions made before, by an earlier run of this client, that the server may
+    /// not have: they go on top of the view and are pending like any made now. They are not
+    /// steps of undo.
+    pub fn restore_pending(&mut self, txns: impl IntoIterator<Item = Txn>) {
+        let before = self.pending.len();
+        for txn in txns {
+            if !self.pending.iter().any(|p| p.txn.id == txn.id) {
+                self.pending.push_back(Pending { txn, accepted: None });
+            }
+        }
+        if self.pending.len() != before {
+            self.rebuild();
+        }
     }
 
     pub fn can_undo(&self) -> bool {
@@ -149,15 +193,18 @@ impl Replica {
         Some(txn)
     }
 
-    /// Wraps ops already applied to the view into a pending transaction.
+    /// Wraps ops already applied to the view into a pending transaction, under an identity of
+    /// its own that it keeps for good.
     fn enqueue(&mut self, ops: Vec<Op>) -> Txn {
         let txn = Txn {
-            client_txn_id: self.next_txn,
+            id: TxnId::random(),
             base_seq: self.seq,
             ops,
         };
-        self.next_txn += 1;
-        self.pending.push_back(txn.clone());
+        self.pending.push_back(Pending {
+            txn: txn.clone(),
+            accepted: None,
+        });
         txn
     }
 
@@ -223,44 +270,60 @@ impl Replica {
         self.seq = event.seq;
         apply_event(&mut self.confirmed, event);
 
-        // The server sequences one client's transactions in the order they were sent.
-        let own = event.actor == self.actor()
-            && self
-                .pending
-                .front()
-                .is_some_and(|txn| event.client_txn_id == txn.client_txn_id);
-        if own {
-            // The view already contains this edit and everything pending after it.
-            self.pending.pop_front();
-            if self.pending.is_empty() {
-                debug_assert!(self.confirmed == self.view, "view diverged from the server");
-                // Equal in content; share the view's allocations so the next foreign event
-                // does not make every track look changed.
-                self.confirmed = self.view.clone();
+        match self.pending.iter().position(|p| p.txn.id == event.txn) {
+            // The oldest pending transaction: the view already contains this edit and everything
+            // pending after it, in this order.
+            Some(0) => {
+                self.pending.pop_front();
+                if self.pending.is_empty() {
+                    debug_assert!(self.confirmed == self.view, "view diverged from the server");
+                    // Equal in content; share the view's allocations so the next foreign event
+                    // does not make every track look changed.
+                    self.confirmed = self.view.clone();
+                }
             }
-        } else {
-            self.rebuild();
+            // Older ones still wait for their answer (they were sent again after a reconnect,
+            // or wait for an upload): the view is built anew without this one.
+            Some(at) => {
+                self.pending.remove(at);
+                self.rebuild();
+            }
+            None => self.rebuild(),
         }
         Ok(())
     }
 
+    /// The server says it sequenced `txn` as event `seq` before: the answer to a transaction
+    /// sent again.
+    pub fn on_accepted(&mut self, txn: TxnId, seq: u64) {
+        let Some(at) = self.pending.iter().position(|p| p.txn.id == txn) else {
+            // Confirmed by its event already.
+            return;
+        };
+        if seq <= self.seq {
+            // The event came inside a snapshot: its effect is in `confirmed` already.
+            self.pending.remove(at);
+            self.rebuild();
+        } else {
+            // The event is on its way; it confirms the transaction when it arrives.
+            self.pending[at].accepted = Some(seq);
+        }
+    }
+
     /// Continues on a new connection, after the server's `Welcome`.
     ///
-    /// `sync` brings the confirmed document to `head_seq`. `acked` is the last of this replica's
-    /// transactions the server dealt with on the previous connection; those leave the pending
-    /// queue. Returns what is still pending, to be sent again under the new `actor`.
+    /// `sync` brings the confirmed document to `head_seq`. Returns every transaction still
+    /// pending, oldest first, to be sent again with their identities: the server answers those it
+    /// has seen before with their original outcome.
     ///
     /// On an error nothing has changed, and the way out is to join afresh.
-    pub fn resync(
-        &mut self,
-        actor: ActorId,
-        head_seq: u64,
-        sync: SyncData,
-        acked: Option<u64>,
-    ) -> Result<Vec<Txn>, SyncError> {
+    pub fn resync(&mut self, actor: ActorId, head_seq: u64, sync: SyncData) -> Result<Vec<Txn>, SyncError> {
         match sync {
             SyncData::Snapshot(project) => {
                 self.confirmed = project;
+                // Accepted before, and in the snapshot now.
+                self.pending
+                    .retain(|p| p.accepted.is_none_or(|seq| seq > head_seq));
             }
             SyncData::Events(events) => {
                 // Checked before anything changes, so a refused resync leaves the replica whole.
@@ -282,34 +345,35 @@ impl Replica {
                 }
                 for event in &events {
                     apply_event(&mut self.confirmed, event);
+                    self.pending.retain(|p| p.txn.id != event.txn);
                 }
             }
         }
         self.seq = head_seq;
-        if let Some(acked) = acked {
-            self.pending.retain(|txn| txn.client_txn_id > acked);
-        }
         // IDs minted from here on must not collide with the old connection's.
         if actor != self.ids.actor() {
             self.ids = IdGen::new(actor);
         }
         self.rebuild();
-        Ok(self.pending.iter().cloned().collect())
+        Ok(self.pending().cloned().collect())
     }
 
-    /// The server refused a transaction: forget it and everything it did locally.
-    pub fn on_rejected(&mut self, client_txn_id: u64) {
+    /// The server refused a transaction, or it cannot be sent: forget it and everything it did
+    /// locally. False if it was not pending.
+    pub fn on_rejected(&mut self, txn: TxnId) -> bool {
         let before = self.pending.len();
-        self.pending.retain(|txn| txn.client_txn_id != client_txn_id);
-        if self.pending.len() != before {
+        self.pending.retain(|p| p.txn.id != txn);
+        let found = self.pending.len() != before;
+        if found {
             self.rebuild();
         }
+        found
     }
 
     fn rebuild(&mut self) {
         let mut view = self.confirmed.clone();
-        for txn in &self.pending {
-            apply_all(&mut view, &txn.ops);
+        for pending in &self.pending {
+            apply_all(&mut view, &pending.txn.ops);
         }
         self.view = view;
     }

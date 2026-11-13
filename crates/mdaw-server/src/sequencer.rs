@@ -8,6 +8,21 @@ use std::collections::VecDeque;
 /// this gets fewer `Superseded` records, nothing else.
 const TAIL: usize = 4096;
 
+/// A transaction the sequencer has decided to take, as the next event, but has not applied yet:
+/// the hub puts it on disk first, and then hands it to [`Sequencer::commit`]. Dropped instead,
+/// it leaves no trace.
+pub struct Prepared {
+    event: Event,
+    /// The document with the event applied.
+    doc: Project,
+}
+
+impl Prepared {
+    pub fn event(&self) -> &Event {
+        &self.event
+    }
+}
+
 /// The server's copy of the document and the end of its log.
 pub struct Sequencer {
     doc: Project,
@@ -74,6 +89,20 @@ impl Sequencer {
         txn: Txn,
         has_blob: impl Fn(&BlobHash) -> bool,
     ) -> Result<Event, RejectReason> {
+        let prepared = self.prepare(actor, user, wall_ts, txn, has_blob)?;
+        Ok(self.commit(prepared))
+    }
+
+    /// Decides whether `txn` goes into the log and makes its event, without changing anything.
+    /// Nothing else may happen to the sequencer before the result is committed or dropped.
+    pub fn prepare(
+        &self,
+        actor: ActorId,
+        user: UserId,
+        wall_ts: u64,
+        txn: Txn,
+        has_blob: impl Fn(&BlobHash) -> bool,
+    ) -> Result<Prepared, RejectReason> {
         self.check(&txn, has_blob)?;
         let seq = self.head + 1;
         let mut superseded = self.overwritten(user, &txn);
@@ -94,17 +123,27 @@ impl Sequencer {
                 });
             }
         }
-        self.doc = doc;
         let event = Event {
             seq,
             actor,
             user,
             wall_ts,
-            client_txn_id: txn.client_txn_id,
+            txn: txn.id,
             ops: txn.ops,
             superseded,
         };
-        Ok(self.push(event))
+        Ok(Prepared { event, doc })
+    }
+
+    /// Applies a prepared event: it is the head of the log from now on.
+    pub fn commit(&mut self, prepared: Prepared) -> Event {
+        assert_eq!(
+            prepared.event.seq,
+            self.head + 1,
+            "an event prepared on another state of the log"
+        );
+        self.doc = prepared.doc;
+        self.push(prepared.event)
     }
 
     /// The latest events the history shows, oldest first.

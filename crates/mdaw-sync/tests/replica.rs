@@ -1,5 +1,5 @@
 use mdaw_model::*;
-use mdaw_proto::{Event, SyncData, Txn};
+use mdaw_proto::{Event, SyncData, Txn, TxnId};
 use mdaw_sync::{Gesture, Loopback, Replica, SyncError};
 use proptest::prelude::*;
 use std::collections::VecDeque;
@@ -124,7 +124,7 @@ impl Server {
             actor,
             user: UserId(actor.0),
             wall_ts: 0,
-            client_txn_id: txn.client_txn_id,
+            txn: txn.id,
             ops: txn.ops,
             superseded: vec![],
         };
@@ -176,7 +176,7 @@ fn an_edit_shows_at_once_and_is_confirmed_later() {
     let mut server = Server::new();
     let mut replica = Replica::new(ActorId(1), base(), 0);
     let txn = replica.submit(vec![add(0, 60)]).unwrap();
-    assert_eq!((txn.client_txn_id, txn.base_seq), (1, 0));
+    assert_eq!(txn.base_seq, 0);
     assert_eq!(note_pitch(replica.view(), 0), Some(60));
     assert_eq!(note_pitch(replica.confirmed(), 0), None);
     assert_eq!(replica.pending().len(), 1);
@@ -239,7 +239,8 @@ fn a_rejected_edit_disappears() {
     let mut replica = Replica::new(ActorId(1), base(), 0);
     let first = replica.submit(vec![add(0, 60)]).unwrap();
     let second = replica.submit(vec![add(1, 62)]).unwrap();
-    replica.on_rejected(first.client_txn_id);
+    assert!(replica.on_rejected(first.id));
+    assert!(!replica.on_rejected(first.id), "only once");
     assert_eq!(note_pitch(replica.view(), 0), None);
     assert_eq!(note_pitch(replica.view(), 1), Some(62));
     replica.on_event(&server.sequence(ActorId(1), second)).unwrap();
@@ -281,16 +282,14 @@ fn a_reconnect_continues_with_the_events_missed() {
         server.sequence(
             ActorId(2),
             Txn {
-                client_txn_id: 1,
+                id: TxnId::random(),
                 base_seq: 0,
                 ops: vec![add(5, 70)],
             },
         ),
         server.sequence(ActorId(1), second),
     ];
-    let resend = replica
-        .resync(ActorId(3), 3, SyncData::Events(missed), Some(2))
-        .unwrap();
+    let resend = replica.resync(ActorId(3), 3, SyncData::Events(missed)).unwrap();
     assert_eq!(resend, std::slice::from_ref(&third));
     assert_eq!(replica.actor(), ActorId(3));
     assert_eq!(replica.seq(), 3);
@@ -303,7 +302,9 @@ fn a_reconnect_continues_with_the_events_missed() {
     assert_eq!(note_pitch(replica.view(), 5), Some(70));
 
     // The rest is confirmed under the new actor.
-    replica.on_event(&server.sequence(ActorId(3), third)).unwrap();
+    replica
+        .on_event(&server.sequence(ActorId(3), third.clone()))
+        .unwrap();
     assert_eq!(replica.pending().len(), 0);
     assert_eq!(replica.view(), &server.doc);
 
@@ -311,7 +312,10 @@ fn a_reconnect_continues_with_the_events_missed() {
     assert_eq!(replica.ids().note().0.actor(), ActorId(3));
     // Undo still reaches back across the reconnect.
     let undone = replica.undo().unwrap();
-    assert_eq!(undone.client_txn_id, 4);
+    assert_ne!(
+        undone.id, third.id,
+        "every transaction has an identity of its own"
+    );
     assert_eq!(note_pitch(replica.view(), 1), Some(62));
 }
 
@@ -323,7 +327,7 @@ fn a_reconnect_can_replace_the_document() {
     let mut current = base();
     apply(&mut current, &add(5, 70)).unwrap();
     let resend = replica
-        .resync(ActorId(2), 40, SyncData::Snapshot(current.clone()), None)
+        .resync(ActorId(2), 40, SyncData::Snapshot(current.clone()))
         .unwrap();
     assert_eq!(resend, [kept]);
     assert_eq!(replica.seq(), 40);
@@ -339,7 +343,7 @@ fn a_reconnect_with_a_hole_in_the_events_is_an_error() {
     let mut server = Server::new();
     let mut replica = Replica::new(ActorId(1), base(), 0);
     let txn = |n| Txn {
-        client_txn_id: n,
+        id: TxnId::from(u128::from(n)),
         base_seq: 0,
         ops: vec![add(n, 60)],
     };
@@ -347,17 +351,162 @@ fn a_reconnect_with_a_hole_in_the_events_is_an_error() {
 
     let skipped = SyncData::Events(events[1..].to_vec());
     assert_eq!(
-        replica.resync(ActorId(3), 3, skipped, None).err(),
+        replica.resync(ActorId(3), 3, skipped).err(),
         Some(SyncError::Gap { expected: 1, got: 2 })
     );
     let short = SyncData::Events(events[..2].to_vec());
-    assert!(replica.resync(ActorId(3), 3, short, None).is_err());
+    assert!(replica.resync(ActorId(3), 3, short).is_err());
     assert_eq!(
         (replica.seq(), replica.actor()),
         (0, ActorId(1)),
         "a refused resync changes nothing"
     );
     assert_eq!(replica.confirmed(), &base());
+}
+
+// ---- Accepted and Event, in every order they can arrive ----
+//
+// A transaction of this replica can be confirmed by its event, by `Accepted` (the server's
+// answer to it being sent again), or both. Each test below is one order; together they are the
+// orderings enumerated on `Replica`. Each makes the same edit (Ann adds note 0) and has Ben remove
+// it afterwards, so an edit that stayed pending too long, or was applied twice, would show as a
+// note that should be gone.
+
+fn ann_adds_ben_removes() -> (Server, Replica, Txn, Event, Event) {
+    let mut server = Server::new();
+    let mut ann = Replica::new(ActorId(1), base(), 0);
+    let added = ann.submit(vec![add(0, 60)]).unwrap();
+    let add_event = server.sequence(ActorId(1), added.clone());
+    let remove = Txn {
+        id: TxnId::random(),
+        base_seq: 1,
+        ops: vec![Op::NoteRemove {
+            track: TRACK(),
+            clip: CLIP(),
+            id: note_id(0),
+        }],
+    };
+    let remove_event = server.sequence(ActorId(2), remove);
+    (server, ann, added, add_event, remove_event)
+}
+
+/// The view is always what was confirmed with the pending edits on top.
+fn consistent(replica: &Replica) {
+    let mut expected = replica.confirmed().clone();
+    for txn in replica.pending() {
+        apply_all(&mut expected, &txn.ops);
+    }
+    assert_eq!(replica.view(), &expected);
+}
+
+#[test]
+fn accepted_after_the_event_changes_nothing() {
+    let (server, mut ann, added, add_event, remove_event) = ann_adds_ben_removes();
+    ann.on_event(&add_event).unwrap();
+    ann.on_event(&remove_event).unwrap();
+    // The transaction was sent twice; the answer to the second comes last.
+    ann.on_accepted(added.id, 1);
+    assert_eq!(ann.pending().len(), 0);
+    assert_eq!(ann.view(), &server.doc);
+    assert_eq!(note_pitch(ann.view(), 0), None);
+}
+
+#[test]
+fn accepted_before_its_event_waits_for_the_event() {
+    let (server, mut ann, added, add_event, remove_event) = ann_adds_ben_removes();
+    ann.on_accepted(added.id, 1);
+    assert_eq!(ann.pending().len(), 1, "the event has not come yet");
+    assert_eq!(note_pitch(ann.view(), 0), Some(60), "still shown");
+    consistent(&ann);
+    ann.on_event(&add_event).unwrap();
+    assert_eq!(ann.pending().len(), 0);
+    ann.on_event(&remove_event).unwrap();
+    assert_eq!(ann.view(), &server.doc);
+}
+
+#[test]
+fn accepted_after_a_snapshot_that_holds_the_edit_drops_it() {
+    let (server, mut ann, added, _, _) = ann_adds_ben_removes();
+    // The acknowledgement was lost; the reconnect brings the whole document, edit and removal.
+    let resend = ann
+        .resync(ActorId(3), 2, SyncData::Snapshot(server.doc.clone()))
+        .unwrap();
+    assert_eq!(resend, std::slice::from_ref(&added), "sent again, same identity");
+    // Until the answer comes, the edit is applied once more on top: a valid document.
+    assert_eq!(note_pitch(ann.view(), 0), Some(60));
+    consistent(&ann);
+    ann.on_accepted(added.id, 1);
+    assert_eq!(ann.pending().len(), 0);
+    assert_eq!(ann.view(), &server.doc, "the note Ben removed stays removed");
+    assert_eq!(ann.confirmed(), &server.doc);
+}
+
+#[test]
+fn a_snapshot_past_an_accepted_edit_confirms_it() {
+    let (server, mut ann, added, _, _) = ann_adds_ben_removes();
+    ann.on_accepted(added.id, 1);
+    // The connection breaks before the event arrives; the next one brings a snapshot.
+    let resend = ann
+        .resync(ActorId(3), 2, SyncData::Snapshot(server.doc.clone()))
+        .unwrap();
+    assert!(resend.is_empty(), "known to be in the snapshot");
+    assert_eq!(ann.view(), &server.doc);
+}
+
+#[test]
+fn a_catch_up_that_holds_the_edit_confirms_it() {
+    let (server, mut ann, added, add_event, remove_event) = ann_adds_ben_removes();
+    let later = ann.submit(vec![cutoff(700.0)]).unwrap();
+    let resend = ann
+        .resync(ActorId(3), 2, SyncData::Events(vec![add_event, remove_event]))
+        .unwrap();
+    assert_eq!(resend, [later], "only what the catch-up did not confirm");
+    assert!(ann.pending().all(|t| t.id != added.id));
+    assert_eq!(note_pitch(ann.view(), 0), None);
+    assert_eq!(ann.confirmed(), &server.doc);
+    consistent(&ann);
+}
+
+#[test]
+fn an_answer_for_something_not_pending_is_ignored() {
+    let (server, mut ann, added, add_event, remove_event) = ann_adds_ben_removes();
+    ann.on_event(&add_event).unwrap();
+    ann.on_event(&remove_event).unwrap();
+    ann.on_accepted(TxnId::random(), 1);
+    ann.on_accepted(added.id, 2);
+    assert!(!ann.on_rejected(added.id));
+    assert_eq!(ann.view(), &server.doc);
+}
+
+#[test]
+fn a_later_edit_confirmed_before_an_earlier_one_leaves_the_earlier_on_top() {
+    let mut server = Server::new();
+    let mut ann = Replica::new(ActorId(1), base(), 0);
+    let first = ann.submit(vec![add(0, 60)]).unwrap();
+    let second = ann.submit(vec![add(1, 62)]).unwrap();
+    // The first waits (for an upload, say) while the second goes through.
+    ann.on_event(&server.sequence(ActorId(1), second)).unwrap();
+    assert_eq!(ann.pending().map(|t| t.id).collect::<Vec<_>>(), [first.id]);
+    assert_eq!(note_pitch(ann.view(), 0), Some(60));
+    consistent(&ann);
+    ann.on_event(&server.sequence(ActorId(1), first)).unwrap();
+    assert_eq!(ann.view(), &server.doc);
+}
+
+#[test]
+fn edits_of_an_earlier_run_come_back_as_pending() {
+    let mut server = Server::new();
+    let mut before = Replica::new(ActorId(1), base(), 0);
+    let kept = before.submit(vec![add(0, 60)]).unwrap();
+    // A new process, a new connection: the outbox brings the transaction back.
+    let mut after = Replica::new(ActorId(4), base(), 0);
+    after.restore_pending([kept.clone(), kept.clone()]);
+    assert_eq!(after.pending().len(), 1, "once, however often it was saved");
+    assert_eq!(note_pitch(after.view(), 0), Some(60));
+    assert!(!after.can_undo(), "not a step of this run's undo");
+    after.on_event(&server.sequence(ActorId(4), kept)).unwrap();
+    assert_eq!(after.pending().len(), 0);
+    assert_eq!(after.view(), &server.doc);
 }
 
 #[test]
@@ -606,7 +755,7 @@ proptest! {
                             replicas[w].on_event(event).unwrap();
                         }
                         delivered[w] = server.log.len();
-                        replicas[w].on_rejected(txn.client_txn_id);
+                        replicas[w].on_rejected(txn.id);
                     }
                 }
             }

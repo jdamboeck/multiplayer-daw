@@ -36,6 +36,26 @@ fn join(server: &Server, name: &str) -> Session {
     Session::join(server.join_info().clone(), who(name), engine, Arc::new(|| {})).unwrap()
 }
 
+/// A client that keeps its unconfirmed edits in an outbox under `profile`, as the app does.
+fn join_kept(server: &Server, name: &str, profile: &Path) -> Session {
+    let engine = Engine::manual(48_000, false);
+    let outbox = mdaw_client::outbox::Outbox::dir_for(profile, server.join_info());
+    Session::join_with_outbox(
+        server.join_info().clone(),
+        who(name),
+        &outbox,
+        engine,
+        Arc::new(|| {}),
+    )
+    .unwrap()
+}
+
+/// The transactions in a client's outbox on disk.
+fn outbox_len(server: &Server, profile: &Path) -> usize {
+    let dir = mdaw_client::outbox::Outbox::dir_for(profile, server.join_info());
+    mdaw_client::outbox::Outbox::open(&dir).unwrap().1.txns.len()
+}
+
 /// Runs frames on all sessions until `done`, as their windows would.
 fn until(sessions: &mut [&mut Session], what: &str, done: impl Fn(&[&mut Session]) -> bool) {
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -667,4 +687,122 @@ fn an_edit_past_the_limits_is_refused_at_once() {
     // An op out of range is refused with a word too, where a debug build used to stop.
     let prop = ShellProp::Name("x".repeat(200));
     assert!(!ann.edit(vec![Op::TrackSetShell { id: track, prop }]));
+}
+
+#[test]
+fn edits_made_offline_survive_a_crash_of_the_client() {
+    let dir = tempfile::tempdir().unwrap();
+    let profile = tempfile::tempdir().unwrap();
+    let server = serve(dir.path(), "127.0.0.1:0");
+    let addr: SocketAddr = server.local_addr().unwrap();
+    let (mut ann, mut ben) = (join_kept(&server, "ann", profile.path()), join(&server, "ben"));
+    let at = add_track(&mut ann, "Lead");
+    settle(&mut [&mut ann, &mut ben]);
+    let before = ann.seq();
+
+    server.stop();
+    until(&mut [&mut ann, &mut ben], "both notice the server is gone", |s| {
+        s.iter().all(|s| s.status() == Status::Reconnecting)
+    });
+    assert!(set_pitch(&mut ann, at, 67));
+    let offline = add_track(&mut ann, "Made offline");
+    assert_eq!(ann.unconfirmed(), 2);
+    // The client dies. Nothing is written on the way out: a session has no exit handler that
+    // saves anything, so dropping it leaves the disk as a crash would.
+    drop(ann);
+
+    let server = serve(dir.path(), &addr.to_string());
+    let mut ann = join_kept(&server, "ann", profile.path());
+    assert_eq!(ann.unconfirmed(), 2, "the edits are back");
+    assert_eq!(pitch(ann.project(), at), Some(67), "and shown at once");
+    assert_eq!(pitch(ann.project(), offline), Some(60));
+    settle(&mut [&mut ann, &mut ben]);
+    assert_eq!(pitch(ben.project(), at), Some(67));
+    assert_eq!(pitch(ben.project(), offline), Some(60));
+    assert_eq!(ben.seq(), before + 2, "each arrived exactly once");
+    until(&mut [&mut ann], "the outbox is emptied", |_| {
+        outbox_len(&server, profile.path()) == 0
+    });
+}
+
+#[test]
+fn an_edit_the_server_took_before_the_client_died_is_not_made_twice() {
+    let dir = tempfile::tempdir().unwrap();
+    let profile = tempfile::tempdir().unwrap();
+    let server = serve(dir.path(), "127.0.0.1:0");
+    let (mut ann, mut ben) = (join_kept(&server, "ann", profile.path()), join(&server, "ben"));
+    let at = add_track(&mut ann, "Lead");
+    settle(&mut [&mut ann, &mut ben]);
+    let before = ben.seq();
+
+    // Ann's edit reaches the server and Ben; Ann dies before she reads the event.
+    assert!(set_pitch(&mut ann, at, 72));
+    until(&mut [&mut ben], "ben has ann's edit", |s| {
+        pitch(s[0].project(), at) == Some(72)
+    });
+    assert_eq!(ann.unconfirmed(), 1);
+    drop(ann);
+    // Ben changes it again meanwhile: made twice, Ann's edit would undo his.
+    assert!(set_pitch(&mut ben, at, 50));
+    settle(&mut [&mut ben]);
+
+    let mut ann = join_kept(&server, "ann", profile.path());
+    assert_eq!(
+        ann.unconfirmed(),
+        1,
+        "still in the outbox, and in the snapshot as well"
+    );
+    settle(&mut [&mut ann, &mut ben]);
+    assert_eq!(pitch(ann.project(), at), Some(50));
+    assert_eq!(pitch(ben.project(), at), Some(50));
+    assert_eq!(ann.seq(), before + 2, "the server answered from its receipt");
+    assert!(ann.notices().is_empty(), "{:?}", ann.notices());
+    until(&mut [&mut ann], "the outbox is emptied", |_| {
+        outbox_len(&server, profile.path()) == 0
+    });
+}
+
+#[test]
+fn an_upload_the_server_refuses_takes_back_its_edit_and_blocks_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let profile = tempfile::tempdir().unwrap();
+    let server = serve(dir.path(), "127.0.0.1:0");
+    let (mut ann, mut ben) = (join_kept(&server, "ann", profile.path()), join(&server, "ben"));
+    let at = add_track(&mut ann, "Lead");
+    settle(&mut [&mut ann, &mut ben]);
+
+    // Settings whose bytes are not what their hash says: the server turns the upload down.
+    let state = mdaw_proto::blob_hash(b"the settings the edit names");
+    ann.put_blob_unchecked(state, Arc::from(&b"other bytes"[..]));
+    let device = Device::new(
+        ann.ids().device(),
+        DeviceKind::Plugin {
+            format: PluginFormat::Clap,
+            id: "org.example.synth".into(),
+            state: Some(state),
+        },
+    );
+    assert!(ann.edit(vec![Op::DeviceAdd {
+        track: at.0,
+        device,
+        after: None,
+    }]));
+    // An edit behind it, which used to wait for the upload for ever.
+    assert!(set_pitch(&mut ann, at, 70));
+
+    settle(&mut [&mut ann, &mut ben]);
+    assert_eq!(pitch(ben.project(), at), Some(70));
+    assert!(ben.project().track(at.0).unwrap().content.devices.is_empty());
+    assert!(
+        ann.project().track(at.0).unwrap().content.devices.is_empty(),
+        "taken back"
+    );
+    assert!(
+        ann.notices().iter().any(|n| n.contains("taken back")),
+        "{:?}",
+        ann.notices()
+    );
+    until(&mut [&mut ann], "the outbox is emptied", |_| {
+        outbox_len(&server, profile.path()) == 0
+    });
 }

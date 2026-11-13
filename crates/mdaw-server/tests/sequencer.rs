@@ -1,7 +1,7 @@
 //! What the server lets into the log, and what it records as displaced.
 
 use mdaw_model::*;
-use mdaw_proto::{RejectReason, Superseded, Txn, blob_hash};
+use mdaw_proto::{RejectReason, Superseded, Txn, TxnId, blob_hash};
 use mdaw_server::Sequencer;
 
 const TRACK: TrackId = TrackId(EntityId(1));
@@ -94,7 +94,7 @@ fn has_blob(blob: &BlobHash) -> bool {
 
 fn txn(id: u64, base_seq: u64, ops: Vec<Op>) -> Txn {
     Txn {
-        client_txn_id: id,
+        id: TxnId::from(u128::from(id)),
         base_seq,
         ops,
     }
@@ -118,7 +118,7 @@ fn events_get_consecutive_numbers_and_carry_the_transaction() {
         (event.seq, event.actor, event.user, event.wall_ts),
         (8, ANN.0, ANN.1, 42)
     );
-    assert_eq!(event.client_txn_id, 5);
+    assert_eq!(event.txn, TxnId::from(5));
     assert_eq!(event.ops, [pitch(62)]);
     assert_eq!(seq.head(), 8);
     assert_eq!(note(&seq).pitch, 62);

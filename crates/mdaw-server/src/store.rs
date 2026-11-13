@@ -1,8 +1,15 @@
-//! The project on disk: the event log, snapshots of the document, and server identity.
+//! The project on disk: the event log, the receipts of transactions, snapshots of the document,
+//! and server identity.
+//!
+//! Every write is a commit with `synchronous=FULL` in WAL mode: when a write returns, it is on
+//! disk, power loss or not. Measured on a developer machine (ext4 on NVMe) a commit of one event
+//! and its receipt takes about 0.25 ms at the median and 0.5 ms at p99, some 3400 a second
+//! (`tests/commit_bench.rs`), which is far more than people editing together produce; so each
+//! transaction is committed on its own, without grouping.
 
 use anyhow::{Context, Result, bail};
 use mdaw_model::{ActorId, Project, UserId};
-use mdaw_proto::{Event, PROTO_VERSION};
+use mdaw_proto::{Event, PROTO_VERSION, RejectReason, TxnId};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 
@@ -13,7 +20,15 @@ fn int(n: u64) -> i64 {
 }
 
 /// Bumped when the tables change.
-const STORE_VERSION: u32 = 2;
+const STORE_VERSION: u32 = 3;
+
+/// What the server answered a transaction with, kept for when it arrives again.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Receipt {
+    /// Sequenced as the event with this number.
+    Accepted(u64),
+    Rejected(RejectReason),
+}
 
 pub struct Store {
     db: Connection,
@@ -23,7 +38,9 @@ impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         let db = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
         db.pragma_update(None, "journal_mode", "WAL")?;
-        db.pragma_update(None, "synchronous", "NORMAL")?;
+        // Every commit is on disk before it returns: events are acknowledged and broadcast only
+        // after theirs.
+        db.pragma_update(None, "synchronous", "FULL")?;
         Self::init(db).with_context(|| format!("in {}", path.display()))
     }
 
@@ -35,12 +52,13 @@ impl Store {
     fn init(db: Connection) -> Result<Self> {
         db.execute_batch(
             "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value BLOB NOT NULL);
-             CREATE TABLE IF NOT EXISTS events (
-                 seq INTEGER PRIMARY KEY,
-                 actor INTEGER NOT NULL,
-                 txn INTEGER NOT NULL,
-                 data BLOB NOT NULL);
-             CREATE INDEX IF NOT EXISTS events_by_actor ON events (actor, txn);
+             CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY, data BLOB NOT NULL);
+             CREATE TABLE IF NOT EXISTS receipts (
+                 user INTEGER NOT NULL,
+                 txn BLOB NOT NULL,
+                 seq INTEGER,
+                 reject BLOB,
+                 PRIMARY KEY (user, txn));
              CREATE TABLE IF NOT EXISTS snapshots (seq INTEGER PRIMARY KEY, data BLOB NOT NULL);
              CREATE TABLE IF NOT EXISTS users (
                  id INTEGER PRIMARY KEY,
@@ -69,13 +87,11 @@ impl Store {
             .optional()?)
     }
 
-    /// Like [`Store::set_meta`], but on disk before it returns, power loss or not. Events are
-    /// written with less care for speed: the last few may be gone after a crash of the machine.
-    pub fn set_meta_durably(&self, key: &str, value: &[u8]) -> Result<()> {
-        self.db.pragma_update(None, "synchronous", "FULL")?;
-        let result = self.set_meta(key, value);
-        self.db.pragma_update(None, "synchronous", "NORMAL")?;
-        result
+    /// The `synchronous` setting of the connection every write goes through: 2 is `FULL`.
+    pub fn synchronous(&self) -> Result<i64> {
+        Ok(self
+            .db
+            .pragma_query_value(None, "synchronous", |row| row.get(0))?)
     }
 
     pub fn set_meta(&self, key: &str, value: &[u8]) -> Result<()> {
@@ -94,16 +110,47 @@ impl Store {
         Ok(head as u64)
     }
 
-    pub fn append(&self, event: &Event) -> Result<()> {
+    /// What the server answered `user`'s transaction `txn` with, if it has seen it.
+    pub fn receipt(&self, user: UserId, txn: TxnId) -> Result<Option<Receipt>> {
+        let row: Option<(Option<i64>, Option<Vec<u8>>)> = self
+            .db
+            .prepare_cached("SELECT seq, reject FROM receipts WHERE user = ?1 AND txn = ?2")?
+            .query_row(params![user.0, txn.0.as_slice()], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .optional()?;
+        Ok(match row {
+            None => None,
+            Some((Some(seq), _)) => Some(Receipt::Accepted(seq as u64)),
+            Some((None, Some(reject))) => Some(Receipt::Rejected(
+                postcard::from_bytes(&reject).context("decoding a stored refusal")?,
+            )),
+            Some((None, None)) => bail!("a receipt without an outcome"),
+        })
+    }
+
+    /// Appends `event`, the transaction `event.txn` of `user`, to the log together with its
+    /// receipt, in one SQLite transaction: both are on disk when this returns, or neither is.
+    pub fn append(&self, user: UserId, event: &Event) -> Result<()> {
         let data = postcard::to_stdvec(event)?;
-        self.db
-            .prepare_cached("INSERT INTO events (seq, actor, txn, data) VALUES (?1, ?2, ?3, ?4)")?
-            .execute(params![
-                int(event.seq),
-                event.actor.0,
-                int(event.client_txn_id),
-                data
-            ])?;
+        // Rolled back when dropped uncommitted, on any error below.
+        let tx = self.db.unchecked_transaction()?;
+        tx.prepare_cached("INSERT INTO events (seq, data) VALUES (?1, ?2)")?
+            .execute(params![int(event.seq), data])?;
+        tx.prepare_cached("INSERT INTO receipts (user, txn, seq) VALUES (?1, ?2, ?3)")?
+            .execute(params![user.0, event.txn.0.as_slice(), int(event.seq)])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Records that `user`'s transaction `txn` was refused, so that it is refused again for the
+    /// same reason should it come again.
+    pub fn reject(&self, user: UserId, txn: TxnId, reason: &RejectReason) -> Result<()> {
+        let reject = postcard::to_stdvec(reason)?;
+        let tx = self.db.unchecked_transaction()?;
+        tx.prepare_cached("INSERT INTO receipts (user, txn, reject) VALUES (?1, ?2, ?3)")?
+            .execute(params![user.0, txn.0.as_slice(), reject])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -120,25 +167,16 @@ impl Store {
         Ok(events)
     }
 
-    /// The highest transaction ID of `actor` that made it into the log.
-    pub fn last_txn(&self, actor: ActorId) -> Result<Option<u64>> {
-        let last: Option<i64> =
-            self.db
-                .query_row("SELECT max(txn) FROM events WHERE actor = ?1", [actor.0], |row| {
-                    row.get(0)
-                })?;
-        Ok(last.map(|txn| txn as u64))
-    }
-
     pub fn put_snapshot(&self, seq: u64, project: &Project) -> Result<()> {
         let data = postcard::to_stdvec(project)?;
-        self.db.execute(
+        let tx = self.db.unchecked_transaction()?;
+        tx.execute(
             "INSERT OR REPLACE INTO snapshots (seq, data) VALUES (?1, ?2)",
             params![int(seq), data],
         )?;
         // The log is the history; of the snapshots only the newest is ever read.
-        self.db
-            .execute("DELETE FROM snapshots WHERE seq < ?1", [int(seq)])?;
+        tx.execute("DELETE FROM snapshots WHERE seq < ?1", [int(seq)])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -178,7 +216,7 @@ impl Store {
     /// under it.
     pub fn next_actor(&self) -> Result<ActorId> {
         let next = self.last_actor()?.0.checked_add(1).context("out of actor IDs")?;
-        self.set_meta_durably("last_actor", &next.to_le_bytes())?;
+        self.set_meta("last_actor", &next.to_le_bytes())?;
         Ok(ActorId(next))
     }
 
@@ -193,7 +231,7 @@ impl Store {
             last_actor: self.last_actor()?,
             head,
         });
-        self.set_meta_durably("runs", &postcard::to_stdvec(&runs)?)?;
+        self.set_meta("runs", &postcard::to_stdvec(&runs)?)?;
         Ok(runs)
     }
 
@@ -211,7 +249,10 @@ impl Store {
 pub struct Run {
     /// Actors up to this one were handed out before the run.
     pub last_actor: ActorId,
-    /// The head of the log when the run began. Events after it that clients of earlier runs
-    /// received may have been lost in a crash, and others written under their seqs.
+    /// The head of the log when the run began. Since events are written with
+    /// `synchronous=FULL` before anyone hears of them, a client of an earlier run cannot have
+    /// received events past it that the disk lost; but a disk that acknowledges writes it has not
+    /// made, or a data directory put back from a backup, can still lose them, and this keeps such
+    /// a client from taking the events written since under those seqs for its own.
     pub head: u64,
 }

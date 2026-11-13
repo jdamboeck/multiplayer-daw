@@ -7,6 +7,7 @@
 mod app;
 mod link;
 pub mod live;
+pub mod outbox;
 pub mod plugins;
 pub mod profile;
 mod record;
@@ -15,5 +16,5 @@ mod theme;
 pub mod ui;
 
 pub use app::{DawApp, Focus, Selection, Tab};
-pub use link::{Waker, Who};
+pub use link::{Upload, Waker, Who};
 pub use session::{Displaced, Session, Status};

@@ -5,6 +5,7 @@ mod wire;
 
 use mdaw_model::{ActorId, BlobHash, EntityRef, Op, Project, PropKey, UserId, apply};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 pub use wire::{
     ALPN, BlobAnswer, BlobRequest, ClientMsg, FrameError, Framed, Hello, MAX_BLOB, MAX_FRAME,
@@ -13,19 +14,60 @@ pub use wire::{
 };
 
 /// Bumped on every incompatible change to the wire format or to the meaning of an op.
-pub const PROTO_VERSION: u32 = 6;
+pub const PROTO_VERSION: u32 = 7;
 
 /// The hash a blob of these bytes is stored and named under.
 pub fn blob_hash(bytes: &[u8]) -> BlobHash {
     BlobHash(*blake3::hash(bytes).as_bytes())
 }
 
+/// The identity of a transaction: 128 random bits, chosen once by the client that makes it and
+/// never changed. It stays with the pending transaction across reconnects and restarts of the
+/// client, so the server can tell a transaction sent again from a new one (see the receipts in
+/// `docs/protocol.md`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct TxnId(pub [u8; 16]);
+
+impl TxnId {
+    /// A new identity from the system's random numbers.
+    pub fn random() -> Self {
+        let mut bytes = [0u8; 16];
+        // Without random numbers from the system no identity is safe to hand out, and nothing
+        // else in the process would work either.
+        getrandom::fill(&mut bytes).expect("random numbers from the system");
+        Self(bytes)
+    }
+}
+
+/// For tests and tools that want identities they can name.
+impl From<u128> for TxnId {
+    fn from(n: u128) -> Self {
+        Self(n.to_be_bytes())
+    }
+}
+
+impl fmt::Display for TxnId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for TxnId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "TxnId({self})")
+    }
+}
+
 /// One user gesture: applied atomically, sequenced as a whole, undone as a whole.
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct Txn {
-    /// Chosen by the client, increasing per connection. Echoed in the event so the client can
-    /// match it with its pending transaction.
-    pub client_txn_id: u64,
+    /// Chosen by the client when it makes the transaction, and sent unchanged however often the
+    /// transaction is sent. Echoed in the event so the client can match it with its pending
+    /// transaction.
+    pub id: TxnId,
     /// The last server sequence number the client had applied when it made the edit. Events
     /// after it are what the edit could not have known about.
     pub base_seq: u64,
@@ -42,9 +84,8 @@ pub struct Event {
     pub user: UserId,
     /// Server wall clock, milliseconds since the Unix epoch. For display only.
     pub wall_ts: u64,
-    /// The sender's [`Txn::client_txn_id`], so it can match the event with its pending
-    /// transaction.
-    pub client_txn_id: u64,
+    /// The sender's [`Txn::id`], so it can match the event with its pending transaction.
+    pub txn: TxnId,
     pub ops: Vec<Op>,
     /// Concurrent edits by others that this one displaced.
     pub superseded: Vec<Superseded>,

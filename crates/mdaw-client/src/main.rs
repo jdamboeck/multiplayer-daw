@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::{Arc, OnceLock};
 
+use mdaw_client::outbox::Outbox;
 use mdaw_client::{DawApp, Session, Waker, profile};
 use mdaw_engine::Engine;
 use mdaw_net::JoinInfo;
@@ -21,8 +22,9 @@ Usage: mdaw [--join <mdaw://...>] [--name <name>] [--profile <dir>] [--no-plugin
   --join <string>   Join the project on a server. The server prints the join string when it starts.
                     Without it, mdaw opens a local project that is not saved.
   --name <name>     The name others see. Remembered in the profile.
-  --profile <dir>   Where this install keeps its identity. Use different directories to run
-                    several clients as different people on one machine.
+  --profile <dir>   Where this install keeps its identity, and the edits a server has not
+                    confirmed yet. Use different directories to run several clients as
+                    different people on one machine.
   --no-plugins      Load no plugins (also --no-clap). Tracks with plugins are silent.
   --test-synth      Also offer the built-in test synth, a plugin for trying things out that
                     can be told to fail or crash.
@@ -126,7 +128,8 @@ fn main() -> ExitCode {
                     }
                 })
             };
-            match Session::join(join, who, engine, waker) {
+            let outbox = Outbox::dir_for(&dir, &join);
+            match Session::join_with_outbox(join, who, &outbox, engine, waker) {
                 Ok(session) => session,
                 Err(err) => {
                     eprintln!("mdaw: {err:#}");
