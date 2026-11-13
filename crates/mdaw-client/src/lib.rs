@@ -5,6 +5,10 @@
 //! real server (M2 on).
 
 mod app;
+pub mod audio;
+pub mod audio_old;
+#[cfg(feature = "tracktion")]
+pub mod audio_tracktion;
 mod link;
 pub mod live;
 pub mod outbox;
@@ -16,5 +20,7 @@ mod theme;
 pub mod ui;
 
 pub use app::{DawApp, Focus, Selection, Tab};
+pub use audio::{Audio, DeviceStatus, ParamEntry, PluginEntry, TrackSound};
+pub use audio_old::OldAudio;
 pub use link::{Upload, Waker, Who};
 pub use session::{Displaced, Session, Status};

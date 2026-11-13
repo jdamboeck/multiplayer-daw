@@ -160,19 +160,19 @@ pub fn find_plugin<'a>(plugins: &'a [PluginInfo], format: PluginFormat, id: &str
 
 // ---- ids ---------------------------------------------------------------------------------------
 
-fn raw_track(id: TrackId) -> u64 {
+pub(crate) fn raw_track(id: TrackId) -> u64 {
     id.0.0
 }
-fn raw_clip(id: ClipId) -> u64 {
+pub(crate) fn raw_clip(id: ClipId) -> u64 {
     id.0.0
 }
-fn raw_note(id: NoteId) -> u64 {
+pub(crate) fn raw_note(id: NoteId) -> u64 {
     id.0.0
 }
-fn raw_device(id: DeviceId) -> u64 {
+pub(crate) fn raw_device(id: DeviceId) -> u64 {
     id.0.0
 }
-fn raw_tempo(id: TempoId) -> u64 {
+pub(crate) fn raw_tempo(id: TempoId) -> u64 {
     id.0.0
 }
 
@@ -180,7 +180,7 @@ fn raw_tempo(id: TempoId) -> u64 {
 
 /// Tracks in display order, then any the order does not list (only a hand-built document has
 /// those).
-fn ordered_tracks(project: &Project) -> Vec<(TrackId, &TrackContent)> {
+pub(crate) fn ordered_tracks(project: &Project) -> Vec<(TrackId, &TrackContent)> {
     let mut out: Vec<(TrackId, &TrackContent)> = project
         .ordered_tracks()
         .map(|(id, t)| (id, t.content.as_ref()))
@@ -204,7 +204,7 @@ fn track_predecessor(project: &Project, track: TrackId) -> u64 {
 
 /// The tempo map as the model compiles it: points before 0 count as 0, and of points at one
 /// tick the highest id wins. The engine keeps one point per tick, so it gets the winners only.
-fn effective_tempo(project: &Project) -> BTreeMap<i64, (TempoId, u32)> {
+pub(crate) fn effective_tempo(project: &Project) -> BTreeMap<i64, (TempoId, u32)> {
     let mut points = BTreeMap::new();
     // OrdMap iterates in id order, so a later (higher) id replaces an earlier one.
     for (id, point) in &project.tempo {
@@ -228,22 +228,22 @@ fn engine_note(id: NoteId, note: &Note) -> Option<EngineNote> {
     })
 }
 
-fn content(project: &Project, track: TrackId) -> Option<&TrackContent> {
+pub(crate) fn content(project: &Project, track: TrackId) -> Option<&TrackContent> {
     project.track(track).map(|t| t.content.as_ref())
 }
 
 // ---- writing the engine ------------------------------------------------------------------------
 
-struct Sync<'a> {
-    engine: &'a Engine,
+pub(crate) struct Sync<'a> {
+    pub(crate) engine: &'a Engine,
     blobs: BlobResolver<'a>,
-    problems: Vec<Problem>,
+    pub(crate) problems: Vec<Problem>,
     /// The engine's plugin list, read once per call when a plugin device is first met.
     plugins: Option<Vec<PluginInfo>>,
 }
 
 impl<'a> Sync<'a> {
-    fn new(engine: &'a Engine, blobs: BlobResolver<'a>) -> Self {
+    pub(crate) fn new(engine: &'a Engine, blobs: BlobResolver<'a>) -> Self {
         Self {
             engine,
             blobs,
@@ -252,7 +252,7 @@ impl<'a> Sync<'a> {
         }
     }
 
-    fn op(&mut self, before: &Project, op: &Op, after: &Project) -> Result<(), Error> {
+    pub(crate) fn op(&mut self, before: &Project, op: &Op, after: &Project) -> Result<(), Error> {
         let engine = self.engine;
         match op {
             // Project scope.
@@ -395,7 +395,7 @@ impl<'a> Sync<'a> {
 
     // ---- tempo
 
-    fn put_tempo(&mut self, id: TempoId, tick: i64, milli_bpm: u32) -> Result<(), Error> {
+    pub(crate) fn put_tempo(&mut self, id: TempoId, tick: i64, milli_bpm: u32) -> Result<(), Error> {
         // The model clamps to its own range when it compiles the map. That range is the
         // engine's now, so the second clamp changes nothing for a valid project; it stays in
         // case the two ever differ again.
@@ -431,7 +431,12 @@ impl<'a> Sync<'a> {
 
     /// Adds the track with everything on it, behind `after_track`. Re-sends values when the
     /// track is already there.
-    fn put_track(&mut self, project: &Project, id: TrackId, after_track: u64) -> Result<(), Error> {
+    pub(crate) fn put_track(
+        &mut self,
+        project: &Project,
+        id: TrackId,
+        after_track: u64,
+    ) -> Result<(), Error> {
         let Some(track) = project.track(id) else {
             return Ok(());
         };
@@ -452,7 +457,12 @@ impl<'a> Sync<'a> {
         Ok(())
     }
 
-    fn put_clip(&mut self, track: TrackId, id: ClipId, clip: &mdaw_model::Clip) -> Result<(), Error> {
+    pub(crate) fn put_clip(
+        &mut self,
+        track: TrackId,
+        id: ClipId,
+        clip: &mdaw_model::Clip,
+    ) -> Result<(), Error> {
         let raw = raw_clip(id);
         if clip.length.0 < 1 {
             self.problems.push(Problem::ClipSkipped { track, clip: id });
@@ -466,7 +476,7 @@ impl<'a> Sync<'a> {
         self.put_notes(track, id, clip.notes.iter().map(|(id, note)| (*id, note)))
     }
 
-    fn put_notes<'n>(
+    pub(crate) fn put_notes<'n>(
         &mut self,
         track: TrackId,
         clip: ClipId,
@@ -501,7 +511,7 @@ impl<'a> Sync<'a> {
 
     /// The device in the engine that `device` goes behind: the nearest one to its left in the
     /// model that the engine has (a skipped plugin is not there), 0 if none.
-    fn device_predecessor(&self, project: &Project, track: TrackId, device: DeviceId) -> u64 {
+    pub(crate) fn device_predecessor(&self, project: &Project, track: TrackId, device: DeviceId) -> u64 {
         let Some(c) = content(project, track) else {
             return 0;
         };
@@ -518,7 +528,12 @@ impl<'a> Sync<'a> {
     }
 
     /// Adds a device with its bypass, parameters and state. Returns whether the engine has it.
-    fn put_device(&mut self, track: TrackId, device: &Device, after_device: u64) -> Result<bool, Error> {
+    pub(crate) fn put_device(
+        &mut self,
+        track: TrackId,
+        device: &Device,
+        after_device: u64,
+    ) -> Result<bool, Error> {
         let raw = raw_device(device.id);
         let added = match &device.kind {
             // The engine's own synth stands in for Pocket until the engine has Pocket.
@@ -584,7 +599,7 @@ impl<'a> Sync<'a> {
     }
 
     /// Gives a plugin device the parameter values the model holds for it.
-    fn put_params(&mut self, track: TrackId, device: &Device) -> Result<(), Error> {
+    pub(crate) fn put_params(&mut self, track: TrackId, device: &Device) -> Result<(), Error> {
         if device.params.is_empty() {
             return Ok(());
         }
@@ -601,7 +616,7 @@ impl<'a> Sync<'a> {
     /// Sets the engine's synth up from all of a Pocket device's parameters, defaults included
     /// (see [`POCKET_TO_FOUR_OSC`]): first the settings that are part of 4osc's state, then its
     /// parameters. Parameter ids Pocket does not have are reported.
-    fn put_pocket(&mut self, track: TrackId, device: &Device) -> Result<(), Error> {
+    pub(crate) fn put_pocket(&mut self, track: TrackId, device: &Device) -> Result<(), Error> {
         let raw = raw_device(device.id);
         let values = PocketParams::from_map(&device.params);
         let state = self.engine.device_get_state(raw);
@@ -642,7 +657,7 @@ impl<'a> Sync<'a> {
 
     /// Sets one parameter of a plugin device. `plain` is the model's value, in the plugin's own
     /// units; `None` is the parameter's default. `params` is the device's list from the engine.
-    fn put_param(
+    pub(crate) fn put_param(
         &mut self,
         track: TrackId,
         device: DeviceId,
@@ -667,7 +682,7 @@ impl<'a> Sync<'a> {
 
     /// A state the plugin refuses is a problem, not an error: the plugin is in the engine either
     /// way.
-    fn put_state(&mut self, track: TrackId, device: DeviceId, blob: BlobHash) {
+    pub(crate) fn put_state(&mut self, track: TrackId, device: DeviceId, blob: BlobHash) {
         let not_applied = |reason: String| Problem::StateNotApplied {
             track,
             device,

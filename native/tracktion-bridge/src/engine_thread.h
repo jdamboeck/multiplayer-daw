@@ -37,6 +37,11 @@ public:
     /// are done. The first exception skips the remaining steps and is rethrown here.
     void call (std::vector<Step> steps, int gapMs);
 
+    /// Runs `step` on the message thread as soon as it is free, without waiting for it. It runs
+    /// between the steps of a call (steps, gapMs) if one is in progress, and after whatever was
+    /// posted before it. What it throws is dropped. False if the message thread does not run.
+    bool post (Step step);
+
     /// Runs the `tearDown` steps like call() (all of them, even after an exception), ends the
     /// dispatch loop, runs `afterLoop` on the thread outside any message callback, shuts JUCE
     /// down there and joins the thread.

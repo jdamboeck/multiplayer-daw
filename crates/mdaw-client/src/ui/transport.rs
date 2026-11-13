@@ -108,7 +108,7 @@ pub fn show(app: &mut DawApp, ui: &mut Ui) {
         }
 
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let mut db = gain_to_db(app.session.engine().output_gain());
+            let mut db = gain_to_db(app.session.audio().output_gain());
             let response = ui
                 .add(
                     DragValue::new(&mut db)
@@ -122,11 +122,11 @@ pub fn show(app: &mut DawApp, ui: &mut Ui) {
                      and nobody else hears it.",
                 );
             if response.changed() {
-                app.session.engine_mut().set_output_gain(db_to_gain(db));
+                app.session.audio_mut().set_output_gain(db_to_gain(db));
             }
             meter(app, ui);
             ui.label(
-                RichText::new(app.session.engine().description())
+                RichText::new(app.session.audio().description())
                     .color(theme::TEXT_DIM)
                     .small(),
             );
@@ -199,7 +199,7 @@ pub fn notices(app: &mut DawApp, ui: &mut Ui) {
 }
 
 fn meter(app: &mut DawApp, ui: &mut Ui) {
-    let peak = app.session.engine().take_peak();
+    let peak = app.session.audio_mut().take_peak();
     let levels = &mut app.transport.meter;
     for (level, peak) in levels.iter_mut().zip(peak) {
         *level = (*level * 0.86).max(peak);

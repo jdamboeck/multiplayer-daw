@@ -20,7 +20,10 @@ Options:
   --listen <addr>   Where the server listens (default: 127.0.0.1:7464).
   --release         Use optimised builds.
   --no-plugins      Clients load no plugins; tracks with plugins are silent in them.
-  --test-synth      Clients also offer the built-in test synth.
+  --test-synth      Clients also offer the built-in test synth (Rust engine only).
+  --tracktion       Build the client with Tracktion Engine (`--features mdaw-client/tracktion`;
+                    needs the native build, see docs/tracktion-integration.md) and play
+                    through it. Without it the clients use the Rust engine.
 
 The pieces can be mixed: `cargo xtask server` in one terminal and `cargo xtask client Ann` in
 others gives the same setup as `demo`, with a server that can be stopped and started alone.
@@ -37,6 +40,8 @@ struct Options {
     no_plugins: bool,
     /// Clients offer the test synth.
     test_synth: bool,
+    /// Clients play through Tracktion Engine.
+    tracktion: bool,
 }
 
 fn main() -> ExitCode {
@@ -49,6 +54,7 @@ fn main() -> ExitCode {
         listen: "127.0.0.1:7464".into(),
         no_plugins: false,
         test_synth: false,
+        tracktion: false,
     };
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -56,6 +62,7 @@ fn main() -> ExitCode {
             "--release" => options.release = true,
             "--no-plugins" | "--no-clap" => options.no_plugins = true,
             "--test-synth" => options.test_synth = true,
+            "--tracktion" => options.tracktion = true,
             "--listen" => match args.next() {
                 Some(addr) => options.listen = addr,
                 None => return fail("--listen needs an address"),
@@ -92,7 +99,7 @@ fn demo(mut options: Options) -> Result<()> {
     if options.names.is_empty() {
         options.names = vec!["Ann".into(), "Ben".into()];
     }
-    build(options.release)?;
+    build(&options)?;
     let (mut server, join) = start_server(&options)?;
     let clients: Result<Vec<Child>> = options
         .names
@@ -119,7 +126,7 @@ fn server(options: Options) -> Result<()> {
     if !options.names.is_empty() {
         return Err("server takes no names".into());
     }
-    build(options.release)?;
+    build(&options)?;
     let (mut server, join) = start_server(&options)?;
     println!("{join}");
     eprintln!("xtask: in another terminal: cargo xtask client <name>");
@@ -143,7 +150,7 @@ fn client(options: Options) -> Result<()> {
     let path = demo_dir().join("join.txt");
     let join = std::fs::read_to_string(&path)
         .map_err(|_| format!("no {}; start `cargo xtask server` first", path.display()))?;
-    build(options.release)?;
+    build(&options)?;
     let status = start_client(name, join.trim(), &options)?
         .wait()
         .map_err(|err| format!("waiting for the client: {err}"))?;
@@ -179,7 +186,8 @@ fn binary(name: &str, release: bool) -> PathBuf {
         .join(format!("{name}{}", std::env::consts::EXE_SUFFIX))
 }
 
-fn build(release: bool) -> Result<()> {
+fn build(options: &Options) -> Result<()> {
+    let release = options.release;
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let mut command = Command::new(cargo);
     command.current_dir(root()).args([
@@ -210,6 +218,9 @@ fn build(release: bool) -> Result<()> {
     }
     if release {
         command.arg("--release");
+    }
+    if options.tracktion {
+        command.args(["--features", "mdaw-client/tracktion"]);
     }
     match command.status() {
         Ok(status) if status.success() => Ok(()),

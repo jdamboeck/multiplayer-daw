@@ -254,7 +254,7 @@ mod tests {
     #[test]
     fn frames_round_trip() {
         let msg = ClientMsg::Hello(Hello {
-            proto_version: 7,
+            proto_version: 8,
             token: "secret".into(),
             user_key: [9; 16],
             name: "ada".into(),

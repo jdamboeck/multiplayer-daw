@@ -11,7 +11,7 @@
 
 use std::ffi::c_char;
 
-pub const MDAW_ABI_VERSION: u32 = 3;
+pub const MDAW_ABI_VERSION: u32 = 4;
 pub const MDAW_TICKS_PER_QUARTER: i64 = 960;
 
 /// Opaque engine handle.
@@ -75,6 +75,10 @@ pub struct mdaw_engine_state {
     pub cpu: f32,
     pub peak_left: f32,
     pub peak_right: f32,
+    /// ABI 4.
+    pub position_age_seconds: f64,
+    /// ABI 4.
+    pub output_latency_seconds: f64,
 }
 
 /// `mdaw_event_kind`, as the `kind` field of [`mdaw_event`] carries it.
@@ -138,6 +142,8 @@ unsafe extern "C" {
         pan: f32,
         mute: i32,
     ) -> mdaw_status;
+    pub fn mdaw_track_live_note(engine: *mut mdaw_engine, track: u64, pitch: u8, velocity: u8)
+    -> mdaw_status;
 
     pub fn mdaw_clip_add(
         engine: *mut mdaw_engine,
@@ -302,7 +308,7 @@ mod tests {
 
         assert_eq!(
             (size_of::<mdaw_engine_state>(), align_of::<mdaw_engine_state>()),
-            (64, 8)
+            (80, 8)
         );
         assert_eq!(
             [
@@ -315,8 +321,10 @@ mod tests {
                 offset_of!(mdaw_engine_state, cpu),
                 offset_of!(mdaw_engine_state, peak_left),
                 offset_of!(mdaw_engine_state, peak_right),
+                offset_of!(mdaw_engine_state, position_age_seconds),
+                offset_of!(mdaw_engine_state, output_latency_seconds),
             ],
-            [8, 16, 24, 32, 40, 44, 48, 52, 56]
+            [8, 16, 24, 32, 40, 44, 48, 52, 56, 64, 72]
         );
 
         assert_eq!((size_of::<mdaw_event>(), align_of::<mdaw_event>()), (88, 8));

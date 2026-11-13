@@ -15,5 +15,6 @@ workspace = true
 mdaw-tracktion-sys.workspace = true
 mdaw-model.workspace = true
 mdaw-dsp.workspace = true
+imbl.workspace = true
 serde.workspace = true
 serde_json.workspace = true

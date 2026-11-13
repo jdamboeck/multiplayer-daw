@@ -171,7 +171,7 @@ impl DawApp {
     }
 
     pub fn remove_track(&mut self, id: TrackId) {
-        self.session.engine_mut().note_off(id, piano_roll::PREVIEW_KEY);
+        piano_roll::stop_preview_on(self, id);
         self.session.edit(vec![Op::TrackRemove { id }]);
     }
 

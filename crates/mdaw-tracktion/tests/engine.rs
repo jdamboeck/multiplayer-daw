@@ -14,7 +14,9 @@ use mdaw_model::{
     Note, NoteId, NoteProp, Op, PluginFormat, Project, TempoId, TempoPoint, Tick, TrackContent, TrackId,
     TrackShell,
 };
-use mdaw_tracktion::{Config, Engine, EntityKind, Event, Problem, Status, apply_op, load_project};
+use mdaw_tracktion::{
+    Config, Engine, EntityKind, Event, Problem, Status, apply_op, load_project, sync_project,
+};
 use mdaw_tracktion_sys as sys;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -337,7 +339,7 @@ fn the_engine_follows_the_model() {
     let engine = Engine::new(config()).expect("create the engine");
     println!("versions: {}", engine.versions());
     assert!(engine.versions().contains("JUCE"), "versions");
-    assert_eq!(mdaw_tracktion::abi_version(), 3);
+    assert_eq!(mdaw_tracktion::abi_version(), 4);
     assert!(
         !engine.versions().contains("Tracktion Engine Tracktion Engine"),
         "versions: name not doubled"
@@ -361,6 +363,8 @@ fn the_engine_follows_the_model() {
     pocket_params(&mut world, &ids);
     no_events_for_own_changes(&world);
     track_removed(&mut world, &ids);
+    sync_by_difference(&world, &mut ids_gen);
+    world.load();
     plugins(&mut world, &mut ids_gen, have_clap);
 
     drop(world);
@@ -954,6 +958,329 @@ fn track_removed(world: &mut World, ids: &Ids) {
             && !engine.has(EntityKind::Device, ids.synth.0.0),
         "has: the track and what was on it are gone"
     );
+}
+
+/// Step 7b: `sync_project` brings the engine from one state of the project to the next by their
+/// difference. Edit sequences with additions, removals, moves, an undo of everything back to an
+/// earlier state, and a rollback (a jump back to an earlier state), each synced step by step,
+/// end in an engine that sounds like a fresh load of the final state. A single changed note
+/// costs one call.
+fn sync_by_difference(world: &World, ids_gen: &mut IdGen) {
+    let engine = &world.engine;
+    let no_blobs = |_: &BlobHash| None;
+    // One oscillator only (Pocket's oscillator mix at 0): two free-running oscillators sum to a
+    // level that changes by some 3 dB from render to render, one does not.
+    let pocket = |id| {
+        let mut device = Device::new(
+            id,
+            DeviceKind::Builtin {
+                kind: BuiltinKind::Pocket,
+                dsp_version: 1,
+            },
+        );
+        device.params.insert(4, 0.0);
+        device
+    };
+    let (t1, t2, t3) = (ids_gen.track(), ids_gen.track(), ids_gen.track());
+    let (d1, d2, d3) = (ids_gen.device(), ids_gen.device(), ids_gen.device());
+    let (c1, c2, c3) = (ids_gen.clip(), ids_gen.clip(), ids_gen.clip());
+    let (tempo0, tempo1) = (ids_gen.tempo(), ids_gen.tempo());
+    let n: Vec<NoteId> = (0..8).map(|_| ids_gen.note()).collect();
+    let shell = |name: &str| TrackShell {
+        name: name.into(),
+        color: 0,
+    };
+    let clip = |start: i64, beats: i64| Clip {
+        start: Tick(start * Q),
+        length: Tick(beats * Q),
+        name: "c".into(),
+        notes: Default::default(),
+    };
+
+    // The starting state: 120 bpm, one track with a clip of two notes.
+    let mut model = Project::default();
+    let apply = |model: &mut Project, ops: Vec<Op>| -> Vec<Op> {
+        let mut inverses = Vec::new();
+        for op in &ops {
+            if let Some(inverse) = mdaw_model::apply(model, op) {
+                inverses.push(inverse);
+            }
+        }
+        inverses
+    };
+    apply(
+        &mut model,
+        vec![
+            Op::TempoPut {
+                id: tempo0,
+                point: TempoPoint {
+                    tick: Tick(0),
+                    milli_bpm: 120_000,
+                },
+            },
+            Op::TrackAdd {
+                id: t1,
+                shell: shell("one"),
+                content: TrackContent::default(),
+                after: None,
+            },
+            Op::DeviceAdd {
+                track: t1,
+                device: pocket(d1),
+                after: None,
+            },
+            Op::ClipAdd {
+                track: t1,
+                id: c1,
+                clip: clip(0, 8),
+            },
+            Op::NoteAdd {
+                track: t1,
+                clip: c1,
+                id: n[0],
+                note: note(0, 60),
+            },
+            Op::NoteAdd {
+                track: t1,
+                clip: c1,
+                id: n[1],
+                note: note(2, 64),
+            },
+        ],
+    );
+    load_project(engine, &model, &no_blobs).expect("sync: first load");
+    let start = model.clone();
+
+    // Syncs each step from the one before and checks the end against a fresh load.
+    let mut synced = model.clone();
+    let step = |synced: &mut Project, next: &Project, what: &str| {
+        let problems =
+            sync_project(engine, synced, next, &no_blobs).unwrap_or_else(|e| panic!("{what}: {e}"));
+        assert!(problems.is_empty(), "{what}: {problems:?}");
+        *synced = next.clone();
+    };
+    let compare = |model: &Project, name: &str| {
+        let by_diff = render(engine, &format!("sync_{name}"), 16 * Q);
+        load_project(engine, model, &no_blobs).expect("sync: reload");
+        let loaded = render(engine, &format!("sync_{name}_loaded"), 16 * Q);
+        assert_same_envelope(&by_diff, &loaded, &format!("sync {name}"));
+        // With one oscillator the level repeats to within a fraction of a percent, so a mix or
+        // parameter the diff missed shows.
+        let energy = |wav: &Wav| wav.envelope().iter().map(|x| x * x).sum::<f64>();
+        let ratio = (energy(&by_diff) / energy(&loaded)).sqrt();
+        println!("RESULT sync_{name}_level_ratio={ratio:.4}");
+        assert!(
+            (0.98..1.02).contains(&ratio),
+            "sync {name}: level differs by {ratio:.4}"
+        );
+        by_diff
+    };
+
+    // 1. Additions and changes.
+    let edits: Vec<Vec<Op>> = vec![
+        vec![
+            Op::TrackAdd {
+                id: t2,
+                shell: shell("two"),
+                content: TrackContent::default(),
+                after: Some(t1),
+            },
+            Op::DeviceAdd {
+                track: t2,
+                device: pocket(d2),
+                after: None,
+            },
+            Op::ClipAdd {
+                track: t2,
+                id: c2,
+                clip: clip(4, 4),
+            },
+        ],
+        vec![
+            Op::NoteAdd {
+                track: t2,
+                clip: c2,
+                id: n[2],
+                note: note(1, 67),
+            },
+            Op::NoteAdd {
+                track: t2,
+                clip: c2,
+                id: n[3],
+                note: note(3, 71),
+            },
+        ],
+        vec![Op::NoteSet {
+            track: t1,
+            clip: c1,
+            id: n[1],
+            prop: NoteProp::Pitch(52),
+        }],
+        vec![Op::ClipSet {
+            track: t1,
+            id: c1,
+            prop: ClipProp::Start(Tick(Q)),
+        }],
+        vec![Op::TempoPut {
+            id: tempo1,
+            point: TempoPoint {
+                tick: Tick(4 * Q),
+                milli_bpm: 180_000,
+            },
+        }],
+        vec![
+            Op::TrackSetMix {
+                track: t2,
+                prop: MixProp::Gain(0.5),
+            },
+            Op::TrackSetShell {
+                id: t2,
+                prop: mdaw_model::ShellProp::Name("two, renamed".into()),
+            },
+        ],
+        vec![Op::DeviceSetParam {
+            track: t1,
+            id: d1,
+            param: 11,
+            value: Some(800.0),
+        }],
+    ];
+    let mut undo: Vec<Vec<Op>> = Vec::new();
+    for (i, ops) in edits.into_iter().enumerate() {
+        undo.push(apply(&mut model, ops));
+        step(&mut synced, &model, &format!("addition {i}"));
+    }
+    let after_additions = model.clone();
+    let wav = compare(&model, "additions");
+    assert!(
+        wav.peak_between(2.0, 3.0) > SOUND,
+        "sync additions: track two sounds"
+    );
+
+    // 2. Removals and moves.
+    let edits: Vec<Vec<Op>> = vec![
+        vec![Op::NoteRemove {
+            track: t2,
+            clip: c2,
+            id: n[3],
+        }],
+        vec![Op::TrackMove { id: t2, after: None }],
+        vec![
+            Op::TrackAdd {
+                id: t3,
+                shell: shell("three"),
+                content: TrackContent::default(),
+                after: Some(t2),
+            },
+            Op::DeviceAdd {
+                track: t3,
+                device: pocket(d3),
+                after: None,
+            },
+            Op::ClipAdd {
+                track: t3,
+                id: c3,
+                clip: clip(8, 4),
+            },
+            Op::NoteAdd {
+                track: t3,
+                clip: c3,
+                id: n[4],
+                note: note(0, 72),
+            },
+        ],
+        vec![Op::DeviceSetBypass {
+            track: t1,
+            id: d1,
+            bypass: true,
+        }],
+        vec![Op::TrackMove {
+            id: t1,
+            after: Some(t2),
+        }],
+        vec![Op::TempoRemove { id: tempo1 }],
+        vec![Op::ClipRemove { track: t2, id: c2 }],
+        vec![Op::TrackRemove { id: t1 }],
+    ];
+    for (i, ops) in edits.into_iter().enumerate() {
+        undo.push(apply(&mut model, ops));
+        step(&mut synced, &model, &format!("removal {i}"));
+    }
+    assert!(!engine.has(EntityKind::Track, t1.0.0) && !engine.has(EntityKind::Clip, c2.0.0));
+    assert!(engine.has(EntityKind::Track, t3.0.0) && engine.has(EntityKind::Device, d3.0.0));
+    let after_removals = model.clone();
+    let wav = compare(&model, "removals");
+    assert!(
+        wav.peak_between(4.0, 4.5) > SOUND,
+        "sync removals: track three sounds"
+    );
+    assert!(
+        wav.peak_between(0.0, 3.9) < SILENT,
+        "sync removals: the rest is gone"
+    );
+
+    // 3. Undo, one step at a time, back to where the removals began.
+    let removals = undo.split_off(undo.len() - 8);
+    for (i, inverses) in removals.into_iter().rev().enumerate() {
+        apply(&mut model, inverses.into_iter().rev().collect());
+        step(&mut synced, &model, &format!("undo {i}"));
+    }
+    assert_eq!(model, after_additions, "undo: the model is back");
+    compare(&model, "undone");
+
+    // 4. A rollback: from the state after the removals straight back to the start, and to the
+    //    state after the removals again.
+    load_project(engine, &after_removals, &no_blobs).expect("sync: load");
+    synced = after_removals.clone();
+    step(&mut synced, &start, "rollback");
+    let wav = compare(&start, "rollback");
+    assert!(
+        wav.peak_between(0.0, 0.4) > SOUND,
+        "rollback: the first note is back"
+    );
+    step(&mut synced, &after_removals, "forward again");
+    compare(&after_removals, "forward_again");
+
+    // 5. One note changed in a project of some size costs one call.
+    let mut big = after_additions.clone();
+    let mut ops = Vec::new();
+    for i in 0..200 {
+        ops.push(Op::NoteAdd {
+            track: t2,
+            clip: c2,
+            id: ids_gen.note(),
+            note: Note {
+                start: Tick(i * 7),
+                dur: Tick(5),
+                pitch: 40 + (i % 40) as u8,
+                vel: 50,
+            },
+        });
+    }
+    apply(&mut big, ops);
+    load_project(engine, &big, &no_blobs).expect("sync: big load");
+    let mut next = big.clone();
+    apply(
+        &mut next,
+        vec![Op::NoteSet {
+            track: t1,
+            clip: c1,
+            id: n[0],
+            prop: NoteProp::Pitch(61),
+        }],
+    );
+    let calls = engine.call_count();
+    let started = Instant::now();
+    sync_project(engine, &big, &next, &no_blobs).expect("sync: one note");
+    let (calls, took) = (engine.call_count() - calls, started.elapsed());
+    println!(
+        "RESULT sync_one_note_calls={calls} sync_one_note_micros={}",
+        took.as_micros()
+    );
+    assert_eq!(calls, 1, "one changed note: one call (notes_put)");
+    let calls = engine.call_count();
+    sync_project(engine, &next, &next, &no_blobs).expect("sync: nothing");
+    assert_eq!(engine.call_count() - calls, 0, "no change: no call");
 }
 
 /// Step 8: plugin devices. One whose plugin is not installed is left out and reported; the

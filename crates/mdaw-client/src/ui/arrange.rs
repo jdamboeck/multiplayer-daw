@@ -155,7 +155,7 @@ pub fn show(app: &mut DawApp, ui: &mut Ui) {
     paint_lanes(app, &ui.painter_at(lanes), &layout, &tracks);
     let loop_range = app.loop_on.then_some((app.loop_range.start, app.loop_range.end));
     paint_ruler(&ui.painter_at(ruler), ruler, &axis, loop_range);
-    let playhead = axis.x_f(app.session.engine().position());
+    let playhead = axis.x_f(app.session.position());
     paint_playhead(&ui.painter_at(ruler.union(lanes)), playhead, ruler, lanes);
 
     ui.painter_at(headers).rect_filled(headers, 0.0, theme::CANVAS);

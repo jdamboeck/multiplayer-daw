@@ -2592,6 +2592,7 @@ dependencies = [
  "mdaw-server",
  "mdaw-sync",
  "mdaw-test-plugin",
+ "mdaw-tracktion",
  "postcard",
  "quinn",
  "serde",
@@ -2719,6 +2720,7 @@ dependencies = [
 name = "mdaw-tracktion"
 version = "0.1.0"
 dependencies = [
+ "imbl",
  "mdaw-dsp",
  "mdaw-model",
  "mdaw-tracktion-sys",

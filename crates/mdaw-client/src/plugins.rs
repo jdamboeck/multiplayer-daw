@@ -16,25 +16,7 @@ use mdaw_dsp::{ExternalDevice, MAX_BLOCK, PluginRef, PluginSource};
 use mdaw_model::{BlobHash, DeviceId, DeviceKind, PluginFormat, Project, TrackId};
 use mdaw_plugin::{Host, Instance, ParamInfo, PluginInfo, Settings, Waker};
 
-/// A state saved from an instance: its hash and its bytes.
-pub type SavedState = (BlobHash, Arc<[u8]>);
-
-/// How a track is heard on this client.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum TrackSound {
-    /// No plugins: built-in devices only.
-    Builtin,
-    /// Its plugins run here.
-    Live,
-    /// A plugin of the track is not installed here (or plugins are off): silent here.
-    NotInstalled,
-    /// A plugin is installed but cannot run, as while its settings are not here: silent.
-    Silent,
-    /// A plugin crashed: silent until it is restarted.
-    Crashed,
-    /// A plugin is starting.
-    Loading,
-}
+pub use crate::audio::{SavedState, TrackSound};
 
 /// An instance made on another thread, its settings loaded.
 struct Made {
@@ -56,6 +38,11 @@ const PARAMS_FRESH: Duration = Duration::from_millis(100);
 /// How often the settings of plugins are looked at, to put those that changed into the
 /// document.
 pub const SAVE_EVERY: Duration = Duration::from_secs(2);
+/// How often the main loop runs at least while a plugin's own window is open: plugins draw from
+/// their timers, which run only then.
+pub const WINDOW_PACE: Duration = Duration::from_millis(10);
+/// How often it runs at least while plugins run without a window, for the callbacks they ask for.
+pub const PACE: Duration = Duration::from_millis(50);
 
 struct Running {
     instance: Box<dyn Instance>,
@@ -307,6 +294,16 @@ impl Plugins {
                 host.dispose(running.instance);
             }
         }
+    }
+
+    /// Whether a device's plugin is being started.
+    pub fn loading(&self, track: TrackId, device: DeviceId) -> bool {
+        self.starting.contains_key(&(track, device)) || self.ready.contains_key(&(track, device))
+    }
+
+    /// Whether a device's plugin runs here.
+    pub fn running(&self, track: TrackId, device: DeviceId) -> bool {
+        self.running.contains_key(&(track, device))
     }
 
     /// How `track` is heard here.

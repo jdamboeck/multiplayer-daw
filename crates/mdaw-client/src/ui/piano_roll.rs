@@ -246,7 +246,7 @@ pub fn show(app: &mut DawApp, ui: &mut Ui) {
     let body = grid.union(velocity);
     paint_playhead(
         &ui.painter_at(ruler.union(body)),
-        axis.x_f(app.session.engine().position()),
+        axis.x_f(app.session.position()),
         ruler,
         body,
     );
@@ -275,14 +275,21 @@ pub fn release_preview(app: &mut DawApp, ctx: &egui::Context) {
 fn start_preview(app: &mut DawApp, track: TrackId, pitch: u8, vel: u8) {
     if app.roll.preview != Some((track, pitch)) {
         stop_preview(app);
-        app.session.engine_mut().note_on(track, PREVIEW_KEY, pitch, vel);
+        app.session.preview_on(track, pitch, vel);
         app.roll.preview = Some((track, pitch));
     }
 }
 
+/// Stops the preview note if it plays on `track`.
+pub(crate) fn stop_preview_on(app: &mut DawApp, track: TrackId) {
+    if app.roll.preview.is_some_and(|(t, _)| t == track) {
+        stop_preview(app);
+    }
+}
+
 fn stop_preview(app: &mut DawApp) {
-    if let Some((track, _)) = app.roll.preview.take() {
-        app.session.engine_mut().note_off(track, PREVIEW_KEY);
+    if let Some((track, pitch)) = app.roll.preview.take() {
+        app.session.preview_off(track, pitch);
     }
 }
 

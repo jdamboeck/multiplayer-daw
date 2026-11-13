@@ -3,12 +3,14 @@
 //!
 //! The engine holds a project *derived* from the application's canonical `mdaw_model::Project`
 //! (docs/decisions/0001-canonical-project-state.md): [`apply::load_project`] builds it from
-//! scratch, [`apply::apply_op`] carries one model op over incrementally.
+//! scratch, [`apply::apply_op`] carries one model op over incrementally, and
+//! [`sync::sync_project`] brings it from one state of the project to another by their difference.
 //!
 //! The semantics of each call are those of `native/tracktion-bridge/include/mdaw_engine.h`.
 //! Ids are the application's own 64-bit ids (0 means "none"); time is ticks at 960 per quarter.
 
 pub mod apply;
+pub mod sync;
 
 use mdaw_tracktion_sys as sys;
 use serde::Deserialize;
@@ -16,8 +18,10 @@ use std::ffi::{CStr, CString, c_char};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::ptr::{self, NonNull};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-pub use apply::{BlobResolver, Problem, apply_op, load_project};
+pub use apply::{BlobResolver, Problem, apply_op, find_plugin, load_project};
+pub use sync::sync_project;
 
 /// Ticks per quarter note, in the engine as in the model.
 pub const TICKS_PER_QUARTER: i64 = sys::MDAW_TICKS_PER_QUARTER;
@@ -332,6 +336,12 @@ pub struct EngineState {
     /// Master output since the last read, linear.
     pub peak_left: f32,
     pub peak_right: f32,
+    /// How long ago `position_tick` and `position_seconds` were taken (about 30 times a second).
+    pub position_age_seconds: f64,
+    /// From the position being processed to its sound leaving the device (the device's output
+    /// latency and one block); 0 without a device. `position_tick` is heard
+    /// `output_latency_seconds - position_age_seconds` from now.
+    pub output_latency_seconds: f64,
 }
 
 /// What the engine has to tell (`mdaw_engine_poll_event`). Changes caused by the application's
@@ -359,6 +369,8 @@ pub enum Event {
 /// The engine. One per process: a second [`Engine::new`] while one lives fails.
 pub struct Engine {
     raw: NonNull<sys::mdaw_engine>,
+    /// Calls made through this handle, for [`Engine::call_count`].
+    calls: AtomicU64,
 }
 
 // SAFETY: the header allows every function to be called from any thread that is not a real-time
@@ -403,17 +415,30 @@ impl Engine {
         // SAFETY: the config and the strings it points to outlive the call.
         let raw = unsafe { sys::mdaw_engine_create(&raw_config) };
         // A failed create returns no status; the thread's last status has it.
-        NonNull::new(raw).map(|raw| Engine { raw }).ok_or_else(|| {
-            let status = match sys::mdaw_last_status() {
-                sys::MDAW_OK => Status::Internal,
-                raw => Status::from_raw(raw),
-            };
-            Error::last(status)
-        })
+        NonNull::new(raw)
+            .map(|raw| Engine {
+                raw,
+                calls: AtomicU64::new(0),
+            })
+            .ok_or_else(|| {
+                let status = match sys::mdaw_last_status() {
+                    sys::MDAW_OK => Status::Internal,
+                    raw => Status::from_raw(raw),
+                };
+                Error::last(status)
+            })
     }
 
     fn ptr(&self) -> *mut sys::mdaw_engine {
+        self.calls.fetch_add(1, Ordering::Relaxed);
         self.raw.as_ptr()
+    }
+
+    /// How many calls into the native engine this handle has made so far ([`Engine::state`]
+    /// and [`Engine::poll_event`] included; a call whose result did not fit its buffer counts
+    /// twice). For tests and diagnostics: it shows how much work an update took.
+    pub fn call_count(&self) -> u64 {
+        self.calls.load(Ordering::Relaxed)
     }
 
     fn text(&self, call: impl Fn(*mut sys::mdaw_engine, *mut c_char, usize) -> usize) -> Vec<u8> {
@@ -488,6 +513,14 @@ impl Engine {
     pub fn track_set_mix(&self, track: u64, gain: f32, pan: f32, mute: bool) -> Result<(), Error> {
         // SAFETY: valid handle.
         check(unsafe { sys::mdaw_track_set_mix(self.ptr(), track, gain, pan, i32::from(mute)) })
+    }
+
+    /// Plays a note on the track's devices at once, as a key on a keyboard does (velocity 0
+    /// ends it). Does not wait for the engine's thread; nothing is heard without an open device
+    /// or for a track the engine does not have, and that is not an error.
+    pub fn track_live_note(&self, track: u64, pitch: u8, velocity: u8) -> Result<(), Error> {
+        // SAFETY: valid handle.
+        check(unsafe { sys::mdaw_track_live_note(self.ptr(), track, pitch, velocity) })
     }
 
     pub fn clip_add(
@@ -717,6 +750,8 @@ impl Engine {
             cpu: raw.cpu,
             peak_left: raw.peak_left,
             peak_right: raw.peak_right,
+            position_age_seconds: raw.position_age_seconds,
+            output_latency_seconds: raw.output_latency_seconds,
         }
     }
 

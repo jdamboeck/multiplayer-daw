@@ -290,11 +290,58 @@ The model's tempo limit is now 20–300 bpm, the range Tracktion plays.
 Open model question: after a parameter is put back to "default" in the model and the project
 is reloaded, the value in the plugin's stored state wins over the default.
 
-Built but not yet exercised by any test: plugin editor windows through the bridge; everything
-that needs an open audio device (device switching, meters, xruns, loop, restart after a
-device-list change, the stalled-audio event); parameter events from a plugin's own window; the
+Built but not yet exercised by any test: plugin editor windows through the bridge; most of what
+needs an open audio device (device switching, xruns, loop, restart after a device-list change,
+the stalled-audio event; meters, live notes and playing are covered by the ignored test
+`crates/mdaw-tracktion/tests/live_device.rs`); parameter events from a plugin's own window; the
 resulting order after track and device moves; VST3 and LV2 through the bridge; calls from
 several threads at once. A hung plugin blocks every call: there is no timeout.
+
+## ABI 4 and the client on Tracktion
+
+Added 2026-11-13 for the client (feature `tracktion` of `mdaw-client`).
+
+- `mdaw_track_live_note(engine, track, pitch, velocity)`: a note on the track's devices at once
+  (velocity 0 ends it), for the computer keyboard, a MIDI input and auditioning. Tracktion's
+  `AudioTrack::injectLiveMidiMessage` must be called on the message thread (its listener list is
+  not thread-safe), so the call posts there and returns without waiting: a note is never held
+  up behind a call in progress on another thread, nor holds its caller. Measured with no device:
+  a call that waits for the message thread takes 3.4 µs at the median (8.6 µs p99) when nothing
+  else runs; the live-note call 0.8 µs. With the device (ALSA → PipeWire, 44.1 kHz, 512 frames),
+  from the call to sound in the master meter: 19–21 ms (the meter is read every 33 ms), plus the
+  device's output latency (reported 46 ms). Every audio track carries Tracktion's
+  `LiveMidiInjectingNode`, also without clips, so the note is heard on any track.
+- The bridge now keeps a playback context whenever a device runs (Tracktion makes one only on
+  play): without it, live notes went unheard and the meter stood while the transport was
+  stopped.
+- `mdaw_engine_state` gained `position_age_seconds` (the position is taken 30 times a second)
+  and `output_latency_seconds` (device latency plus one block), so the client can tell when a
+  position is heard, for recording.
+- **MIDI inputs (point 19).** Tracktion opens every MIDI input port (seen: "Midi Through", and a
+  Launchkey on this machine), but a port reaches a track only through an input destination
+  assigned to it (`InputDeviceInstance::setTarget`; `createLiveInputsNode` takes only inputs
+  whose targets contain the track), and the bridge assigns none. So notes from a MIDI device are
+  not played twice: the client reads the port itself (midir, `mdaw_engine::midi`) and plays the
+  notes with `mdaw_track_live_note`. Not done: closing Tracktion's ports. On Linux (ALSA
+  sequencer) several readers of one port are fine; on Windows a port opened by Tracktion would
+  be busy for the client.
+
+`mdaw_tracktion::sync_project(engine, before, after, blobs)` brings the engine from one state of
+the project to another by their difference, whatever caused it (own edit, server event, rebase,
+rollback, snapshot). It skips whatever the two states share (`imbl` maps and `Arc`s compared by
+pointer, `OrdMap::diff` skipping shared nodes), so one changed note costs one `mdaw_notes_put`
+call (checked by `Engine::call_count` in `tests/engine.rs`: 1 call, about 15 µs); tracks,
+clips, notes in batches, devices, tempo and master gain are covered, with moves of tracks and
+devices. The test syncs edit sequences step by step (additions, removals, moves, undo back to an
+earlier state, a jump back to the start and forward again) and compares each end with a fresh
+`load_project` of the same state: same sound windows and the same level within 2 % (with
+Pocket's oscillator mix at 0, 4osc's level repeats to 0.1 %; with two oscillators it varies
+by up to 3 dB from render to render).
+
+In the client (`crates/mdaw-client/src/audio_tracktion.rs`) every engine call that changes
+something or may take long runs on a worker thread, in order; the UI thread only reads the
+engine's state and events. The view is synced at most once per frame (requests coalesce).
+Plugins are scanned on the worker at startup (`--scan` formats; the app scans CLAP, VST3, LV2).
 
 ## Not tested yet
 

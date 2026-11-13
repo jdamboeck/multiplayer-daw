@@ -36,6 +36,9 @@ struct Shared
     std::atomic<int64_t> positionTick { 0 };
     std::atomic<double> positionSeconds { 0 }, sampleRate { 0 };
     std::atomic<float> cpu { 0 }, peakLeft { 0 }, peakRight { 0 };
+    std::atomic<double> outputLatency { 0 };
+    /// When positionTick was last taken, in Time::getMillisecondCounterHiRes() milliseconds.
+    std::atomic<double> positionTakenAt { 0 };
 
     /// Adds an event. A parameter change replaces one still queued for the same parameter, and a
     /// device change one still queued, so a dragged knob does not flood the queue.
@@ -85,6 +88,7 @@ public:
     void trackMove (uint64_t id, uint64_t after);
     void trackSetName (uint64_t id, const juce::String& name);
     void trackSetMix (uint64_t id, float gain, float pan, bool mute);
+    void trackLiveNote (uint64_t id, int pitch, int velocity);
 
     void clipAdd (uint64_t track, uint64_t id, int64_t start, int64_t length, const juce::String& name);
     void clipRemove (uint64_t id);

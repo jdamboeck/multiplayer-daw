@@ -167,19 +167,32 @@ pub enum DeviceKind {
     },
 }
 
-/// The plugin standards a device can come from. Only CLAP is hosted so far; another format
-/// is a new variant here and a new backend in `mdaw-plugin`, and nothing else in the document
-/// changes.
+/// The plugin standards a device can come from. The device's `id` is the plugin's own id in its
+/// format, the same on every machine: for CLAP the plugin id, for VST3 the class id as 32 hex
+/// digits, for LV2 the plugin URI. A client that cannot host a format treats its devices as not
+/// installed. New variants go at the end: the wire and store formats number them.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 pub enum PluginFormat {
     Clap,
+    Vst3,
+    Lv2,
 }
 
 impl PluginFormat {
+    pub const ALL: [PluginFormat; 3] = [PluginFormat::Clap, PluginFormat::Vst3, PluginFormat::Lv2];
+
+    /// The format's usual name, which is also how the audio engine names it.
     pub fn name(self) -> &'static str {
         match self {
             PluginFormat::Clap => "CLAP",
+            PluginFormat::Vst3 => "VST3",
+            PluginFormat::Lv2 => "LV2",
         }
+    }
+
+    /// The format with this [`name`](Self::name).
+    pub fn from_name(name: &str) -> Option<PluginFormat> {
+        Self::ALL.into_iter().find(|f| f.name() == name)
     }
 }
 

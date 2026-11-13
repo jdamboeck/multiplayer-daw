@@ -28,6 +28,13 @@ tokio.workspace = true
 eframe.workspace = true
 egui.workspace = true
 chrono.workspace = true
+mdaw-tracktion = { workspace = true, optional = true }
+
+[features]
+# Plays through Tracktion Engine (crates/mdaw-tracktion), which builds native code with CMake and
+# a C++ toolchain. Off by default, so that plain `cargo build` / `cargo test` and CI need neither;
+# `cargo run -p mdaw-client --features tracktion` or `cargo xtask demo --tracktion` turn it on.
+tracktion = ["dep:mdaw-tracktion"]
 
 [dev-dependencies]
 egui_kittest = { workspace = true, features = ["wgpu"] }
@@ -42,3 +49,17 @@ path = "src/lib.rs"
 [[bin]]
 name = "mdaw"
 path = "src/main.rs"
+
+# Drives a session on Tracktion without a window, for the tests of the collaborative slice.
+[[bin]]
+name = "mdaw-slice"
+path = "src/bin/mdaw-slice.rs"
+required-features = ["tracktion"]
+
+[[test]]
+name = "slice"
+required-features = ["tracktion"]
+
+[[test]]
+name = "ui_tracktion"
+required-features = ["tracktion"]

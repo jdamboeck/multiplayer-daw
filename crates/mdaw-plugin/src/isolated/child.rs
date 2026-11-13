@@ -145,6 +145,9 @@ fn handle(running: &mut Option<Running>, request: Request) -> Reply {
         // Another format is another backend here, beside CLAP.
         match format {
             PluginFormat::Clap => {}
+            PluginFormat::Vst3 | PluginFormat::Lv2 => {
+                return error(format!("{} plugins are not hosted here", format.name()));
+            }
         }
         let builtin = file.is_none();
         let mut backend = ClapBackend::files(file.map(PathBuf::from).into_iter().collect(), builtin);

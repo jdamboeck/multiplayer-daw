@@ -33,7 +33,7 @@
 extern "C" {
 #endif
 
-#define MDAW_ABI_VERSION 3
+#define MDAW_ABI_VERSION 4
 #define MDAW_TICKS_PER_QUARTER 960
 
 typedef struct mdaw_engine mdaw_engine;
@@ -109,6 +109,16 @@ mdaw_status mdaw_track_move(mdaw_engine* engine, uint64_t track, uint64_t after_
 mdaw_status mdaw_track_set_name(mdaw_engine* engine, uint64_t track, const char* name);
 mdaw_status mdaw_track_set_mix(mdaw_engine* engine, uint64_t track,
                                float gain /* linear */, float pan /* -1..1 */, int32_t mute);
+
+/* Plays a note on the track's devices at once, as a key on a keyboard does: heard while the
+ * transport stands and while it plays, never part of the project and never recorded by the
+ * engine. velocity 1..127 starts the note, 0 ends it (pitch over 127, velocity over 127:
+ * MDAW_ERR_ARGUMENT). This call does not wait for the engine's thread: the note is handed over
+ * and the call returns at once, also while another call is being carried out (it is played when
+ * that one is done). Notes are played in the order they were given, after the calls made
+ * before them. A track the engine does not have, or no open audio device: nothing is heard,
+ * and the call still returns MDAW_OK. */
+mdaw_status mdaw_track_live_note(mdaw_engine* engine, uint64_t track, uint8_t pitch, uint8_t velocity);
 
 /* MIDI clips. */
 mdaw_status mdaw_clip_add(mdaw_engine* engine, uint64_t track, uint64_t clip,
@@ -207,6 +217,13 @@ typedef struct mdaw_engine_state {
     int32_t xruns;            /* since the device was opened */
     float cpu;                /* 0..1 */
     float peak_left, peak_right; /* master output since the last call, linear */
+    /* ABI 4. How long ago position_tick and position_seconds were taken (they are refreshed
+     * about 30 times a second). */
+    double position_age_seconds;
+    /* ABI 4. From the position being processed to its sound leaving the device: the device's
+     * output latency and one block; 0 without an open device. So position_tick is heard
+     * output_latency_seconds - position_age_seconds from now. */
+    double output_latency_seconds;
 } mdaw_engine_state;
 /* Cheap; meant to be called every UI frame. Reads atomics, does not wait for the message thread. */
 void mdaw_engine_state_read(mdaw_engine* engine, mdaw_engine_state* out);

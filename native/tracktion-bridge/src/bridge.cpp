@@ -236,6 +236,24 @@ mdaw_status mdaw_track_set_mix (mdaw_engine* engine, uint64_t track, float gain,
     return onEngine (engine, [&] (Project& p) { p.trackSetMix (track, gain, pan, mute != 0); });
 }
 
+mdaw_status mdaw_track_live_note (mdaw_engine* engine, uint64_t track, uint8_t pitch, uint8_t velocity)
+{
+    return guarded ([&]
+    {
+        if (engine == nullptr) argumentError ("engine is NULL");
+        if (pitch > 127 || velocity > 127) argumentError ("pitch and velocity must be 0..127");
+        // Not through call(): a note must not wait for, nor make its caller wait for, a call in
+        // progress on another thread. The project outlives every message posted while it lives
+        // (it is deleted after the dispatch loop has ended).
+        if (! engine->thread.post ([engine, track, pitch, velocity]
+                                   {
+                                       if (engine->project != nullptr)
+                                           engine->project->trackLiveNote (track, pitch, velocity);
+                                   }))
+            throw Failure (MDAW_ERR_INTERNAL, "the engine's message thread is not running");
+    });
+}
+
 mdaw_status mdaw_clip_add (mdaw_engine* engine, uint64_t track, uint64_t clip, int64_t start_tick, int64_t length_ticks, const char* name)
 {
     return onEngine (engine, [&] (Project& p) { p.clipAdd (track, clip, start_tick, length_ticks, text (name)); });
@@ -420,6 +438,9 @@ void mdaw_engine_state_read (mdaw_engine* engine, mdaw_engine_state* out)
     out->cpu = s.cpu.load();
     out->peak_left = s.peakLeft.exchange (0.0f);
     out->peak_right = s.peakRight.exchange (0.0f);
+    out->output_latency_seconds = s.outputLatency.load();
+    const auto takenAt = s.positionTakenAt.load();
+    out->position_age_seconds = takenAt > 0.0 ? juce::jmax (0.0, (juce::Time::getMillisecondCounterHiRes() - takenAt) / 1000.0) : 0.0;
 }
 
 size_t mdaw_audio_devices (mdaw_engine* engine, char* buffer, size_t capacity)

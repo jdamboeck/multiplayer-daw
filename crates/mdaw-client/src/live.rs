@@ -11,9 +11,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use mdaw_engine::clock;
 use mdaw_engine::midi::{self, MidiDevice, MidiMsg};
-use mdaw_engine::{LiveInput, clock};
 use mdaw_model::TrackId;
+
+use crate::audio::LiveSink;
 
 /// Engine keys of this player's notes: the pitch is added.
 const OWN_KEY: u64 = 1 << 40;
@@ -32,7 +34,7 @@ pub struct Played {
 #[derive(Clone)]
 pub struct Live {
     state: Arc<Mutex<State>>,
-    engine: LiveInput,
+    engine: Arc<dyn LiveSink>,
 }
 
 #[derive(Default)]
@@ -47,7 +49,7 @@ struct State {
 }
 
 impl Live {
-    pub fn new(engine: LiveInput) -> Self {
+    pub fn new(engine: Arc<dyn LiveSink>) -> Self {
         Self {
             state: Arc::default(),
             engine,
@@ -104,7 +106,7 @@ impl Live {
             return;
         };
         let now = clock::now_micros();
-        self.engine.note_off(track, OWN_KEY | pitch as u64);
+        self.engine.note_off(track, OWN_KEY | pitch as u64, pitch);
         state.capture(now, track, pitch, 0);
     }
 

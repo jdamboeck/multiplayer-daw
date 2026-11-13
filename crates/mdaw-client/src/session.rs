@@ -1,18 +1,16 @@
 //! One editing session: the replica, the thing that orders its edits, and the audio engine.
 //!
 //! Playback is this client's own: play, stop, seek and loop act on the local engine and nothing
-//! about them goes over the network.
+//! about them goes over the network. The engine is whatever stands behind [`Audio`].
 
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use mdaw_dsp::pocket;
-use mdaw_engine::{Engine, clock};
+use mdaw_engine::clock;
 use mdaw_model::{
     ActorId, BlobHash, BuiltinKind, Device, DeviceId, DeviceKind, EntityRef, IdGen, Op, Project, TempoMap,
     TempoPoint, Tick, TickRange, TrackContent, TrackId, TrackShell, UserId, apply, apply_all,
@@ -21,12 +19,14 @@ use mdaw_net::JoinInfo;
 use mdaw_proto::{ClientMsg, Event, Peer, Presence, ServerMsg, Superseded, SyncData, Txn, TxnId, Welcome};
 use mdaw_sync::{Gesture, Loopback, Replica};
 
+use crate::audio::{Audio, DeviceStatus, ParamEntry, PluginEntry, TrackSound};
+use crate::audio_old::OldAudio;
 use crate::link::{Link, LinkEvent, Upload, Waker, Who};
 use crate::live::Live;
 use crate::outbox::{self, Outbox};
-use crate::plugins::{self, Plugins, TrackSound};
 use crate::record::{Take, take_ops};
 use crate::theme;
+use crate::ui::piano_roll::PREVIEW_KEY;
 
 /// Actor that owns the IDs of the starter project, so they cannot collide with the user's.
 const TEMPLATE_ACTOR: ActorId = ActorId(0);
@@ -43,11 +43,6 @@ const PRESENCE_REFRESH: Duration = Duration::from_millis(500);
 const PRESENCE_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_DISPLACED: usize = 500;
 const MAX_NOTICES: usize = 4;
-/// How often the main loop runs at least while a plugin's own window is open: plugins draw from
-/// their timers, which run only then.
-const PLUGIN_WINDOW_PACE: Duration = Duration::from_millis(10);
-/// How often it runs at least while plugins run without a window, for the callbacks they ask for.
-const PLUGIN_PACE: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Status {
@@ -75,7 +70,7 @@ pub struct Displaced {
 pub struct Session {
     replica: Replica,
     backend: Backend,
-    engine: Engine,
+    audio: Box<dyn Audio>,
     gesture_seq: u64,
     user: UserId,
     /// What this user is dragging right now, for the others to see.
@@ -102,9 +97,6 @@ pub struct Session {
     recording: bool,
     /// The notes of the current run of the transport, while recording.
     take: Take,
-    plugins: plugins::Shared,
-    /// When the plugins' settings were last looked at for changes.
-    plugins_saved_at: Instant,
     /// Saves of one plugin's settings, one after the other, are one undo step.
     plugin_gestures: HashMap<(TrackId, DeviceId), Gesture>,
 }
@@ -132,17 +124,17 @@ struct Remote {
 
 impl Session {
     /// A local session on `project`. Edits are ordered by an in-process loopback.
-    pub fn local(project: Project, engine: Engine) -> Self {
+    pub fn local(project: Project, audio: impl Into<Box<dyn Audio>>) -> Self {
         Self::new(
             Replica::new(LOCAL_ACTOR, project, 0),
             Backend::Local(Loopback::new(0, LOCAL_USER)),
             LOCAL_USER,
-            engine,
+            audio.into(),
         )
     }
 
     /// A local session on a new project with one instrument track.
-    pub fn starter(engine: Engine) -> Self {
+    pub fn starter(audio: impl Into<Box<dyn Audio>>) -> Self {
         let mut ids = IdGen::new(TEMPLATE_ACTOR);
         let mut project = Project::default();
         let tempo = TempoPoint {
@@ -159,15 +151,15 @@ impl Session {
                 new_track(&mut ids, 0, None),
             ],
         );
-        Self::local(project, engine)
+        Self::local(project, audio)
     }
 
     /// Joins the project a server holds. Waits until the project has arrived.
     ///
     /// `waker` is called from another thread whenever [`Session::frame`] has something to do.
     /// Edits not yet confirmed live only in memory: see [`Session::join_with_outbox`].
-    pub fn join(join: JoinInfo, who: Who, engine: Engine, waker: Waker) -> Result<Self> {
-        Self::join_inner(join, who, None, engine, waker)
+    pub fn join(join: JoinInfo, who: Who, audio: impl Into<Box<dyn Audio>>, waker: Waker) -> Result<Self> {
+        Self::join_inner(join, who, None, audio.into(), waker)
     }
 
     /// Joins like [`Session::join`], keeping edits the server has not confirmed in `outbox`, a
@@ -177,17 +169,17 @@ impl Session {
         join: JoinInfo,
         who: Who,
         outbox: &Path,
-        engine: Engine,
+        audio: impl Into<Box<dyn Audio>>,
         waker: Waker,
     ) -> Result<Self> {
-        Self::join_inner(join, who, Some(outbox), engine, waker)
+        Self::join_inner(join, who, Some(outbox), audio.into(), waker)
     }
 
     fn join_inner(
         join: JoinInfo,
         who: Who,
         outbox: Option<&Path>,
-        engine: Engine,
+        audio: Box<dyn Audio>,
         waker: Waker,
     ) -> Result<Self> {
         let outbox = outbox.map(Outbox::open).transpose()?;
@@ -238,8 +230,9 @@ impl Session {
             Replica::new(actor, project, head_seq),
             Backend::Remote(Box::new(remote)),
             user,
-            engine,
+            audio,
         );
+        session.audio.set_waker(waker.clone());
         session.waker = Some(waker);
         session.absorb_history(history);
         if let Some((outbox, saved)) = outbox {
@@ -255,19 +248,17 @@ impl Session {
             session.uploads = saved.blobs;
             session.outgoing = session.replica.pending().cloned().collect();
             session.flush_outgoing();
-            session.engine.set_project(session.replica.view());
+            session.audio.set_project(session.replica.view());
         }
         Ok(session)
     }
 
-    fn new(replica: Replica, backend: Backend, user: UserId, mut engine: Engine) -> Self {
-        let live = Live::new(engine.live_input());
-        let plugins = plugins::Shared(Rc::new(RefCell::new(Plugins::new(engine.sample_rate()))));
-        engine.set_plugins(Box::new(plugins.clone()));
+    fn new(replica: Replica, backend: Backend, user: UserId, audio: Box<dyn Audio>) -> Self {
+        let live = Live::new(audio.live());
         let mut session = Self {
             replica,
             backend,
-            engine,
+            audio,
             gesture_seq: 0,
             user,
             editing: None,
@@ -283,12 +274,10 @@ impl Session {
             live,
             recording: false,
             take: Take::default(),
-            plugins,
-            plugins_saved_at: Instant::now(),
             plugin_gestures: HashMap::new(),
         };
         session.tempo = session.replica.view().tempo_map();
-        session.engine.set_project(session.replica.view());
+        session.audio.set_project(session.replica.view());
         session
     }
 
@@ -300,12 +289,43 @@ impl Session {
         self.replica.ids()
     }
 
-    pub fn engine(&self) -> &Engine {
-        &self.engine
+    /// The sound engine.
+    pub fn audio(&self) -> &dyn Audio {
+        self.audio.as_ref()
     }
 
-    pub fn engine_mut(&mut self) -> &mut Engine {
-        &mut self.engine
+    pub fn audio_mut(&mut self) -> &mut dyn Audio {
+        self.audio.as_mut()
+    }
+
+    /// The Rust engine, when the session runs on it (tests that drive a manual engine). Panics
+    /// on any other engine.
+    pub fn engine(&self) -> &mdaw_engine::Engine {
+        self.old_audio()
+            .expect("this session does not run on the Rust engine")
+            .engine()
+    }
+
+    /// See [`Session::engine`].
+    pub fn engine_mut(&mut self) -> &mut mdaw_engine::Engine {
+        self.audio
+            .as_any_mut()
+            .downcast_mut::<OldAudio>()
+            .expect("this session does not run on the Rust engine")
+            .engine_mut()
+    }
+
+    fn old_audio(&self) -> Option<&OldAudio> {
+        self.audio.as_any().downcast_ref::<OldAudio>()
+    }
+
+    /// Starts auditioning a note on `track` (the piano roll does, while a key is held).
+    pub fn preview_on(&mut self, track: TrackId, pitch: u8, vel: u8) {
+        self.audio.live().note_on(track, PREVIEW_KEY, pitch, vel);
+    }
+
+    pub fn preview_off(&mut self, track: TrackId, pitch: u8) {
+        self.audio.live().note_off(track, PREVIEW_KEY, pitch);
     }
 
     /// Applies one user gesture as one undo step. Returns false if it changed nothing.
@@ -369,42 +389,58 @@ impl Session {
         self.receive();
         self.keep_outbox();
         self.share_presence();
-        self.engine.set_project(self.replica.view());
+        self.audio.set_project(self.replica.view());
         self.tempo = self.replica.view().tempo_map();
-        self.engine.tick();
+        let told = self.audio.frame(self.replica.view());
+        for text in told {
+            notice(&mut self.notices, &text);
+        }
         self.keep_plugins();
         self.record();
     }
 
-    /// Hosts plugins from now on: tracks whose plugins are installed here are heard. Without
-    /// this, every track with plugins is silent.
+    /// Hosts plugins from now on, on the Rust engine: tracks whose plugins are installed here
+    /// are heard. Without this, every track with plugins is silent. Other engines find their
+    /// plugins themselves; for them this does nothing.
     pub fn enable_plugins(&mut self, host: mdaw_plugin::Host) {
-        let mut plugins = self.plugins.0.borrow_mut();
-        plugins.set_host(Some(host));
-        if let Some(waker) = &self.waker {
-            plugins.set_waker(waker.clone());
+        if let Some(old) = self.audio.as_any_mut().downcast_mut::<OldAudio>() {
+            old.enable_plugins(host);
         }
-        drop(plugins);
-        self.engine.refresh();
     }
 
     pub fn plugins_enabled(&self) -> bool {
-        self.plugins.0.borrow().has_host()
+        self.audio.plugins_enabled()
+    }
+
+    /// Whether the plugins on this machine are being looked for.
+    pub fn scanning_plugins(&self) -> bool {
+        self.audio.scanning_plugins()
     }
 
     /// The plugins installed here.
-    pub fn plugin_catalog(&self) -> Vec<mdaw_plugin::PluginInfo> {
-        self.plugins.0.borrow().catalog().to_vec()
+    pub fn plugin_catalog(&self) -> Vec<PluginEntry> {
+        self.audio.plugin_catalog()
     }
 
     /// The name of a plugin if it is installed here.
     pub fn plugin_name(&self, format: mdaw_model::PluginFormat, id: &str) -> Option<String> {
-        Some(self.plugins.0.borrow().installed(format, id)?.name.clone())
+        Some(self.audio.installed(format, id)?.name)
     }
 
     /// How a track is heard here: from its devices or its plugins, or not at all.
     pub fn track_sound(&self, track: TrackId) -> TrackSound {
-        self.plugins.0.borrow().sound(self.replica.view(), track)
+        self.audio.track_sound(self.replica.view(), track)
+    }
+
+    /// How a device is doing here.
+    pub fn device_status(&self, track: TrackId, device: DeviceId) -> DeviceStatus {
+        self.audio.device_status(self.replica.view(), track, device)
+    }
+
+    /// Renders ticks `[from, to)` of the project as this client hears it, to a wav file.
+    pub fn render(&mut self, path: &Path, from: Tick, to: Tick) -> Result<(), String> {
+        self.audio.set_project(self.replica.view());
+        self.audio.render(path, from, to)
     }
 
     /// Whether a device makes its track's sound, as opposed to changing it. A plugin that is not
@@ -412,12 +448,9 @@ impl Session {
     fn is_instrument(&self, device: &mdaw_model::Device) -> bool {
         match &device.kind {
             DeviceKind::Builtin { .. } => true,
-            DeviceKind::Plugin { format, id, .. } => self
-                .plugins
-                .0
-                .borrow()
-                .installed(*format, id)
-                .is_none_or(|p| p.instrument),
+            DeviceKind::Plugin { format, id, .. } => {
+                self.audio.installed(*format, id).is_none_or(|p| p.instrument)
+            }
         }
     }
 
@@ -442,7 +475,7 @@ impl Session {
 
     /// Puts a plugin on a track: an instrument in place of the track's instrument, an effect at
     /// the end.
-    pub fn add_plugin(&mut self, track: TrackId, plugin: &mdaw_plugin::PluginInfo) -> bool {
+    pub fn add_plugin(&mut self, track: TrackId, plugin: &PluginEntry) -> bool {
         let device = mdaw_model::Device::new(
             self.replica.ids().device(),
             DeviceKind::Plugin {
@@ -478,127 +511,109 @@ impl Session {
     pub fn plugin_params(
         &mut self,
         track: TrackId,
-        device: mdaw_model::DeviceId,
+        device: DeviceId,
         limit: usize,
-    ) -> Option<(Vec<mdaw_plugin::ParamInfo>, usize)> {
-        self.plugins.0.borrow_mut().params(track, device, limit)
+    ) -> Option<(Vec<ParamEntry>, usize)> {
+        self.audio.plugin_params(track, device, limit)
     }
 
     /// Gives running plugins what they expect from the main loop: their timers, the callbacks
     /// they asked for, their windows' events. Call as often as possible, also between frames
     /// and while the window is hidden; [`Session::frame`] does it too.
     pub fn pump_plugins(&mut self) {
-        let crashed = self.plugins.0.borrow_mut().idle();
-        for ((track, device), what) in crashed {
-            // Its processor is dead: the next graph does without it, and the track is silent.
-            self.engine.forget(track, device);
-            let text = format!(
-                "{what} Its track is silent here until it is restarted; Restart is in the Device tab."
-            );
+        for text in self.audio.pump() {
             notice(&mut self.notices, &text);
-        }
-        if self.plugins.0.borrow_mut().take_dirty() {
-            self.engine.refresh();
         }
     }
 
-    /// Whether a plugin device crashed and waits to be restarted.
-    pub fn plugin_crashed(&self, track: TrackId, device: mdaw_model::DeviceId) -> bool {
-        self.plugins.0.borrow().crashed(track, device)
+    /// Whether a plugin device crashed or failed, and waits to be restarted.
+    pub fn plugin_crashed(&self, track: TrackId, device: DeviceId) -> bool {
+        matches!(self.device_status(track, device), DeviceStatus::Failed(_))
     }
 
     /// Starts a crashed plugin again, with its last settings.
-    pub fn restart_plugin(&mut self, track: TrackId, device: mdaw_model::DeviceId) {
-        self.plugins.0.borrow_mut().restart(track, device);
-        self.engine.forget(track, device);
-        self.engine.refresh();
+    pub fn restart_plugin(&mut self, track: TrackId, device: DeviceId) {
+        self.audio.restart_plugin(track, device);
     }
 
-    /// Sets a parameter of a plugin running here. The plugin's state changes, and reaches the
-    /// document with the next save of its settings.
-    pub fn set_plugin_param(&mut self, track: TrackId, device: mdaw_model::DeviceId, param: u32, value: f64) {
-        self.plugins.0.borrow_mut().set_param(track, device, param, value);
+    /// Sets a parameter of a plugin running here (`value` in the units of [`ParamEntry::value`]).
+    /// The plugin's state changes, and reaches the document with the next save of its settings.
+    pub fn set_plugin_param(
+        &mut self,
+        track: TrackId,
+        device: DeviceId,
+        param: impl std::fmt::Display,
+        value: f64,
+    ) {
+        self.audio
+            .set_plugin_param(track, device, &param.to_string(), value);
     }
 
     /// Opens or closes a plugin's own window.
-    pub fn toggle_plugin_editor(&mut self, track: TrackId, device: mdaw_model::DeviceId) {
+    pub fn toggle_plugin_editor(&mut self, track: TrackId, device: DeviceId) {
         let title = self
             .replica
             .view()
             .track(track)
             .map(|t| t.shell.name.clone())
             .unwrap_or_default();
-        let mut plugins = self.plugins.0.borrow_mut();
-        let Some(instance) = plugins.instance(track, device) else {
-            return;
-        };
-        if instance.editor_open() {
-            instance.close_editor();
-        } else {
-            let title = format!("{} - {title}", instance.info().name);
-            if let Err(err) = instance.open_editor(&title) {
-                drop(plugins);
-                notice(
-                    &mut self.notices,
-                    &format!("The plugin's window did not open: {err}."),
-                );
-            }
+        if let Err(err) = self.audio.toggle_editor(track, device, &title) {
+            notice(
+                &mut self.notices,
+                &format!("The plugin's window did not open: {err}."),
+            );
         }
     }
 
-    pub fn plugin_editor_open(&self, track: TrackId, device: mdaw_model::DeviceId) -> bool {
-        self.plugins
-            .0
-            .borrow_mut()
-            .instance(track, device)
-            .is_some_and(|i| i.editor_open())
+    pub fn plugin_editor_open(&self, track: TrackId, device: DeviceId) -> bool {
+        self.audio.editor_open(track, device)
     }
 
     /// Whether a plugin running here has a window of its own.
-    pub fn plugin_has_editor(&self, track: TrackId, device: mdaw_model::DeviceId) -> bool {
-        self.plugins
-            .0
-            .borrow_mut()
-            .instance(track, device)
-            .is_some_and(|i| i.has_editor())
+    pub fn plugin_has_editor(&self, track: TrackId, device: DeviceId) -> bool {
+        self.audio.has_editor(track, device)
     }
 
     /// Whether a plugin device runs here.
-    pub fn plugin_running(&self, track: TrackId, device: mdaw_model::DeviceId) -> bool {
-        self.plugins.0.borrow_mut().instance(track, device).is_some()
+    pub fn plugin_running(&self, track: TrackId, device: DeviceId) -> bool {
+        self.device_status(track, device) == DeviceStatus::Running
     }
 
-    /// Keeps the plugins in step with the document, fetches the state blobs they need, and puts
-    /// the settings of plugins changed here into the document.
+    /// Fetches the state blobs the engine needs, and puts the settings of plugins changed here
+    /// into the document.
     fn keep_plugins(&mut self) {
-        let renew = self.plugins.0.borrow_mut().follow(self.replica.view());
-        for &(track, device) in &renew {
-            self.engine.forget(track, device);
-        }
-        self.pump_plugins();
         if let Backend::Remote(remote) = &self.backend
             && remote.status == Status::Online
         {
-            let wanted = self.plugins.0.borrow_mut().take_wanted(&self.fetching);
+            let wanted = self.audio.wanted_blobs(&self.fetching);
             for hash in wanted {
                 self.fetching.insert(hash);
                 remote.link.get(hash);
             }
         }
-        if self.plugins.0.borrow_mut().take_dirty() || !renew.is_empty() {
-            self.engine.refresh();
-        }
-        if self.plugins_saved_at.elapsed() >= plugins::SAVE_EVERY {
-            self.plugins_saved_at = Instant::now();
-            self.save_plugin_states();
-        }
+        self.put_plugin_states(false);
     }
 
     /// Saves the settings of plugins that changed here, uploads them and records them in the
     /// document. The edit goes to the server once the upload has arrived.
     pub fn save_plugin_states(&mut self) {
-        let saved = self.plugins.0.borrow_mut().save_changed();
+        self.put_plugin_states(true);
+    }
+
+    fn put_plugin_states(&mut self, now: bool) {
+        let saved = self.audio.changed_states(self.replica.view(), now);
         for ((track, id), (hash, bytes)) in saved {
+            // Only what the document does not hold already: a state that came from elsewhere
+            // and was just applied is not sent back.
+            let held = self
+                .replica
+                .view()
+                .track(track)
+                .and_then(|t| t.content.device(id))
+                .is_some_and(|d| matches!(d.kind, DeviceKind::Plugin { state: Some(s), .. } if s == hash));
+            if held {
+                continue;
+            }
             self.put_blob(hash, bytes);
             let gesture = match self.plugin_gestures.get(&(track, id)) {
                 Some(gesture) => *gesture,
@@ -746,11 +761,11 @@ impl Session {
     /// Where the transport was, or is, at `micros` on [`clock::now_micros`]. `None` unless it
     /// runs then.
     fn tick_at(&self, micros: i64) -> Option<f64> {
-        if !self.engine.is_playing() {
+        if !self.audio.is_playing() {
             return None;
         }
         // From where the playhead was at the time it was heard.
-        let (tick, heard_at) = self.engine.position_heard();
+        let (tick, heard_at) = self.audio.position_heard();
         let since = (micros - heard_at) as f64 / 1e6;
         let then = self.tempo.tick_to_seconds(tick) + since;
         Some(self.tempo.seconds_to_tick(then.max(0.0)))
@@ -758,12 +773,12 @@ impl Session {
 
     /// Whether this client's transport is playing.
     pub fn is_playing(&self) -> bool {
-        self.engine.is_playing()
+        self.audio.is_playing()
     }
 
     /// The playhead in ticks.
     pub fn position(&self) -> f64 {
-        self.engine.position()
+        self.audio.position()
     }
 
     /// The loop region, if looping is on.
@@ -772,23 +787,23 @@ impl Session {
     }
 
     pub fn play(&mut self) {
-        self.engine.play();
+        self.audio.play();
     }
 
     /// Stops where the playhead is.
     pub fn pause(&mut self) {
-        self.engine.stop();
+        self.audio.stop();
     }
 
     pub fn seek(&mut self, tick: Tick) {
-        self.engine.seek(tick);
+        self.audio.seek(tick);
     }
 
     /// Sets the loop region, or turns looping off.
     pub fn set_loop(&mut self, range: Option<TickRange>) {
         let range = range.filter(|range| !range.is_empty());
         self.loop_range = range;
-        self.engine.set_loop(range);
+        self.audio.set_loop(range);
     }
 
     pub fn status(&self) -> Status {
@@ -885,13 +900,7 @@ impl Session {
     /// When the screen has to be drawn again although nothing arrives: soft locks run out and
     /// presence wants repeating.
     pub fn next_frame_in(&self) -> Option<Duration> {
-        // Plugins live on this thread: their windows, timers and callbacks run only when it
-        // does, also while nothing changes in this window.
-        let plugins = match self.plugins.0.borrow().activity() {
-            (_, true) => Some(PLUGIN_WINDOW_PACE),
-            (true, false) => Some(PLUGIN_PACE),
-            _ => None,
-        };
+        let plugins = self.audio.next_frame_in();
         let others = self.others_next_frame_in();
         // Edits written to the outbox go to the disk on a later frame.
         let outbox = self
@@ -972,7 +981,7 @@ impl Session {
                 }
             }
         }
-        self.engine.set_project(self.replica.view());
+        self.audio.set_project(self.replica.view());
         true
     }
 
@@ -1047,12 +1056,7 @@ impl Session {
                 },
                 LinkEvent::Fetched { hash, bytes } => {
                     self.fetching.remove(&hash);
-                    let mut plugins = self.plugins.0.borrow_mut();
-                    match bytes {
-                        Some(bytes) if plugins.wanted(&hash) => plugins.add_state(hash, bytes),
-                        Some(_) => {}
-                        None => plugins.give_up(&hash),
-                    }
+                    self.audio.blob_arrived(hash, bytes);
                 }
                 LinkEvent::Msg(ServerMsg::Rejected { txn, reason }) => {
                     // Refused again after a restart of this client, it was taken back before.

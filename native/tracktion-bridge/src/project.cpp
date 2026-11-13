@@ -575,6 +575,23 @@ void Project::trackSetMix (uint64_t id, float gain, float pan, bool mute)
     t->setMute (mute);
 }
 
+// Tracktion puts a LiveMidiInjectingNode on every audio track's path (createNodeForAudioTrack:
+// the clips node exists even for a track without clips), so the note reaches the track's
+// devices with the next block, whether the transport plays or not. The track's listener list is
+// not thread-safe, hence the message thread. Without a playback context nobody listens and the
+// note is dropped.
+void Project::trackLiveNote (uint64_t id, int pitch, int velocity)
+{
+    if (edit == nullptr)
+        return;
+    auto* t = track (id);
+    if (t == nullptr)
+        return;
+    const auto message = velocity > 0 ? juce::MidiMessage::noteOn (1, pitch, (juce::uint8) velocity)
+                                      : juce::MidiMessage::noteOff (1, pitch);
+    t->injectLiveMidiMessage (message, {});
+}
+
 //==============================================================================
 void Project::clipAdd (uint64_t trackId, uint64_t id, int64_t start, int64_t length, const juce::String& name)
 {
@@ -1308,6 +1325,7 @@ void Project::seek (int64_t tick)
     seekPending = ! deviceRuns();
     shared.positionTick = tick;
     shared.positionSeconds = t.inSeconds();
+    shared.positionTakenAt = juce::Time::getMillisecondCounterHiRes();
 }
 
 void Project::setLoop (int64_t start, int64_t end)
@@ -1478,6 +1496,8 @@ void Project::updateDeviceState()
     shared.blockSize = open ? dev->getCurrentBufferSizeSamples() : 0;
     shared.xruns = open ? juce::jmax (0, dev->getXRunCount() - xrunBase) : 0;
     shared.cpu = open ? (float) dm.getCpuUsage() : 0.0f;
+    const double rate = open ? dev->getCurrentSampleRate() : 0.0;
+    shared.outputLatency = rate > 0.0 ? (dev->getOutputLatencyInSamples() + dev->getCurrentBufferSizeSamples()) / rate : 0.0;
 }
 
 void Project::updateMeter()
@@ -1540,6 +1560,12 @@ void Project::timerCallback()
         return;
     auto& transport = edit->getTransport();
 
+    // With a device, the edit is always processed, also while the transport stands, so that
+    // live notes (mdaw_track_live_note) are heard and the meter moves. Tracktion makes the
+    // playback context only on play, and drops it when the devices change.
+    if (deviceRuns() && ! edit->isRendering() && edit->getCurrentPlaybackContext() == nullptr)
+        transport.ensureContextAllocated();
+
     // Tracktion stops the transport whenever the device list changes; the application did not
     // ask for that, so playback is started again.
     startTransportIfWanted();
@@ -1556,6 +1582,7 @@ void Project::timerCallback()
         shared.positionSeconds = timeOf (offlinePosition).inSeconds();
         shared.positionTick = offlinePosition;
     }
+    shared.positionTakenAt = juce::Time::getMillisecondCounterHiRes();
     updateMeter();
 
     // The audio callback has stopped returning when the playhead stands still while playing.

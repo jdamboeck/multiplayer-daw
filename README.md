@@ -39,7 +39,8 @@ included, is an ordinary transaction; each client plays the project on its own; 
 without a plugin hears nothing from that track and says so.
 
 **In progress** (branch `tracktion-integration`): moving local audio to Tracktion Engine. So far
-a native spike under `native/`, a C bridge with its Rust side, and the documents above.
+a native spike under `native/`, a C bridge with its Rust side, the documents above, and the
+client on Tracktion behind the `tracktion` feature (see "Run").
 
 ## Native build (Tracktion spike)
 
@@ -69,6 +70,20 @@ cargo run -p mdaw-client      # a local project; falls back to a silent engine i
 cargo xtask demo              # a server and two clients (Ann, Ben) on this machine
 cargo test --workspace --exclude mdaw-tracktion --exclude mdaw-tracktion-sys
 ```
+
+The client plays through the Rust engine unless it is built with the `tracktion` feature, which
+needs the native build above (`cargo` runs it; the first time takes about ten minutes):
+
+```sh
+cargo run -p mdaw-client --features tracktion          # Tracktion Engine on the default device
+cargo run -p mdaw-client --features tracktion -- --old-engine   # same build, Rust engine, to compare
+cargo xtask demo --tracktion                           # server and two clients on Tracktion
+cargo test -p mdaw-client --features tracktion         # adds the slice and UI tests on Tracktion
+```
+
+The feature is off by default, so plain `cargo build`, `cargo test` and CI need no C++ toolchain.
+With it, the client hosts VST3, LV2 and CLAP plugins (scanned at startup, in child processes) and
+keeps its engine settings in `<profile>/engine/`.
 
 Double-click an empty lane to create a clip, double-click a clip to edit its notes, Space plays,
 Ctrl+Z undoes.

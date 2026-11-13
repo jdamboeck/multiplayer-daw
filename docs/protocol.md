@@ -1,11 +1,13 @@
 # mdaw protocol
 
-What client and server say to each other, as built. Protocol version **7**. The types live in
+What client and server say to each other, as built. Protocol version **8**. The types live in
 `mdaw-proto` (`lib.rs` for transactions and events, `wire.rs` for messages) and in `mdaw-model`
 (ops); this text explains the rules around them. People share the project — tracks, clips,
 notes, devices, tempo — and nothing else: each client plays it back on its own, and nothing
 about playback travels.
 
+Version 8 adds the plugin formats VST3 and LV2 (`PluginFormat::Vst3`, `PluginFormat::Lv2`);
+nothing else changed, but a version-7 peer could not read a project that uses them.
 Version 7 gives every transaction a random identity the client keeps until it is confirmed, and
 the server a receipt per transaction, so a transaction sent again is never applied twice
 (`Accepted` is new, `Welcome.acked` is gone); events are on disk before anyone hears of them.
@@ -256,7 +258,7 @@ A device can be a plugin installed on the user's machine:
 
 ```
 DeviceKind::Plugin { format: PluginFormat, id: String, state: Option<BlobHash> }
-PluginFormat = Clap            // another format is another variant; nothing else changes
+PluginFormat = Clap | Vst3 | Lv2   // new formats are added at the end
 ```
 
 - **Ordinary edits.** Anyone puts a plugin on any track (`DeviceAdd`), removes it, bypasses it
@@ -265,15 +267,31 @@ PluginFormat = Clap            // another format is another variant; nothing els
   makes sound from notes. Picking another replaces it in the same transaction; plugins that
   change sound (effects) come after it. The client keeps to this; the server does not check it.
 - **State.** The plugin's settings are its own state, an opaque blob; `id` names the plugin
-  within its format. The device's `params` are not used for plugins. Turning a plugin's knobs,
-  in its own window or in the generic controls, changes the running instance; every 2 s the
-  client saves the state of each instance that says it changed or whose window is open, and if
-  the save differs from the one the same instance gave when it was made or last saved, uploads
-  it and submits `DeviceSetState` (which waits for the upload, see "What the client does").
+  within its format (CLAP: plugin id; VST3: class id, 32 hex digits; LV2: URI). The device's
+  `params` are not written by the client for plugins (for CLAP they are applied on top of the
+  state if a document has them). Turning a plugin's knobs, in its own window or in the generic
+  controls, changes the running instance, and its state reaches the document as
+  `DeviceSetState` (which waits for the upload of the blob, see "What the client does"):
+  - On Tracktion Engine (client built with `tracktion`): the engine reports a parameter changed
+    or a preset loaded in the plugin's window; a generic slider marks the device itself. 500 ms
+    after the last change of a device, and at most 2 s after the first, the client reads the
+    plugin's state (without an audio device it first renders a moment, so the plugin has taken
+    the new values) and submits it if its hash differs from the state the document holds. A
+    state that arrives from another client, or from undo, is given to the plugin; the engine does
+    not report that as a change, and the client knows the plugin holds it, so it is not sent
+    back.
+  - On the Rust engine: every 2 s the client saves the state of each instance that says it
+    changed or whose window is open, and submits it if it differs from the one the same instance
+    gave when it was made or last saved.
+
   Successive saves of one plugin are one undo step. Plugins do not always say that their
   settings changed (Vital does not for presets), so a save is compared only with saves of the
   same instance: different instances save the same settings differently.
-- **Hearing a track with plugins.** Each client decides for itself. With every plugin of the
+- **Hearing a track with plugins.** Each client decides for itself. On Tracktion Engine a device
+  whose plugin is missing or does not load is left out and the rest of the track plays (a
+  missing instrument makes the track silent); the header says "plugin not installed" or "plugin
+  crashed", and "loading plugin…" while plugins are still being looked for. The text below is the
+  Rust engine's behaviour. With every plugin of the
   track installed and its state at hand, it runs them, loaded with the document's state.
   Otherwise the whole track is silent on that client, and its header says so: "plugin not
   installed" when a plugin is missing (or the client runs with `--no-plugins`), "no sound here"
@@ -334,9 +352,9 @@ transaction is committed by itself, without grouping several into one commit.
 
 Blobs are files in `blobs/`, named by their hash in hex.
 
-The format entry is `<store version>/<protocol version>`, now `3/7`. A database with another
+The format entry is `<store version>/<protocol version>`, now `4/8`. A database with another
 format is not opened; the prototype has no migrations, so a breaking change means a new data
-directory. In particular, data directories of protocol 6 and earlier are not readable: move them
+directory. In particular, data directories of protocol 7 and earlier are not readable: move them
 away and start a new project.
 
 A client whose outgoing queue reaches 4096 messages is disconnected and resumes later.

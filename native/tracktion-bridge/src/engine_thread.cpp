@@ -92,6 +92,15 @@ std::shared_ptr<EngineThread::Job> EngineThread::post (std::vector<Step> steps, 
     return job;
 }
 
+bool EngineThread::post (Step step)
+{
+    return juce::MessageManager::callAsync ([step = std::move (step)]
+                                            {
+                                                try { step(); }
+                                                catch (...) {}
+                                            });
+}
+
 void EngineThread::startNext()
 {
     if (current != nullptr || waiting.empty())

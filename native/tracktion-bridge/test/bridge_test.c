@@ -385,6 +385,12 @@ static void restartedPluginList (mdaw_engine* e, int haveExternal)
 
 /* -------- the plugin scanner ------------------------------------------------------------ */
 
+static int cmp (const void* a, const void* b)
+{
+    double x = *(const double*) a, y = *(const double*) b;
+    return x < y ? -1 : x > y ? 1 : 0;
+}
+
 static double now (void)
 {
     struct timespec t;
@@ -882,6 +888,50 @@ int main (void)
         mdaw_engine_state_read (e, &st);
         check (st.playing == 0, "stopped");
         check (mdaw_transport_set_loop (e, 0, 4 * Q) == MDAW_OK && mdaw_transport_set_loop (e, 0, 0) == MDAW_OK, "loop_calls");
+        mdaw_engine_state_read (e, &st);
+        measure ("position_age_seconds", st.position_age_seconds);
+        check (st.position_age_seconds >= 0.0 && st.position_age_seconds < 1.0, "position_age");
+        check (st.output_latency_seconds == 0.0, "no_output_latency_without_device");
+    }
+
+    /* 8b. Live notes (ABI 4). A render cannot hear them; without a device they are dropped. What
+     * is checked: the status, that nothing breaks, and the cost of the call next to a call that
+     * waits for the message thread. */
+    {
+        Wav w1 = render (e, "before_live_notes", 0, 8 * Q);
+        check (mdaw_track_live_note (e, TRACK, 60, 100) == MDAW_OK && mdaw_track_live_note (e, TRACK, 60, 0) == MDAW_OK,
+               "live_note_on_off");
+        check (mdaw_track_live_note (e, 999, 60, 100) == MDAW_OK && mdaw_track_live_note (e, 999, 60, 0) == MDAW_OK,
+               "live_note_unknown_track");
+        check (mdaw_track_live_note (e, TRACK, 128, 100) == MDAW_ERR_ARGUMENT && mdaw_track_live_note (e, TRACK, 60, 128) == MDAW_ERR_ARGUMENT
+               && mdaw_track_live_note (NULL, TRACK, 60, 100) == MDAW_ERR_ARGUMENT, "live_note_bad_arguments");
+
+        enum { N = 400 };
+        static double waits[N], notes[N];
+        for (int i = 0; i < N; ++i)
+        {
+            double t0 = now();
+            mdaw_project_has (e, MDAW_ENTITY_TRACK, TRACK);
+            double t1 = now();
+            mdaw_track_live_note (e, TRACK, (uint8_t) (40 + i % 40), (uint8_t) (i % 2 == 0 ? 90 : 0));
+            double t2 = now();
+            waits[i] = t1 - t0;
+            notes[i] = t2 - t1;
+            if (i % 50 == 0) sleepMs (3);
+        }
+        qsort (waits, N, sizeof (double), cmp);
+        qsort (notes, N, sizeof (double), cmp);
+        measure ("blocking_call_round_trip_p50_ms", waits[N / 2] * 1000.0);
+        measure ("blocking_call_round_trip_p99_ms", waits[N * 99 / 100] * 1000.0);
+        measure ("blocking_call_round_trip_max_ms", waits[N - 1] * 1000.0);
+        measure ("live_note_call_p50_ms", notes[N / 2] * 1000.0);
+        measure ("live_note_call_max_ms", notes[N - 1] * 1000.0);
+        check (mdaw_project_has (e, MDAW_ENTITY_TRACK, TRACK) == 1, "engine_fine_after_live_notes");
+        Wav w2 = render (e, "after_live_notes", 0, 8 * Q);
+        check (w1.ok && w2.ok && fabs (peakOf (&w2) - peakOf (&w1)) < 0.5 * peakOf (&w1) + 0.001
+               && fabs (lastAbove (&w2, 0.001) - lastAbove (&w1, 0.001)) < 0.1, "live_notes_leave_the_render_alone");
+        freeWav (&w1);
+        freeWav (&w2);
     }
 
     /* 9. Parameters and state of the built-in synth -------------------------------------- */

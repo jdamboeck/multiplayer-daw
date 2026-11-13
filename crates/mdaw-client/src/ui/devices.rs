@@ -7,7 +7,7 @@ use egui::{
 use mdaw_dsp::pocket::{self, ParamInfo, Scale};
 use mdaw_model::{BuiltinKind, Device, DeviceKind, Op, PluginFormat, TrackId};
 
-use crate::{DawApp, theme};
+use crate::{DawApp, DeviceStatus, PluginEntry, theme};
 
 /// Parameters by section, as indices into `pocket::PARAMS`.
 const SECTIONS: [(&str, &[usize]); 5] = [
@@ -120,10 +120,13 @@ fn plugin_panel(
         return;
     }
     if !running {
-        let why = if app.session.plugin_name(format, id).is_none() {
-            format!("{name} is not installed here, so this track gives no sound on this computer.")
-        } else {
-            "Starting the plugin…".to_string()
+        let why = match app.session.device_status(track, device.id) {
+            DeviceStatus::NotInstalled => {
+                format!("{name} is not installed here, so it gives no sound on this computer.")
+            }
+            DeviceStatus::Failed(why) => format!("{name} did not load: {why}"),
+            DeviceStatus::WaitingForState => format!("{name} waits for its settings."),
+            _ => "Starting the plugin…".to_string(),
         };
         ui.label(RichText::new(why).color(theme::TEXT_DIM));
         return;
@@ -138,12 +141,15 @@ fn plugin_panel(
         .show(ui, |ui| {
             for (index, param) in params.iter().enumerate() {
                 let mut value = param.value;
-                let slider = egui::Slider::new(&mut value, param.min..=param.max)
-                    .show_value(true)
+                let mut slider = egui::Slider::new(&mut value, param.min..=param.max)
+                    .show_value(param.text.is_empty())
                     .step_by(if param.stepped { 1.0 } else { 0.0 })
                     .text(&param.name);
+                if !param.text.is_empty() {
+                    slider = slider.text(format!("{} {}", param.name, param.text));
+                }
                 if ui.add(slider).changed() {
-                    app.session.set_plugin_param(track, device.id, param.id, value);
+                    app.session.set_plugin_param(track, device.id, &param.id, value);
                 }
                 if index % 2 == 1 {
                     ui.end_row();
@@ -162,8 +168,11 @@ fn add_plugin(app: &mut DawApp, ui: &mut Ui, track: TrackId) {
         ui.label(RichText::new("Plugins are switched off in this window.").color(theme::TEXT_DIM));
         return;
     }
+    if app.session.scanning_plugins() {
+        ui.label(RichText::new("Scanning plugins…").color(theme::TEXT_DIM));
+    }
     let catalog = app.session.plugin_catalog();
-    let label = |plugin: &mdaw_plugin::PluginInfo| {
+    let label = |plugin: &PluginEntry| {
         if plugin.vendor.is_empty() {
             format!("{} ({})", plugin.name, plugin.format.name())
         } else {
@@ -173,7 +182,7 @@ fn add_plugin(app: &mut DawApp, ui: &mut Ui, track: TrackId) {
     let (instruments, effects): (Vec<_>, Vec<_>) = catalog.iter().partition(|p| p.instrument);
     enum Pick {
         Pocket,
-        Plugin(mdaw_plugin::PluginInfo),
+        Plugin(PluginEntry),
     }
     let mut pick = None;
     ui.horizontal(|ui| {
