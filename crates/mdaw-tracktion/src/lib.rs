@@ -404,7 +404,10 @@ impl Engine {
         // parent folder at the same moment.
         std::fs::create_dir_all(&config.settings_dir).map_err(|e| Error {
             status: Status::Io,
-            message: format!("cannot create the settings folder {}: {e}", config.settings_dir.display()),
+            message: format!(
+                "cannot create the settings folder {}: {e}",
+                config.settings_dir.display()
+            ),
         })?;
         let settings_dir = c_path(&config.settings_dir)?;
         let backend = config.audio_backend.as_deref().map(c_string).transpose()?;
