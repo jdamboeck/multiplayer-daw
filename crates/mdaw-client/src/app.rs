@@ -50,6 +50,8 @@ pub struct DawApp {
     /// The changelog lists the whole project rather than the selected track.
     pub changelog_all: bool,
     pub live: live::LiveState,
+    /// [`DawApp::logic`] ran the session's frame for the frame being drawn.
+    logic_ran: bool,
 }
 
 impl DawApp {
@@ -72,7 +74,17 @@ impl DawApp {
             editing: None,
             changelog_all: false,
             live: live::LiveState::default(),
+            logic_ran: false,
         }
+    }
+
+    /// The session's share of a frame: what arrived from the server, the engine, plugins'
+    /// settings to save. The window calls this also while it is hidden (on Wayland a window that
+    /// is not shown may get no frames to draw for as long as it stays so), so that the project
+    /// keeps up with the others. [`DawApp::ui`] calls it itself when it was not called before.
+    pub fn logic(&mut self) {
+        self.session.frame();
+        self.logic_ran = true;
     }
 
     /// Starts looking for MIDI inputs, so the user can pick one.
@@ -93,7 +105,9 @@ impl DawApp {
 
     /// Runs one frame.
     pub fn ui(&mut self, ui: &mut egui::Ui) {
-        self.session.frame();
+        if !std::mem::take(&mut self.logic_ran) {
+            self.session.frame();
+        }
         self.drop_stale_selection();
         self.session.live().set_target(live::target(self));
         live::keyboard(self, ui.ctx());
