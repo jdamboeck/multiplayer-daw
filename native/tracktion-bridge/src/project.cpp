@@ -288,8 +288,17 @@ struct Project::Editor : juce::DocumentWindow
 //==============================================================================
 Project::Project (const Config& c, Shared& s) : config (c), shared (s)
 {
-    if (! config.settingsDir.createDirectory())
+    // Two applications starting at once may both try to make a shared parent folder; JUCE
+    // gives up when it comes second there, so try again: by then the parent exists.
+    for (int attempt = 0; attempt < 5 && ! config.settingsDir.isDirectory(); ++attempt)
+        config.settingsDir.createDirectory();
+    if (! config.settingsDir.isDirectory())
         fail (MDAW_ERR_IO, "cannot create the settings folder " + config.settingsDir.getFullPathName());
+
+    // Tracktion logs every device and port it finds; keep that out of the terminal.
+    logFile = std::make_unique<juce::FileLogger> (config.settingsDir.getChildFile ("engine.log"),
+                                                  "mdaw audio engine", 1 << 20);
+    juce::Logger::setCurrentLogger (logFile.get());
 
     engine = std::make_unique<te::Engine> (std::make_unique<Storage> (config.appName, config.settingsDir),
                                            std::make_unique<te::UIBehaviour>(),
@@ -306,6 +315,8 @@ Project::Project (const Config& c, Shared& s) : config (c), shared (s)
     if (config.openDevice)
         openDefaultDevice();
 
+    // So that the state read right after creation already says whether a device is open.
+    updateDeviceState();
     startTimerHz (30);
 }
 
@@ -320,6 +331,7 @@ Project::~Project()
     edit.reset();
     retiring.reset();
     engine.reset();
+    juce::Logger::setCurrentLogger (nullptr);
 }
 
 Project::Steps Project::shutDownSteps()

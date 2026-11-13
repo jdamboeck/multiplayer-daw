@@ -231,6 +231,12 @@ These were all found by running into them.
     not: JUCE builds lilv with that (deprecated) extension on. None are installed here.
 25. **Do not ignore SIGCHLD in the application.** The bridge then cannot tell a scanner crash
     from an empty result.
+26. **`File::createDirectory` fails when another process makes a parent folder at the same
+    moment** (two clients started together on fresh profiles). The bridge retries and the Rust
+    wrapper makes the folder first.
+27. **Tracktion logs every device and port to the terminal.** The bridge sends JUCE's log to
+    `engine.log` in the settings folder. lilv's own warnings ("Duplicate plugin", "Reloading
+    plugin") still go to stderr.
 
 ## The bridge
 

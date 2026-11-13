@@ -400,6 +400,12 @@ impl Engine {
     /// Creates the engine (and its message thread).
     pub fn new(config: Config) -> Result<Engine, Error> {
         let app_name = c_string(&config.app_name)?;
+        // Made here as well as by the engine: this call copes with another process making a
+        // parent folder at the same moment.
+        std::fs::create_dir_all(&config.settings_dir).map_err(|e| Error {
+            status: Status::Io,
+            message: format!("cannot create the settings folder {}: {e}", config.settings_dir.display()),
+        })?;
         let settings_dir = c_path(&config.settings_dir)?;
         let backend = config.audio_backend.as_deref().map(c_string).transpose()?;
         let scanner = config.scanner_path.as_deref().map(c_path).transpose()?;

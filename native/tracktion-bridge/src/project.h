@@ -138,6 +138,9 @@ private:
 
     Config config;
     Shared& shared;
+    /// Where JUCE's and Tracktion's log lines go while the engine lives: a file in the
+    /// settings folder, not the application's terminal.
+    std::unique_ptr<juce::FileLogger> logFile;
     std::unique_ptr<te::Engine> engine;
     std::unique_ptr<te::Edit> edit;
     std::unique_ptr<te::Edit> retiring;   // between the steps that drop an edit
