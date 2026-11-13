@@ -164,14 +164,19 @@ fn plugin_panel(
 
 /// The track's instrument, and effects to add after it.
 fn add_plugin(app: &mut DawApp, ui: &mut Ui, track: TrackId) {
-    if !app.session.plugins_enabled() {
+    // Without plugins the built-in instrument is still there to choose: a track whose plugin
+    // was taken off must be able to get an instrument again.
+    let plugins = app.session.plugins_enabled();
+    if !plugins {
         ui.label(RichText::new("Plugins are switched off in this window.").color(theme::TEXT_DIM));
-        return;
-    }
-    if app.session.scanning_plugins() {
+    } else if app.session.scanning_plugins() {
         ui.label(RichText::new("Scanning plugins…").color(theme::TEXT_DIM));
     }
-    let catalog = app.session.plugin_catalog();
+    let catalog = if plugins {
+        app.session.plugin_catalog()
+    } else {
+        Vec::new()
+    };
     let instruments = by_format(&catalog, true);
     let effects = by_format(&catalog, false);
     enum Pick {

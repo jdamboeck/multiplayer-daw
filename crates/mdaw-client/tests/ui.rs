@@ -748,3 +748,76 @@ fn a_plugin_is_added_from_the_device_tab_and_its_settings_shown() {
         mdaw_model::DeviceKind::Builtin { .. }
     ));
 }
+
+/// A window without plugins (`--no-plugins`): a track whose instrument is a plugin shows it as
+/// not installed; the plugin can be taken off, and the built-in instrument put on again.
+#[test]
+fn without_plugins_a_plugin_comes_off_and_pocket_goes_on() {
+    let session = Session::starter(Engine::manual(48_000, false));
+    let app = DawApp::new(session);
+    let mut h = Harness::builder()
+        .with_size(vec2(1280.0, 800.0))
+        .with_step_dt(1.0 / 60.0)
+        .with_context_setup(DawApp::setup)
+        .build_ui_state(|ui, app: &mut DawApp| app.ui(ui), app);
+    h.run_steps(3);
+    let id = track(&h);
+    let devices = |h: &App| {
+        h.state()
+            .session
+            .project()
+            .track(id)
+            .unwrap()
+            .content
+            .devices
+            .clone()
+    };
+    // Someone else made the track's instrument a plugin this window does not run.
+    let pocket = devices(&h)[0].id;
+    let plugin = mdaw_model::Device::new(
+        h.state_mut().session.ids().device(),
+        mdaw_model::DeviceKind::Plugin {
+            format: mdaw_model::PluginFormat::Clap,
+            id: mdaw_plugin::TEST_SYNTH.into(),
+            state: None,
+        },
+    );
+    let added = h.state_mut().session.edit(vec![
+        mdaw_model::Op::DeviceRemove {
+            track: id,
+            id: pocket,
+        },
+        mdaw_model::Op::DeviceAdd {
+            track: id,
+            device: plugin,
+            after: None,
+        },
+    ]);
+    assert!(added);
+    h.run_steps(2);
+
+    h.get_by_label("Device").click();
+    h.run_steps(2);
+    assert!(
+        h.query_by_label("Plugins are switched off in this window.")
+            .is_some()
+    );
+    let remove = h.get_by_label("Remove").rect().center();
+    click(&mut h, remove);
+    h.run_steps(2);
+    assert!(devices(&h).is_empty(), "the plugin came off");
+
+    // Not locked: the built-in instrument is still on offer.
+    let add = h.get_by_label("Instrument…").rect().center();
+    click(&mut h, add);
+    let pick = h.get_by_label("Pocket (built in)").rect().center();
+    click(&mut h, pick);
+    h.run_steps(2);
+    assert!(
+        matches!(
+            devices(&h).front().map(|d| &d.kind),
+            Some(mdaw_model::DeviceKind::Builtin { .. })
+        ),
+        "the track has the built-in instrument again"
+    );
+}
