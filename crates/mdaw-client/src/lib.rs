@@ -23,5 +23,5 @@ pub mod ui;
 pub use app::{DawApp, Focus, Selection, Tab};
 pub use audio::{Audio, DeviceStatus, ParamEntry, PluginEntry, TrackSound};
 pub use audio_old::OldAudio;
-pub use link::{Upload, Waker, Who};
+pub use link::{Fetched, Fetcher, Upload, Waker, Who};
 pub use session::{Displaced, Session, Status};

@@ -69,6 +69,8 @@ pub struct Displaced {
 
 pub struct Session {
     replica: Replica,
+    /// Dropped before `audio`: downloads the engine asked the link for hold a way back to the
+    /// engine's worker, and the link's end drops them, so the worker can then stop.
     backend: Backend,
     audio: Box<dyn Audio>,
     gesture_seq: u64,
@@ -233,6 +235,9 @@ impl Session {
             audio,
         );
         session.audio.set_waker(waker.clone());
+        if let Backend::Remote(remote) = &session.backend {
+            session.audio.set_fetcher(remote.link.fetcher());
+        }
         session.waker = Some(waker);
         session.absorb_history(history);
         if let Some((outbox, saved)) = outbox {

@@ -39,6 +39,9 @@ use mdaw_net::JoinInfo;
 const WAIT: Duration = Duration::from_secs(60);
 
 struct Args {
+    /// How long the driver waits between frames while it has no command: 5 ms, or longer to
+    /// play a window that the compositor does not draw (eframe then runs its logic every 250 ms).
+    frame_every: Duration,
     join: JoinInfo,
     name: String,
     profile: PathBuf,
@@ -51,6 +54,7 @@ fn parse() -> Result<Args, String> {
     let mut args = std::env::args().skip(1);
     let (mut join, mut name, mut profile) = (None, None, None);
     let (mut plugins, mut device, mut scan) = (true, false, vec![PluginFormat::Clap]);
+    let mut frame_every = Duration::from_millis(5);
     while let Some(arg) = args.next() {
         let mut value = || args.next().ok_or_else(|| format!("{arg} needs a value"));
         match arg.as_str() {
@@ -59,6 +63,10 @@ fn parse() -> Result<Args, String> {
             "--profile" => profile = Some(PathBuf::from(value()?)),
             "--no-plugins" => plugins = false,
             "--device" => device = true,
+            "--frame-every" => {
+                let ms = value()?.parse().map_err(|_| "--frame-every takes milliseconds")?;
+                frame_every = Duration::from_millis(ms);
+            }
             "--scan" => {
                 scan = value()?
                     .split(',')
@@ -70,6 +78,7 @@ fn parse() -> Result<Args, String> {
         }
     }
     Ok(Args {
+        frame_every,
         join: join.ok_or("--join is needed")?,
         name: name.ok_or("--name is needed")?,
         profile: profile.ok_or("--profile is needed")?,
@@ -88,6 +97,8 @@ fn main() -> ExitCode {
         }
     };
     let started = Instant::now();
+    mdaw_client::trace::set_name(&args.name);
+    let frame_every = args.frame_every;
     let mut options = TracktionOptions::new(args.profile.join("engine"));
     options.open_audio_device = args.device;
     options.enable_plugins = args.plugins;
@@ -124,7 +135,7 @@ fn main() -> ExitCode {
             Ok(line) => line,
             Err(TryRecvError::Empty) => {
                 driver.session.frame();
-                std::thread::sleep(Duration::from_millis(5));
+                std::thread::sleep(frame_every);
                 continue;
             }
             Err(TryRecvError::Disconnected) => break,

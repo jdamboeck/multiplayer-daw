@@ -102,6 +102,12 @@ struct Shared {
     ahead: HashMap<DeviceId, Ahead>,
     /// State blobs the engine needs and does not have.
     wanted: HashSet<BlobHash>,
+    /// Downloads blobs for the worker, straight to it; without, the session downloads them.
+    fetcher: Option<crate::link::Fetcher>,
+    /// To hand downloaded blobs to the worker from the network thread.
+    jobs: Option<Sender<Job>>,
+    /// Blobs being downloaded by the fetcher.
+    fetching: HashSet<BlobHash>,
     notices: Vec<String>,
     waker: Option<Waker>,
 }
@@ -429,8 +435,15 @@ impl TracktionAudio {
 
 impl Drop for TracktionAudio {
     fn drop(&mut self) {
-        // The worker ends when its queue is gone; the engine goes with the last holder (live
-        // notes may hold it a moment longer).
+        // The worker ends when its queue is gone, the handle the downloads use included; the
+        // engine goes with the last holder (live notes may hold it a moment longer). A download
+        // still on its way holds a handle of its own until it ends, which the link's end makes
+        // happen.
+        {
+            let mut shared = lock(&self.shared);
+            shared.jobs = None;
+            shared.fetcher = None;
+        }
         self.jobs = None;
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
@@ -742,16 +755,26 @@ impl Audio for TracktionAudio {
         self.send(Job::Retry { track, device });
     }
 
+    fn set_fetcher(&mut self, fetcher: crate::link::Fetcher) {
+        let mut shared = lock(&self.shared);
+        shared.fetcher = Some(fetcher);
+        shared.jobs = self.jobs.clone();
+    }
+
     fn wanted_blobs(&mut self, asked: &HashSet<BlobHash>) -> Vec<BlobHash> {
-        lock(&self.shared).wanted.difference(asked).copied().collect()
+        let shared = lock(&self.shared);
+        if shared.fetcher.is_some() {
+            return Vec::new();
+        }
+        shared.wanted.difference(asked).copied().collect()
     }
 
     fn blob_arrived(&mut self, hash: BlobHash, bytes: Option<Arc<[u8]>>) {
-        match bytes {
-            Some(bytes) => self.send(Job::Blob(hash, bytes)),
-            None => {
-                lock(&self.shared).wanted.remove(&hash);
-            }
+        // No longer wanted from here on, so that the next frame does not ask for it again
+        // while the worker has yet to take it.
+        lock(&self.shared).wanted.remove(&hash);
+        if let Some(bytes) = bytes {
+            self.send(Job::Blob(hash, bytes));
         }
     }
 
@@ -1047,7 +1070,36 @@ impl Worker {
             }
         }
         let mut shared = lock(&self.shared);
-        shared.wanted.extend(wanted);
+        shared.wanted.extend(wanted.iter().copied());
+        // With a fetcher the download starts here, on the worker, and comes back to it: no
+        // round trip through the window's thread, which may run seldom while it is not shown.
+        if let (Some(fetcher), Some(jobs)) = (shared.fetcher.clone(), shared.jobs.clone()) {
+            for hash in wanted {
+                if !shared.fetching.insert(hash) {
+                    continue;
+                }
+                crate::trace::step(|| format!("engine asks for settings {}", crate::trace::short(&hash)));
+                let (jobs, back) = (jobs.clone(), self.shared.clone());
+                fetcher.fetch(
+                    hash,
+                    Box::new(move |bytes| {
+                        crate::trace::step(|| {
+                            format!("engine's download {} arrived", crate::trace::short(&hash))
+                        });
+                        match bytes {
+                            Some(bytes) => {
+                                let _ = jobs.send(Job::Blob(hash, bytes));
+                            }
+                            None => {
+                                let mut shared = lock(&back);
+                                shared.wanted.remove(&hash);
+                                shared.fetching.remove(&hash);
+                            }
+                        }
+                    }),
+                );
+            }
+        }
         let mut statuses = HashMap::new();
         for (_, device) in plugin_devices(project) {
             let DeviceKind::Plugin { format, id, .. } = &device.kind else {
@@ -1247,9 +1299,10 @@ impl Worker {
 
     fn blob(&mut self, hash: BlobHash, bytes: Arc<[u8]>) {
         self.blobs.insert(hash, bytes);
-        let wanted = lock(&self.shared).wanted.remove(&hash);
-        if !wanted {
-            return;
+        {
+            let mut shared = lock(&self.shared);
+            shared.wanted.remove(&hash);
+            shared.fetching.remove(&hash);
         }
         let Some(project) = &self.synced else { return };
         let waiting: Vec<(TrackId, DeviceId)> = plugin_devices(project)

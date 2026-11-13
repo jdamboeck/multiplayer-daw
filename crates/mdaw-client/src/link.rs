@@ -63,11 +63,28 @@ pub enum Upload {
     Failed,
 }
 
+/// What to do with a blob a [`Fetcher`] downloaded, or `None` if it could not be had. Called on
+/// the network thread.
+pub type Fetched = Box<dyn FnOnce(Option<Arc<[u8]>>) + Send>;
+
 enum Out {
     Msg(u64, ClientMsg),
     Rejoin,
     Put(BlobHash, Arc<[u8]>),
     Get(BlobHash),
+    GetThen(BlobHash, Fetched),
+}
+
+/// Downloads blobs for another thread, which gets them without going through [`Link::poll`]
+/// (and so without waiting for the thread that polls). A download asked for while there is no
+/// connection waits for the next one.
+#[derive(Clone)]
+pub struct Fetcher(mpsc::UnboundedSender<Out>);
+
+impl Fetcher {
+    pub fn fetch(&self, hash: BlobHash, then: Fetched) {
+        let _ = self.0.send(Out::GetThen(hash, then));
+    }
 }
 
 pub struct Link {
@@ -132,6 +149,11 @@ impl Link {
     /// Downloads a blob. The outcome arrives as [`LinkEvent::Fetched`].
     pub fn get(&self, hash: BlobHash) {
         let _ = self.out.send(Out::Get(hash));
+    }
+
+    /// A handle to download blobs from another thread.
+    pub fn fetcher(&self) -> Fetcher {
+        Fetcher(self.out.clone())
     }
 
     /// Drops the connection and joins again from scratch, to receive the whole document.
@@ -334,6 +356,13 @@ impl Task {
                             let bytes = bytes.map(Arc::from);
                             let _ = events.send(LinkEvent::Fetched { hash, bytes });
                             waker();
+                        });
+                    }
+                    Some(Out::GetThen(hash, then)) => {
+                        let connection = connection.clone();
+                        tokio::spawn(async move {
+                            let bytes = mdaw_net::get_blob(&connection, hash).await.ok().flatten();
+                            then(bytes.map(Arc::from));
                         });
                     }
                     Some(Out::Rejoin) => return End::Rejoin,

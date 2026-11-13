@@ -169,6 +169,9 @@ pub trait Audio: Any {
 
     // ---- plugin settings and the document
 
+    /// A way to download blobs straight from the engine's own thread. An engine that takes it
+    /// downloads what it needs itself, and [`Audio::wanted_blobs`] gives nothing.
+    fn set_fetcher(&mut self, _fetcher: crate::link::Fetcher) {}
     /// State blobs the engine needs and that are not in `asked` yet.
     fn wanted_blobs(&mut self, asked: &HashSet<BlobHash>) -> Vec<BlobHash>;
     /// A blob asked for arrived, or (`None`) cannot be had.
