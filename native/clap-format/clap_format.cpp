@@ -220,8 +220,20 @@ public:
     void setValue (float v) override
     {
         value.store (v);
+        hostSetAt.store (juce::Time::getMillisecondCounter());
         sendToPlugin.store (true);
         anySendToPlugin->store (true);
+    }
+
+    /// Whether a value the plugin reports is its own change rather than an echo of something
+    /// the host set. Some plugins (Odin2) report values back some time after the host set them,
+    /// and then the one before: taking those would put the parameter back. A change made in
+    /// the plugin's own window comes inside a gesture, and is always taken.
+    bool takesValueFromPlugin() const
+    {
+        if (pluginGesture.load() || sendToPlugin.load())
+            return pluginGesture.load();
+        return juce::Time::getMillisecondCounter() - hostSetAt.load() > echoWindowMs;
     }
     float getDefaultValue() const override               { return toNormalised (info.default_value); }
     juce::String getName (int max) const override        { return juce::String (juce::CharPointer_UTF8 (info.name)).substring (0, max); }
@@ -257,6 +269,11 @@ public:
     /// Set from the plugin's output events, taken by the message thread to tell listeners.
     std::atomic<bool> changedByPlugin { false };
     std::atomic<int> gesture { 0 };   // 1 = began, 2 = ended, waiting for the message thread
+    /// The plugin is inside a gesture on this parameter (between its begin and end events).
+    std::atomic<bool> pluginGesture { false };
+    /// When the host last set the value (`Time::getMillisecondCounter`).
+    std::atomic<juce::uint32> hostSetAt { 0 };
+    static constexpr juce::uint32 echoWindowMs = 500;
     std::atomic<bool>* anySendToPlugin = nullptr;
 };
 
@@ -590,6 +607,8 @@ private:
             auto& v = reinterpret_cast<const clap_event_param_value_t&> (e);
             if (auto found = byId.find (v.param_id); found != byId.end())
             {
+                if (! found->second->takesValueFromPlugin())
+                    return true;
                 found->second->value.store (found->second->toNormalised (v.value));
                 found->second->changedByPlugin.store (true);
                 anyChangedByPlugin.store (true);
@@ -600,6 +619,7 @@ private:
             auto& g = reinterpret_cast<const clap_event_param_gesture_t&> (e);
             if (auto found = byId.find (g.param_id); found != byId.end())
             {
+                found->second->pluginGesture.store (e.type == CLAP_EVENT_PARAM_GESTURE_BEGIN);
                 found->second->gesture.store (e.type == CLAP_EVENT_PARAM_GESTURE_BEGIN ? 1 : 2);
                 anyChangedByPlugin.store (true);
             }

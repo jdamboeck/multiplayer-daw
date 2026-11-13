@@ -142,3 +142,11 @@ Things under [Known gaps](#known-gaps-not-failures) are not failures.
 | Step | What happened | Expected instead |
 |---|---|---|
 | | | |
+
+Results, 2026-11-13 (tester: the project owner): A, B, C, D and E pass after the fixes made
+during the session (knob jump-back, device-tab refresh, hidden windows, downloads by the engine,
+plugins that change without a report, plugin menus by format, built-in instrument without
+plugins, plugin names in the document). Dexed (LV2) prints "JUCE Assertion failure in
+juce_Component.cpp:1912" when its settings are replaced while its window is open: its own JUCE,
+logged only. Decided: the 3 dB level spread of the two-oscillator default is moot, Pocket is to be
+rewritten around 4osc.

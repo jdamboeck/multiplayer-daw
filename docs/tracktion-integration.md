@@ -237,6 +237,10 @@ These were all found by running into them.
 27. **Tracktion logs every device and port to the terminal.** The bridge sends JUCE's log to
     `engine.log` in the settings folder. lilv's own warnings ("Duplicate plugin", "Reloading
     plugin") still go to stderr.
+28. **CLAP plugins may report a parameter back after the host set it, with an older value**
+    (Odin2: 9 of 61 steps of a host-driven drag). The CLAP host takes a value from the plugin
+    only inside the plugin's gesture, or when the host has not set that parameter in the last
+    500 ms; otherwise the report is an echo and is ignored. Measured after: 0 of 183.
 
 ## The bridge
 
