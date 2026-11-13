@@ -269,6 +269,7 @@ mod tests {
             DeviceKind::Plugin {
                 format: PluginFormat::Clap,
                 id: "x".into(),
+                name: "Synth".into(),
                 state,
             },
         );

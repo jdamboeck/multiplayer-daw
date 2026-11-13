@@ -409,12 +409,16 @@ impl TracktionAudio {
         let shared = lock(&self.shared);
         let mut names = Vec::new();
         for (track, device) in plugin_devices(project) {
-            if let DeviceKind::Plugin { format, id, .. } = &device.kind {
-                let name = shared
-                    .catalog
-                    .iter()
-                    .find(|p| p.format == *format && p.id == *id)
-                    .map_or(id.clone(), |p| p.name.clone());
+            if let DeviceKind::Plugin { format, id, name, .. } = &device.kind {
+                let name = if name.is_empty() {
+                    shared
+                        .catalog
+                        .iter()
+                        .find(|p| p.format == *format && p.id == *id)
+                        .map_or(id.clone(), |p| p.name.clone())
+                } else {
+                    name.clone()
+                };
                 let track = project
                     .track(track)
                     .map(|t| t.shell.name.clone())

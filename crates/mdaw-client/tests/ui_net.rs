@@ -321,6 +321,7 @@ fn a_refused_edit_shows_a_notice_that_can_be_dismissed() {
         DeviceKind::Plugin {
             format: mdaw_model::PluginFormat::Clap,
             id: "org.example.synth".into(),
+            name: "Synth".into(),
             state: Some(mdaw_proto::blob_hash(b"never uploaded")),
         },
     );
@@ -430,6 +431,7 @@ fn screenshots() {
         DeviceKind::Plugin {
             format: mdaw_model::PluginFormat::Clap,
             id: "org.example.synth".into(),
+            name: "Synth".into(),
             state: None,
         },
     );

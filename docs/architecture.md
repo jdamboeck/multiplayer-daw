@@ -51,7 +51,7 @@ Rust workspace, edition 2024, GPL-3.0-only.
 | Crate | Lines | What it does |
 |---|---|---|
 | `mdaw-model` | 1.7k | Project, typed stable IDs (`EntityId = actor << 32 | counter`), `Tick` at 960 PPQ, the `Op` enum and `apply` |
-| `mdaw-proto` | 1.4k | Wire messages (protocol version 8), `Txn { id: TxnId, base_seq, ops }`, blobs, live MIDI packets, transport |
+| `mdaw-proto` | 1.4k | Wire messages (protocol version 9), `Txn { id: TxnId, base_seq, ops }`, blobs, live MIDI packets, transport |
 | `mdaw-sync` | 0.7k | Client replica: optimistic ops, rebase on server events, checkout workspaces |
 | `mdaw-server` | 1.9k | Hub, sequencer, SQLite store, checkout/lease bookkeeping, live-MIDI relay |
 | `mdaw-net` | 0.6k | QUIC (quinn), clock sync |

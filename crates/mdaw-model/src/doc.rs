@@ -163,6 +163,9 @@ pub enum DeviceKind {
         format: PluginFormat,
         /// The plugin's own identifier within its format, compared as an opaque string.
         id: String,
+        /// The plugin's name as the client that put it on the track saw it, so that every
+        /// client shows the same name, those without the plugin too. Never used to find it.
+        name: String,
         state: Option<BlobHash>,
     },
 }

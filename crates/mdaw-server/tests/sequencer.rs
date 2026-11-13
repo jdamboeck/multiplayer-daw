@@ -76,6 +76,7 @@ fn clap_device(state: Option<BlobHash>) -> Device {
         DeviceKind::Plugin {
             format: PluginFormat::Clap,
             id: "com.example.synth".into(),
+            name: "Synth".into(),
             state,
         },
     )

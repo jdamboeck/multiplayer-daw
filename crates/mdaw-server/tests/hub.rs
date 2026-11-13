@@ -74,6 +74,7 @@ fn refused(n: u64) -> Txn {
         DeviceKind::Plugin {
             format: PluginFormat::Clap,
             id: "x".into(),
+            name: "Synth".into(),
             state: Some(missing()),
         },
     );

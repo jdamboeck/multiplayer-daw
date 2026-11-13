@@ -71,6 +71,7 @@ fn device() -> impl Strategy<Value = Device> {
         prop::option::of(any::<[u8; 32]>().prop_map(BlobHash)).prop_map(|state| DeviceKind::Plugin {
             format: PluginFormat::Clap,
             id: "test.plugin".into(),
+            name: "Synth".into(),
             state
         }),
     ];

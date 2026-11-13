@@ -1,11 +1,13 @@
 # mdaw protocol
 
-What client and server say to each other, as built. Protocol version **8**. The types live in
+What client and server say to each other, as built. Protocol version **9**. The types live in
 `mdaw-proto` (`lib.rs` for transactions and events, `wire.rs` for messages) and in `mdaw-model`
 (ops); this text explains the rules around them. People share the project — tracks, clips,
 notes, devices, tempo — and nothing else: each client plays it back on its own, and nothing
 about playback travels.
 
+Version 9 gives a plugin device the plugin's name (`DeviceKind::Plugin::name`), so a client
+without the plugin shows it under the same name as one with it.
 Version 8 adds the plugin formats VST3 and LV2 (`PluginFormat::Vst3`, `PluginFormat::Lv2`);
 nothing else changed, but a version-7 peer could not read a project that uses them.
 Version 7 gives every transaction a random identity the client keeps until it is confirmed, and
@@ -257,10 +259,13 @@ undo step and reaches the others like any edit.
 A device can be a plugin installed on the user's machine:
 
 ```
-DeviceKind::Plugin { format: PluginFormat, id: String, state: Option<BlobHash> }
+DeviceKind::Plugin { format: PluginFormat, id: String, name: String, state: Option<BlobHash> }
 PluginFormat = Clap | Vst3 | Lv2   // new formats are added at the end
 ```
 
+- **Name.** `name` is the plugin's name as the client that added it saw it (at most 128 bytes).
+  Every client shows it, those without the plugin too; the plugin is found by `format` and
+  `id` only.
 - **Ordinary edits.** Anyone puts a plugin on any track (`DeviceAdd`), removes it, bypasses it
   or changes its settings, by transactions like every other edit.
 - **One instrument.** A track has one instrument, the first device: Pocket or a plugin that
@@ -352,7 +357,7 @@ transaction is committed by itself, without grouping several into one commit.
 
 Blobs are files in `blobs/`, named by their hash in hex.
 
-The format entry is `<store version>/<protocol version>`, now `4/8`. A database with another
+The format entry is `<store version>/<protocol version>`, now `5/9`. A database with another
 format is not opened; the prototype has no migrations, so a breaking change means a new data
 directory. In particular, data directories of protocol 7 and earlier are not readable: move them
 away and start a new project.

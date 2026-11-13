@@ -163,6 +163,7 @@ fn plugin(state: BlobHash) -> Op {
             DeviceKind::Plugin {
                 format: PluginFormat::Clap,
                 id: "x".into(),
+                name: "Synth".into(),
                 state: Some(state),
             },
         ),

@@ -499,10 +499,16 @@ fn check_clip(clip: &Clip) -> Result<(), Invalid> {
 }
 
 fn check_device(device: &Device) -> Result<(), Invalid> {
-    if let DeviceKind::Plugin { id: plugin_id, .. } = &device.kind
-        && (plugin_id.is_empty() || plugin_id.len() > MAX_PLUGIN_ID_BYTES)
+    if let DeviceKind::Plugin {
+        id: plugin_id, name, ..
+    } = &device.kind
     {
-        return Err(Invalid("bad plugin id"));
+        if plugin_id.is_empty() || plugin_id.len() > MAX_PLUGIN_ID_BYTES {
+            return Err(Invalid("bad plugin id"));
+        }
+        if name.len() > MAX_NAME_BYTES {
+            return Err(Invalid("plugin name too long"));
+        }
     }
     if device.params.len() > MAX_PARAMS_PER_DEVICE {
         return Err(Invalid("too many parameters"));

@@ -72,6 +72,7 @@ fn project() -> (Project, TrackId, DeviceId) {
         DeviceKind::Plugin {
             format: PluginFormat::Clap,
             id: "org.example.fake".into(),
+            name: "Synth".into(),
             state: None,
         },
     ));

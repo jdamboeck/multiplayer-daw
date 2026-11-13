@@ -1320,6 +1320,7 @@ fn plugins(world: &mut World, ids_gen: &mut IdGen, have_clap: bool) {
             DeviceKind::Plugin {
                 format: PluginFormat::Clap,
                 id: id.into(),
+                name: "Synth".into(),
                 state: None,
             },
         )

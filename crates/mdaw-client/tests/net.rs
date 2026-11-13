@@ -273,6 +273,7 @@ fn a_refused_edit_is_taken_back_with_a_notice() {
         DeviceKind::Plugin {
             format: PluginFormat::Clap,
             id: "org.example.synth".into(),
+            name: "Synth".into(),
             state: Some(mdaw_proto::blob_hash(b"never uploaded")),
         },
     );
@@ -779,6 +780,7 @@ fn an_upload_the_server_refuses_takes_back_its_edit_and_blocks_nothing() {
         DeviceKind::Plugin {
             format: PluginFormat::Clap,
             id: "org.example.synth".into(),
+            name: "Synth".into(),
             state: Some(state),
         },
     );

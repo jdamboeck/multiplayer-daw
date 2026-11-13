@@ -486,6 +486,7 @@ impl Session {
             DeviceKind::Plugin {
                 format: plugin.format,
                 id: plugin.id.clone(),
+                name: plugin.name.clone(),
                 state: None,
             },
         );

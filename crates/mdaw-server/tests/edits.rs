@@ -119,6 +119,7 @@ fn plugin(id: u64, state: Option<BlobHash>) -> Device {
         DeviceKind::Plugin {
             format: PluginFormat::Clap,
             id: "org.example.synth".into(),
+            name: "Synth".into(),
             state,
         },
     )

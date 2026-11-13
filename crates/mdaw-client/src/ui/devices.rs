@@ -48,7 +48,9 @@ pub fn show(app: &mut DawApp, ui: &mut Ui) {
                     kind: BuiltinKind::Pocket,
                     ..
                 } => pocket_panel(app, ui, track_id, device),
-                DeviceKind::Plugin { format, id, .. } => plugin_panel(app, ui, track_id, device, *format, id),
+                DeviceKind::Plugin { format, id, name, .. } => {
+                    plugin_panel(app, ui, track_id, device, *format, id, name)
+                }
             });
             ui.separator();
         }
@@ -65,11 +67,17 @@ fn plugin_panel(
     device: &Device,
     format: PluginFormat,
     id: &str,
+    stored_name: &str,
 ) {
-    let name = app
-        .session
-        .plugin_name(format, id)
-        .unwrap_or_else(|| id.to_string());
+    // The name in the document, the same for everyone; a device without one is named from
+    // the plugins here, or by its id.
+    let name = if stored_name.is_empty() {
+        app.session
+            .plugin_name(format, id)
+            .unwrap_or_else(|| id.to_string())
+    } else {
+        stored_name.to_string()
+    };
     let running = app.session.plugin_running(track, device.id);
     ui.horizontal(|ui| {
         ui.label(RichText::new(&name).strong().size(15.0));

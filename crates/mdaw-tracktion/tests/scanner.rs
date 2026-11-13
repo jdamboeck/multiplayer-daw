@@ -124,6 +124,7 @@ fn bad_plugins_are_examined_in_a_child_process() {
         DeviceKind::Plugin {
             format: PluginFormat::Clap,
             id: TEST_SYNTH.into(),
+            name: "Synth".into(),
             state: None,
         },
     ));

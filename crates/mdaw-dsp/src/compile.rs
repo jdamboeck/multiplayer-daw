@@ -158,7 +158,9 @@ fn compile_track(
                 } if *dsp_version == crate::pocket::DSP_VERSION => {
                     CompiledKind::Pocket(PocketParams::from_map(&device.params))
                 }
-                DeviceKind::Plugin { format, id, state } => CompiledKind::Plugin {
+                DeviceKind::Plugin {
+                    format, id, state, ..
+                } => CompiledKind::Plugin {
                     format: *format,
                     id: id.clone(),
                     state: *state,

@@ -750,7 +750,7 @@ fn a_plugin_is_added_from_the_device_tab_and_its_settings_shown() {
 }
 
 /// A window without plugins (`--no-plugins`): a track whose instrument is a plugin shows it as
-/// not installed; the plugin can be taken off, and the built-in instrument put on again.
+/// not installed, under the name the document gives it; the plugin can be taken off, and the built-in instrument put on again.
 #[test]
 fn without_plugins_a_plugin_comes_off_and_pocket_goes_on() {
     let session = Session::starter(Engine::manual(48_000, false));
@@ -779,6 +779,7 @@ fn without_plugins_a_plugin_comes_off_and_pocket_goes_on() {
         mdaw_model::DeviceKind::Plugin {
             format: mdaw_model::PluginFormat::Clap,
             id: mdaw_plugin::TEST_SYNTH.into(),
+            name: "Ann's Synth".into(),
             state: None,
         },
     );
@@ -801,6 +802,10 @@ fn without_plugins_a_plugin_comes_off_and_pocket_goes_on() {
     assert!(
         h.query_by_label("Plugins are switched off in this window.")
             .is_some()
+    );
+    assert!(
+        h.query_by_label("Ann's Synth").is_some(),
+        "the device is named as in the document, not by its id"
     );
     let remove = h.get_by_label("Remove").rect().center();
     click(&mut h, remove);
