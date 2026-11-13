@@ -30,7 +30,8 @@ use std::time::{Duration, Instant};
 
 use mdaw_engine::clock;
 use mdaw_model::{
-    BlobHash, DeviceId, DeviceKind, Op, PluginFormat, Project, Tick, TickRange, TrackContent, TrackId,
+    BlobHash, BuiltinKind, DeviceId, DeviceKind, Op, PluginFormat, Project, Tick, TickRange, TrackContent,
+    TrackId,
 };
 use mdaw_tracktion::{Config, Engine, EngineState, EntityKind, Event, Problem};
 
@@ -472,6 +473,10 @@ impl Audio for TracktionAudio {
 
     fn set_waker(&mut self, waker: Waker) {
         lock(&self.shared).waker = Some(waker);
+    }
+
+    fn default_instrument(&self) -> BuiltinKind {
+        BuiltinKind::TwoOsc
     }
 
     fn set_project(&mut self, project: &Project) {

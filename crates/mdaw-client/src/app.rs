@@ -176,7 +176,8 @@ impl DawApp {
     pub fn add_track(&mut self) {
         let project = self.session.project();
         let (count, last) = (project.track_order.len(), project.track_order.last().copied());
-        let op = new_track(self.session.ids(), count, last);
+        let instrument = self.session.default_instrument();
+        let op = new_track(self.session.ids(), count, last, instrument);
         let Op::TrackAdd { id, .. } = &op else { return };
         let id = *id;
         if self.session.edit(vec![op]) {

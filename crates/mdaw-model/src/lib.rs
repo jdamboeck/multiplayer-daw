@@ -8,6 +8,7 @@ mod doc;
 mod ids;
 mod op;
 mod time;
+pub mod two_osc;
 
 pub use apply::{apply, apply_all};
 pub use doc::{

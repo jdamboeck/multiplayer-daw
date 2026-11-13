@@ -11,6 +11,7 @@
 
 pub mod apply;
 pub mod sync;
+mod two_osc;
 
 use mdaw_tracktion_sys as sys;
 use serde::Deserialize;

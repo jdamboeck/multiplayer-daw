@@ -20,7 +20,7 @@ fn int(n: u64) -> i64 {
 }
 
 /// Bumped when the tables change.
-const STORE_VERSION: u32 = 5;
+const STORE_VERSION: u32 = 6;
 
 /// What the server answered a transaction with, kept for when it arrives again.
 #[derive(Clone, PartialEq, Eq, Debug)]

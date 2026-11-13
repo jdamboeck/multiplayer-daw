@@ -1,6 +1,7 @@
 use crate::doc::*;
 use crate::ids::*;
 use crate::time::{MAX_MILLI_BPM, MAX_TICK, MIN_MILLI_BPM, TempoPoint, Tick};
+use crate::two_osc;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -301,9 +302,28 @@ impl Op {
 
     /// Whether applying this op to `project` keeps it within the size limits. [`Op::validate`]
     /// checks what an op carries; this checks what it adds to what is there, so that many small
-    /// ops cannot grow a clip or a track without end.
+    /// ops cannot grow a clip or a track without end. It also checks a parameter value set on a
+    /// built-in device whose parameters have ranges (`BuiltinKind::TwoOsc`, see
+    /// [`crate::two_osc`]): the op does not say what kind of device it addresses.
     pub fn fits(&self, project: &Project) -> Result<(), Invalid> {
         let content = |track: &TrackId| project.track(*track).map(|t| &t.content);
+        if let Op::DeviceSetParam {
+            track,
+            id,
+            param,
+            value: Some(value),
+        } = self
+            && let Some(device) = content(track).and_then(|c| c.device(*id))
+            && matches!(
+                device.kind,
+                DeviceKind::Builtin {
+                    kind: BuiltinKind::TwoOsc,
+                    ..
+                }
+            )
+        {
+            two_osc::check(*param, *value)?;
+        }
         let full = match self {
             Op::TrackAdd { id, .. } => !project.tracks.contains_key(id) && project.tracks.len() >= MAX_TRACKS,
             Op::TempoPut { id, .. } => {
@@ -513,11 +533,19 @@ fn check_device(device: &Device) -> Result<(), Invalid> {
     if device.params.len() > MAX_PARAMS_PER_DEVICE {
         return Err(Invalid("too many parameters"));
     }
-    if device.params.values().all(|v| v.is_finite()) {
-        Ok(())
-    } else {
-        Err(Invalid("parameter value is not finite"))
+    if !device.params.values().all(|v| v.is_finite()) {
+        return Err(Invalid("parameter value is not finite"));
     }
+    if let DeviceKind::Builtin {
+        kind: BuiltinKind::TwoOsc,
+        ..
+    } = &device.kind
+    {
+        for (param, value) in &device.params {
+            two_osc::check(*param, *value)?;
+        }
+    }
+    Ok(())
 }
 
 fn check_content(content: &TrackContent) -> Result<(), Invalid> {

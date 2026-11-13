@@ -11,7 +11,8 @@
 //! index in their clip, ordered by start and pitch. Between commands the session keeps running.
 //!
 //! Commands: `wait-scan`, `settle`, `wait-seq <n>`, `seq`, `doc-hash`,
-//! `add-track <name>`, `pocket-param <track> <param> <value>`, `add-clip <track> <clip> <beat> <beats>`,
+//! `add-track <name>` (with the engine's built-in instrument), `pocket-param <track> <param> <value>`,
+//! `add-clip <track> <clip> <beat> <beats>`,
 //! `add-notes <track> <clip> <beat>:<pitch>[,...]`, `set-note <track> <clip> <index> pitch|vel <value>`,
 //! `note-pitch <track> <clip> <index>`, `add-plugin <track> clap:<id>`,
 //! `plugin-param <track> <param id> <value>`, `shown-param <track> <param id>`,
@@ -31,8 +32,8 @@ use mdaw_client::audio_tracktion::{TracktionAudio, TracktionOptions};
 use mdaw_client::outbox::Outbox;
 use mdaw_client::{Session, Status, profile};
 use mdaw_model::{
-    BuiltinKind, Clip, ClipId, Device, DeviceKind, Note, NoteId, NoteProp, Op, PluginFormat, Project, Tick,
-    TrackContent, TrackId, TrackShell,
+    Clip, ClipId, Device, DeviceKind, Note, NoteId, NoteProp, Op, PluginFormat, Project, Tick, TrackContent,
+    TrackId, TrackShell,
 };
 use mdaw_net::JoinInfo;
 
@@ -310,10 +311,8 @@ impl Driver {
                 let ids = self.session.ids();
                 let (id, device) = (ids.track(), ids.device());
                 let mut content = TrackContent::default();
-                let kind = DeviceKind::Builtin {
-                    kind: BuiltinKind::Pocket,
-                    dsp_version: mdaw_dsp::pocket::DSP_VERSION,
-                };
+                // The engine's own built-in instrument, as a new track in the window gets.
+                let kind = mdaw_client::builtin_kind(self.session.default_instrument());
                 content.devices.push_back(Device::new(device, kind));
                 let after = self.session.project().track_order.last().copied();
                 self.edit(vec![Op::TrackAdd {

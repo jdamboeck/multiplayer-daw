@@ -1,11 +1,13 @@
 # mdaw protocol
 
-What client and server say to each other, as built. Protocol version **9**. The types live in
+What client and server say to each other, as built. Protocol version **10**. The types live in
 `mdaw-proto` (`lib.rs` for transactions and events, `wire.rs` for messages) and in `mdaw-model`
 (ops); this text explains the rules around them. People share the project — tracks, clips,
 notes, devices, tempo — and nothing else: each client plays it back on its own, and nothing
 about playback travels.
 
+Version 10 adds the built-in instrument of the Tracktion engine (`BuiltinKind::TwoOsc`, shown
+as "Pocket") with its own parameter table and range checks (see "Built-in devices").
 Version 9 gives a plugin device the plugin's name (`DeviceKind::Plugin::name`), so a client
 without the plugin shows it under the same name as one with it.
 Version 8 adds the plugin formats VST3 and LV2 (`PluginFormat::Vst3`, `PluginFormat::Lv2`);
@@ -254,6 +256,33 @@ or else a `ClipAdd` named "Take" of whole bars holding them. Notes still held en
 playhead was last; a note held across the end of the loop lasts to that end. The take is one
 undo step and reaches the others like any edit.
 
+## Built-in devices
+
+```
+DeviceKind::Builtin { kind: BuiltinKind, dsp_version: u16 }
+BuiltinKind = Pocket | TwoOsc   // new kinds are added at the end
+```
+
+A built-in device's settings are its `params`: plain values by parameter id. A missing entry is
+the parameter's default; `DeviceSetParam { value: None }` puts it back there. The parameter ids
+are part of the format: they are never renumbered or reused.
+
+- **`TwoOsc`** is the built-in instrument on the Tracktion engine, a front for Tracktion's 4OSC
+  synth; users see it as "Pocket". Two oscillators, a sub oscillator that can be switched on,
+  a filter with its envelope, an amp envelope and global settings (voice mode, glide, level).
+  Its 33 parameters (ids 0 to 32) are listed in `crates/mdaw-model/src/two_osc.rs`. Values are
+  in 4OSC's own units (Hz, dB, semitones, cents, %, seconds, milliseconds), choices as an index
+  into their labels, switches 0 or 1, so the engine gets them without loss. The server refuses
+  a value outside a parameter's range, a fraction for a choice, switch or tuning in semitones,
+  and an id the table does not have (`Invalid`), in `DeviceAdd`, `TrackAdd` and
+  `DeviceSetParam`. `dsp_version` is 1.
+- **`Pocket`** is the Rust engine's own synth (`crates/mdaw-dsp/src/pocket.rs`, 20 parameters,
+  values clamped rather than refused). Projects made before version 10 have it. The Tracktion
+  engine plays it with 4OSC as an approximation; the Rust engine, which goes in phase 7, plays
+  it exactly and leaves `TwoOsc` silent.
+
+New tracks get the built-in instrument of the client's engine.
+
 ## Plugins
 
 A device can be a plugin installed on the user's machine:
@@ -268,7 +297,7 @@ PluginFormat = Clap | Vst3 | Lv2   // new formats are added at the end
   `id` only.
 - **Ordinary edits.** Anyone puts a plugin on any track (`DeviceAdd`), removes it, bypasses it
   or changes its settings, by transactions like every other edit.
-- **One instrument.** A track has one instrument, the first device: Pocket or a plugin that
+- **One instrument.** A track has one instrument, the first device: built in or a plugin that
   makes sound from notes. Picking another replaces it in the same transaction; plugins that
   change sound (effects) come after it. The client keeps to this; the server does not check it.
 - **State.** The plugin's settings are its own state, an opaque blob; `id` names the plugin
@@ -357,7 +386,7 @@ transaction is committed by itself, without grouping several into one commit.
 
 Blobs are files in `blobs/`, named by their hash in hex.
 
-The format entry is `<store version>/<protocol version>`, now `5/9`. A database with another
+The format entry is `<store version>/<protocol version>`, now `6/10`. A database with another
 format is not opened; the prototype has no migrations, so a breaking change means a new data
 directory. In particular, data directories of protocol 7 and earlier are not readable: move them
 away and start a new project.

@@ -242,6 +242,24 @@ impl Wav {
             .fold(0.0f64, |m, s| m.max(s.abs() as f64))
     }
 
+    /// The share of the left channel's energy between two times that passes two one-pole
+    /// low-passes at 100 Hz: a crude measure of low end.
+    fn lowness(&self, from: f64, to: f64) -> f64 {
+        let frames = self.samples.len() / 2;
+        let a = ((from * RATE) as usize).min(frames) * 2;
+        let b = ((to * RATE) as usize).min(frames) * 2;
+        let k = 1.0 - (-2.0 * std::f64::consts::PI * 100.0 / RATE).exp();
+        let (mut y1, mut y2, mut low, mut all) = (0.0, 0.0, 0.0, 0.0);
+        for frame in self.samples[a..b.max(a)].chunks_exact(2) {
+            let x = f64::from(frame[0]);
+            y1 += k * (x - y1);
+            y2 += k * (y1 - y2);
+            low += y2 * y2;
+            all += x * x;
+        }
+        low / all.max(1e-12)
+    }
+
     fn envelope(&self) -> Vec<f64> {
         let window = (0.05 * RATE) as usize * 2;
         self.samples
@@ -275,12 +293,12 @@ fn assert_same_sound(a: &Wav, b: &Wav, what: &str) -> f64 {
 
 // ---- the song --------------------------------------------------------------------------------------
 
-/// Keys: the built-in synth (one oscillator, so renders repeat), notes on beats 0 to 3 (0 to
-/// 1.75 s at 120 bpm). Synth: the CLAP test synth, notes on beats 4 and 5 (2 to 2.75 s).
+/// Keys: the built-in synth (one oscillator: OSC 2 Wave None, so renders repeat), notes on
+/// beats 0 to 3 (0 to 1.75 s at 120 bpm). Synth: the CLAP test synth, notes on beats 4 and 5 (2 to 2.75 s).
 fn build_song(ann: &mut Client) -> u64 {
     for line in [
         "add-track Keys",
-        "pocket-param Keys 4 0",
+        "pocket-param Keys 5 0",
         "add-clip Keys k 0 4",
         "add-notes Keys k 0:60,1:64,2:67,3:72",
         "add-track Synth",
@@ -339,6 +357,24 @@ fn two_clients_build_play_and_tweak_one_song() {
     }
     assert_same_sound(&a, &b, "1: ann vs ben");
     let synth_before = b.peak_between(SYNTH_ONLY.0, SYNTH_ONLY.1);
+
+    // 1b. Ann switches the built-in synth's sub oscillator on (parameter 10, SUB On): Ben's
+    //     document and sound follow; then off again.
+    ann.cmd("pocket-param Keys 10 1");
+    let on = ann.seq();
+    ben.wait_seq(on);
+    assert_eq!(ann.hash(), ben.hash(), "1b: same document");
+    let sub = ben.render("1b-ben-sub.wav", 8);
+    let (low_off, low_on) = (b.lowness(KEYS.0, KEYS.1), sub.lowness(KEYS.0, KEYS.1));
+    println!("RESULT 1b: ben lowness off={low_off:.4} on={low_on:.4}");
+    assert!(
+        low_on > 1.5 * low_off,
+        "1b: Ben hears the sub ({low_off} -> {low_on})"
+    );
+    ann.cmd("pocket-param Keys 10 0");
+    let seq = ann.seq();
+    ben.wait_seq(seq);
+    assert_eq!(ann.hash(), ben.hash(), "1b: same document, sub off");
 
     // 2. Concurrent edits: different notes from each, and the same note from both.
     ann.cmd("set-note Keys k 0 pitch 62");

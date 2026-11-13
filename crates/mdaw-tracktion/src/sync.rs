@@ -8,7 +8,7 @@
 //! The model is built from `imbl` persistent collections and `Arc`s, so unchanged parts of two
 //! states share memory. Whatever is shared is skipped without looking inside: a single changed
 //! note costs a walk down to its clip and one `notes_put` call. Values are read from `after`, as
-//! in [`crate::apply`], whose mapping (Pocket on 4osc, CLAP parameter ranges, what is reported
+//! in [`crate::apply`], whose mapping (built-in devices on 4osc, CLAP parameter ranges, what is reported
 //! as a [`Problem`]) is the same here.
 
 use crate::apply::{
@@ -257,7 +257,15 @@ fn devices(sync: &mut Sync<'_>, track: TrackId, old: &TrackContent, new: &TrackC
         match &device.kind {
             DeviceKind::Builtin { .. } => {
                 if was.params != device.params {
-                    sync.put_pocket(track, device)?;
+                    let changed: Vec<u32> = was
+                        .params
+                        .diff(&device.params)
+                        .map(|item| match item {
+                            DiffItem::Remove(param, _) | DiffItem::Add(param, _) => *param,
+                            DiffItem::Update { new: (param, _), .. } => *param,
+                        })
+                        .collect();
+                    sync.put_builtin_changes(track, device, changed)?;
                 }
             }
             DeviceKind::Plugin { state, .. } => {

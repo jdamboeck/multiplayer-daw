@@ -167,7 +167,7 @@ mod tests {
     fn a_take_goes_into_a_new_clip_of_whole_bars_or_into_the_clip_it_fits() {
         let mut ids = IdGen::new(ActorId(5));
         let mut project = Project::default();
-        let add = crate::session::new_track(&mut ids, 0, None);
+        let add = crate::session::new_track(&mut ids, 0, None, mdaw_model::BuiltinKind::Pocket);
         let Op::TrackAdd { id: track, .. } = add else {
             unreachable!()
         };

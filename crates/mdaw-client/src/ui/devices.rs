@@ -5,6 +5,7 @@ use egui::{
     vec2,
 };
 use mdaw_dsp::pocket::{self, ParamInfo, Scale};
+use mdaw_model::two_osc::{self, Group, Kind};
 use mdaw_model::{BuiltinKind, Device, DeviceKind, Op, PluginFormat, TrackId};
 
 use crate::{DawApp, DeviceStatus, PluginEntry, theme};
@@ -48,6 +49,10 @@ pub fn show(app: &mut DawApp, ui: &mut Ui) {
                     kind: BuiltinKind::Pocket,
                     ..
                 } => pocket_panel(app, ui, track_id, device),
+                DeviceKind::Builtin {
+                    kind: BuiltinKind::TwoOsc,
+                    ..
+                } => two_osc_panel(app, ui, track_id, device),
                 DeviceKind::Plugin { format, id, name, .. } => {
                     plugin_panel(app, ui, track_id, device, *format, id, name)
                 }
@@ -188,7 +193,7 @@ fn add_plugin(app: &mut DawApp, ui: &mut Ui, track: TrackId) {
     let instruments = by_format(&catalog, true);
     let effects = by_format(&catalog, false);
     enum Pick {
-        Pocket,
+        Builtin,
         Plugin(PluginEntry),
     }
     let mut pick = None;
@@ -215,8 +220,9 @@ fn add_plugin(app: &mut DawApp, ui: &mut Ui, track: TrackId) {
     ui.horizontal(|ui| {
         ui.menu_button("Instrument…", |ui| {
             ui.label(RichText::new("A track has one instrument; this one takes its place.").small());
+            // Both engines call their built-in instrument Pocket.
             if ui.button("Pocket (built in)").clicked() {
-                pick = Some(Pick::Pocket);
+                pick = Some(Pick::Builtin);
                 ui.close();
             }
             if !instruments.is_empty() {
@@ -229,8 +235,8 @@ fn add_plugin(app: &mut DawApp, ui: &mut Ui, track: TrackId) {
         }
     });
     match pick {
-        Some(Pick::Pocket) => {
-            app.session.use_pocket(track);
+        Some(Pick::Builtin) => {
+            app.session.use_builtin(track);
         }
         Some(Pick::Plugin(plugin)) => {
             app.session.add_plugin(track, &plugin);
@@ -265,20 +271,7 @@ fn pocket_panel(app: &mut DawApp, ui: &mut Ui, track: TrackId, device: &Device) 
     // Two rows of sections, so the panel fits a window of ordinary width.
     const ROWS: [&[usize]; 2] = [&[0, 4], &[1, 2, 3]];
     ui.horizontal_top(|ui| {
-        ui.vertical(|ui| {
-            ui.set_width(64.0);
-            ui.label(RichText::new("Pocket").strong().size(15.0));
-            ui.label(RichText::new("Synth").small().color(theme::TEXT_DIM));
-            let mut on = !device.bypass;
-            if ui.checkbox(&mut on, "On").changed() {
-                let bypass = !on;
-                app.session.edit(vec![Op::DeviceSetBypass {
-                    track,
-                    id: device.id,
-                    bypass,
-                }]);
-            }
-        });
+        builtin_header(app, ui, track, device);
         ui.separator();
         ui.vertical(|ui| {
             for row in ROWS {
@@ -305,6 +298,215 @@ fn pocket_panel(app: &mut DawApp, ui: &mut Ui, track: TrackId, device: &Device) 
             }
         });
     });
+}
+
+/// The name of a built-in instrument and its on switch, left of its controls.
+fn builtin_header(app: &mut DawApp, ui: &mut Ui, track: TrackId, device: &Device) {
+    ui.vertical(|ui| {
+        ui.set_width(64.0);
+        ui.label(RichText::new("Pocket").strong().size(15.0));
+        ui.label(RichText::new("Synth").small().color(theme::TEXT_DIM));
+        let mut on = !device.bypass;
+        if ui.checkbox(&mut on, "On").changed() {
+            let bypass = !on;
+            app.session.edit(vec![Op::DeviceSetBypass {
+                track,
+                id: device.id,
+                bypass,
+            }]);
+        }
+    });
+}
+
+/// The built-in instrument on Tracktion (`BuiltinKind::TwoOsc`, a front for 4OSC), in its
+/// sections. Controls that make no difference with the other settings as they are are greyed
+/// out (`two_osc::Values::active`).
+fn two_osc_panel(app: &mut DawApp, ui: &mut Ui, track: TrackId, device: &Device) {
+    const ROWS: [&[Group]; 3] = [
+        &[Group::Osc1, Group::Osc2],
+        &[Group::Sub, Group::Filter],
+        &[Group::FilterEnv, Group::AmpEnv, Group::Global],
+    ];
+    let values = two_osc::Values::from_map(&device.params);
+    ui.horizontal_top(|ui| {
+        builtin_header(app, ui, track, device);
+        ui.separator();
+        ui.vertical(|ui| {
+            if app.session.device_status(track, device.id) == crate::DeviceStatus::NotInstalled {
+                let why = "This instrument plays on the Tracktion engine only; it is silent here.";
+                ui.label(RichText::new(why).color(theme::WARN));
+            }
+            for row in ROWS {
+                let size = vec2(ui.available_width(), 98.0);
+                ui.allocate_ui_with_layout(size, Layout::left_to_right(Align::Min), |ui| {
+                    for (position, &group) in row.iter().enumerate() {
+                        if position > 0 {
+                            ui.separator();
+                        }
+                        ui.vertical(|ui| {
+                            ui.label(RichText::new(group.title()).small().color(theme::TEXT_DIM));
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 2.0;
+                                for p in two_osc::PARAMS.iter().filter(|p| p.group == group) {
+                                    ui.add_enabled_ui(values.active(p.id), |ui| {
+                                        two_osc_param(app, ui, track, device, p, values.get(p.id));
+                                    });
+                                }
+                            });
+                        });
+                    }
+                });
+                ui.add_space(4.0);
+            }
+        });
+    });
+}
+
+fn two_osc_param(
+    app: &mut DawApp,
+    ui: &mut Ui,
+    track: TrackId,
+    device: &Device,
+    p: &two_osc::Param,
+    value: f64,
+) {
+    let set = |value: Option<f64>| Op::DeviceSetParam {
+        track,
+        id: device.id,
+        param: p.id,
+        value,
+    };
+    // Accessible names carry the section: "Level" is in four of them.
+    let label = format!("{} {}", p.group.title(), p.name);
+    match p.kind {
+        Kind::Toggle => {
+            ui.vertical(|ui| {
+                ui.add_space(22.0);
+                let mut on = value != 0.0;
+                let response = ui.checkbox(&mut on, p.name);
+                let checked = on;
+                response.widget_info(|| {
+                    egui::WidgetInfo::selected(egui::Role::CheckBox, ui.is_enabled(), checked, &label)
+                });
+                if response.changed() {
+                    app.session.edit(vec![set(Some(if on { 1.0 } else { 0.0 }))]);
+                }
+            });
+        }
+        Kind::Choice(labels) => {
+            ui.vertical(|ui| {
+                ui.add_space(6.0);
+                ui.label(RichText::new(p.name).size(11.0).color(theme::TEXT_DIM));
+                let mut choice = value as usize;
+                let current = labels.get(choice).copied().unwrap_or("?");
+                let combo = ComboBox::from_id_salt(("two_osc", p.id))
+                    .selected_text(current)
+                    .width(if labels.len() > 3 { 76.0 } else { 58.0 })
+                    .show_ui(ui, |ui| {
+                        for (index, text) in labels.iter().enumerate() {
+                            if ui.selectable_value(&mut choice, index, *text).changed() {
+                                app.session.edit(vec![set(Some(index as f64))]);
+                            }
+                        }
+                    });
+                combo
+                    .response
+                    .widget_info(|| egui::WidgetInfo::labeled(egui::Role::ComboBox, ui.is_enabled(), &label));
+            });
+        }
+        Kind::Continuous { .. } => {
+            let knob_param = TwoOscKnob {
+                param: p,
+                label: &label,
+            };
+            let (response, change) = knob(ui, &knob_param, value);
+            knob_edit(app, &response, change, set);
+        }
+    }
+}
+
+/// Makes the edit a knob asks for: a turn is part of the knob's gesture (one undo step per
+/// drag), a reset an edit of its own.
+fn knob_edit(app: &mut DawApp, response: &Response, change: Option<Change>, set: impl Fn(Option<f64>) -> Op) {
+    match change {
+        Some(Change::Reset) => {
+            app.session.edit(vec![set(None)]);
+        }
+        Some(Change::Set(value)) => {
+            if let Some(gesture) = app.gestures.track(&mut app.session, response) {
+                app.session.edit_gesture(vec![set(Some(value))], gesture);
+            }
+        }
+        None => {
+            // Keeps the gesture tracker informed about where a drag begins.
+            app.gestures.track(&mut app.session, response);
+        }
+    }
+}
+
+/// What a knob needs to know about its parameter.
+trait KnobParam {
+    /// Shown above the knob.
+    fn name(&self) -> &str;
+    /// The accessible name, and the one in the hint.
+    fn label(&self) -> &str {
+        self.name()
+    }
+    fn default(&self) -> f64;
+    fn travel_of(&self, value: f64) -> f64;
+    /// The value at a travel, as the parameter can hold it.
+    fn value_at(&self, travel: f64) -> f64;
+    fn text(&self, value: f64) -> String;
+}
+
+impl KnobParam for ParamInfo {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn default(&self) -> f64 {
+        f64::from(self.default)
+    }
+    fn travel_of(&self, value: f64) -> f64 {
+        f64::from(to_norm(self, value as f32))
+    }
+    fn value_at(&self, travel: f64) -> f64 {
+        f64::from(from_norm(self, travel as f32))
+    }
+    fn text(&self, value: f64) -> String {
+        format_value(self.unit, value as f32)
+    }
+}
+
+struct TwoOscKnob<'a> {
+    param: &'a two_osc::Param,
+    label: &'a str,
+}
+
+impl KnobParam for TwoOscKnob<'_> {
+    fn name(&self) -> &str {
+        self.param.name
+    }
+    fn label(&self) -> &str {
+        self.label
+    }
+    fn default(&self) -> f64 {
+        self.param.default
+    }
+    fn travel_of(&self, value: f64) -> f64 {
+        self.param.to_travel(value)
+    }
+    fn value_at(&self, travel: f64) -> f64 {
+        let value = self.param.from_travel(travel);
+        // Whole cents, as for Pocket.
+        if self.param.unit == "ct" {
+            value.round()
+        } else {
+            value
+        }
+    }
+    fn text(&self, value: f64) -> String {
+        format_value(self.param.unit, value as f32)
+    }
 }
 
 fn param(app: &mut DawApp, ui: &mut Ui, track: TrackId, device: &Device, info: &ParamInfo) {
@@ -340,25 +542,12 @@ fn param(app: &mut DawApp, ui: &mut Ui, track: TrackId, device: &Device, info: &
         });
         return;
     }
-    let (response, change) = knob(ui, info, value);
-    match change {
-        Some(Change::Reset) => {
-            app.session.edit(vec![set(None)]);
-        }
-        Some(Change::Set(value)) => {
-            if let Some(gesture) = app.gestures.track(&mut app.session, &response) {
-                app.session.edit_gesture(vec![set(Some(value))], gesture);
-            }
-        }
-        None => {
-            // Keeps the gesture tracker informed about where a drag begins.
-            app.gestures.track(&mut app.session, &response);
-        }
-    }
+    let (response, change) = knob(ui, info, f64::from(value));
+    knob_edit(app, &response, change, |value| set(value.map(|v| v as f32)));
 }
 
 enum Change {
-    Set(f32),
+    Set(f64),
     Reset,
 }
 
@@ -384,23 +573,28 @@ fn from_norm(info: &ParamInfo, norm: f32) -> f32 {
     value.clamp(info.min, info.max)
 }
 
-fn format_value(info: &ParamInfo, value: f32) -> String {
-    match info.unit {
+/// A value as a knob shows it. Pocket's unitless values are fractions, shown in percent.
+fn format_value(unit: &str, value: f32) -> String {
+    match unit {
         "s" if value < 1.0 => format!("{:.0} ms", value * 1000.0),
         "s" => format!("{value:.2} s"),
+        "ms" => format!("{value:.0} ms"),
         "Hz" if value >= 1000.0 => format!("{:.2} kHz", value / 1000.0),
         "Hz" => format!("{value:.0} Hz"),
-        "st" | "ct" => format!("{value:+.0} {}", info.unit),
+        "st" | "ct" => format!("{value:+.0} {unit}"),
         "oct" => format!("{value:+.1} oct"),
+        "dB" if value <= -100.0 => "-inf dB".to_string(),
+        "dB" => format!("{value:.1} dB"),
+        "%" => format!("{value:.0} %"),
         _ => format!("{:.0} %", value * 100.0),
     }
 }
 
 /// A rotary control. Drag up and down to turn it; double-click to reset.
-fn knob(ui: &mut Ui, info: &ParamInfo, value: f32) -> (Response, Option<Change>) {
+fn knob(ui: &mut Ui, info: &impl KnobParam, value: f64) -> (Response, Option<Change>) {
     let (rect, mut response) = ui.allocate_exact_size(vec2(62.0, 76.0), Sense::click_and_drag());
     let mut change = None;
-    let mut norm = to_norm(info, value);
+    let mut norm = info.travel_of(value) as f32;
 
     // The drag accumulates in knob travel, not in the value, so rounding cannot stall it.
     if response.drag_started() {
@@ -414,32 +608,42 @@ fn knob(ui: &mut Ui, info: &ParamInfo, value: f32) -> (Response, Option<Change>)
             *travel = (*travel + delta).clamp(0.0, 1.0);
             *travel
         });
-        let turned = from_norm(info, travel);
+        let turned = info.value_at(f64::from(travel));
         if turned != value {
-            norm = to_norm(info, turned);
+            norm = info.travel_of(turned) as f32;
             change = Some(Change::Set(turned));
             response.mark_changed();
         }
     }
     if response.double_clicked() {
-        norm = to_norm(info, info.default);
+        norm = info.travel_of(info.default()) as f32;
         change = Some(Change::Reset);
     }
 
     let shown = match change {
         Some(Change::Set(value)) => value,
-        Some(Change::Reset) => info.default,
+        Some(Change::Reset) => info.default(),
         None => value,
     };
-    response.widget_info(|| egui::WidgetInfo::slider(true, f64::from(shown), info.name));
+    let enabled = ui.is_enabled();
+    response.widget_info(|| egui::WidgetInfo::slider(enabled, shown, info.label()));
     let painter = ui.painter_at(rect);
     let name = pos2(rect.center().x, rect.top() + 2.0);
+    // Greyed out when it makes no difference.
+    let (fill, text) = if enabled {
+        (theme::LOOP, theme::TEXT)
+    } else {
+        (
+            theme::LOOP.gamma_multiply(0.35),
+            theme::TEXT_DIM.gamma_multiply(0.6),
+        )
+    };
     painter.text(
         name,
         Align2::CENTER_TOP,
-        info.name,
+        info.name(),
         FontId::proportional(11.0),
-        theme::TEXT_DIM,
+        if enabled { theme::TEXT_DIM } else { text },
     );
     let centre = pos2(rect.center().x, rect.top() + 36.0);
     let radius = 15.0;
@@ -457,28 +661,27 @@ fn knob(ui: &mut Ui, info: &ParamInfo, value: f32) -> (Response, Option<Change>)
     let active = response.dragged() || response.hovered();
     painter.add(Shape::line(arc(1.0), Stroke::new(3.0, theme::GRID_BAR)));
     if norm > 0.0 {
-        painter.add(Shape::line(arc(norm), Stroke::new(3.0, theme::LOOP)));
+        painter.add(Shape::line(arc(norm), Stroke::new(3.0, fill)));
     }
     let a = angle(norm);
     let direction = vec2(a.cos(), a.sin());
-    let pointer = if active { Color32::WHITE } else { theme::TEXT };
+    let pointer = if active && enabled { Color32::WHITE } else { text };
     painter.line_segment(
         [centre + direction * 4.0, centre + direction * (radius - 3.0)],
         Stroke::new(2.0, pointer),
     );
     let value_at = pos2(rect.center().x, rect.bottom() - 3.0);
-    let text = format_value(info, shown);
     painter.text(
         value_at,
         Align2::CENTER_BOTTOM,
-        text,
+        info.text(shown),
         FontId::proportional(11.0),
-        theme::TEXT,
+        text,
     );
 
     let hint = format!(
         "{}: drag up or down. Hold Shift for fine steps. Double-click to reset.",
-        info.name
+        info.label()
     );
     (response.on_hover_text(hint), change)
 }

@@ -12,7 +12,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use mdaw_engine::{Engine, LiveInput};
-use mdaw_model::{BlobHash, DeviceId, DeviceKind, PluginFormat, Project, Tick, TickRange, TrackId};
+use mdaw_model::{
+    BlobHash, BuiltinKind, DeviceId, DeviceKind, PluginFormat, Project, Tick, TickRange, TrackId,
+};
 
 use crate::audio::{Audio, DeviceStatus, LiveSink, ParamEntry, PluginEntry, SavedState, TrackSound};
 use crate::link::Waker;
@@ -106,6 +108,10 @@ impl Audio for OldAudio {
     fn set_waker(&mut self, waker: Waker) {
         // Only once plugins are enabled does the host take it (see `enable_plugins`).
         self.waker = Some(waker);
+    }
+
+    fn default_instrument(&self) -> BuiltinKind {
+        BuiltinKind::Pocket
     }
 
     fn set_project(&mut self, project: &Project) {
@@ -216,8 +222,14 @@ impl Audio for OldAudio {
         let Some(d) = project.track(track).and_then(|t| t.content.device(device)) else {
             return DeviceStatus::Loading;
         };
-        let DeviceKind::Plugin { format, id, .. } = &d.kind else {
-            return DeviceStatus::Builtin;
+        let (format, id) = match &d.kind {
+            DeviceKind::Plugin { format, id, .. } => (format, id),
+            // The Tracktion engine's instrument is not played here (`mdaw-dsp` leaves it inert).
+            DeviceKind::Builtin {
+                kind: BuiltinKind::TwoOsc,
+                ..
+            } => return DeviceStatus::NotInstalled,
+            DeviceKind::Builtin { .. } => return DeviceStatus::Builtin,
         };
         if plugins.crashed(track, device) {
             return DeviceStatus::Failed("crashed".into());
@@ -235,6 +247,20 @@ impl Audio for OldAudio {
     }
 
     fn track_sound(&self, project: &Project, track: TrackId) -> TrackSound {
+        let silent_here = project.track(track).is_some_and(|t| {
+            t.content.devices.iter().any(|d| {
+                matches!(
+                    d.kind,
+                    DeviceKind::Builtin {
+                        kind: BuiltinKind::TwoOsc,
+                        ..
+                    }
+                )
+            })
+        });
+        if silent_here {
+            return TrackSound::Silent;
+        }
         self.plugins.0.borrow().sound(project, track)
     }
 
@@ -322,5 +348,77 @@ impl Audio for OldAudio {
             self.saved_at = Instant::now();
         }
         self.plugins.0.borrow_mut().save_changed()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mdaw_model::{ActorId, Clip, Device, IdGen, Note, Op, TrackContent, TrackShell, apply};
+
+    /// The Tracktion engine's instrument is inert here: silent, said so, and no error; Pocket
+    /// next to it still plays.
+    #[test]
+    fn the_tracktion_instrument_is_silent_here() {
+        let mut audio = OldAudio::new(Engine::manual(48_000, false));
+        assert_eq!(audio.default_instrument(), BuiltinKind::Pocket);
+        let mut ids = IdGen::new(ActorId(3));
+        let mut project = Project::default();
+        let mut track_with = |project: &mut Project, kind: BuiltinKind| {
+            let (track, device) = (ids.track(), ids.device());
+            let mut content = TrackContent::default();
+            content
+                .devices
+                .push_back(Device::new(device, crate::builtin_kind(kind)));
+            let mut clip = Clip {
+                start: Tick(0),
+                length: Tick(4 * mdaw_model::PPQ),
+                name: "c".into(),
+                notes: Default::default(),
+            };
+            clip.notes.insert(
+                ids.note(),
+                Note {
+                    start: Tick(0),
+                    dur: Tick(mdaw_model::PPQ),
+                    pitch: 60,
+                    vel: 100,
+                },
+            );
+            content.clips.insert(ids.clip(), Arc::new(clip));
+            apply(
+                project,
+                &Op::TrackAdd {
+                    id: track,
+                    shell: TrackShell {
+                        name: "t".into(),
+                        color: 0,
+                    },
+                    content,
+                    after: None,
+                },
+            );
+            (track, device)
+        };
+        let (track, device) = track_with(&mut project, BuiltinKind::TwoOsc);
+        let peak = |audio: &mut OldAudio, project: &Project| {
+            audio.set_project(project);
+            audio.frame(project);
+            audio.seek(Tick(0));
+            audio.play();
+            let samples = audio.engine_mut().pump(24_000).unwrap_or_default();
+            audio.stop();
+            samples.iter().fold(0.0f32, |m, s| m.max(s.abs()))
+        };
+        assert_eq!(peak(&mut audio, &project), 0.0, "silent");
+        assert_eq!(
+            audio.device_status(&project, track, device),
+            DeviceStatus::NotInstalled
+        );
+        assert_eq!(audio.track_sound(&project, track), TrackSound::Silent);
+
+        let (pocket, _) = track_with(&mut project, BuiltinKind::Pocket);
+        assert!(peak(&mut audio, &project) > 0.01, "Pocket plays next to it");
+        assert_eq!(audio.track_sound(&project, pocket), TrackSound::Builtin);
     }
 }

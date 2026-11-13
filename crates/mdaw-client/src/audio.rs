@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use mdaw_model::{BlobHash, DeviceId, PluginFormat, Project, Tick, TickRange, TrackId};
+use mdaw_model::{BlobHash, BuiltinKind, DeviceId, PluginFormat, Project, Tick, TickRange, TrackId};
 
 use crate::link::Waker;
 
@@ -97,6 +97,10 @@ pub trait Audio: Any {
     fn set_waker(&mut self, _waker: Waker) {}
 
     // ---- the project
+
+    /// The built-in instrument this engine plays, which new tracks get: Pocket on the Rust
+    /// engine, its successor for 4OSC (`BuiltinKind::TwoOsc`, also called "Pocket") on Tracktion.
+    fn default_instrument(&self) -> BuiltinKind;
 
     /// The project as it should sound from now on: the session's view. Cheap when it did not
     /// change; the engine takes it over at most once per frame.

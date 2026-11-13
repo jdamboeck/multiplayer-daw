@@ -199,7 +199,14 @@ impl PluginFormat {
     }
 }
 
+/// The built-in devices. New variants go at the end: the wire and store formats number them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum BuiltinKind {
+    /// The Rust engine's own synth (`mdaw_dsp::pocket`), parameters in its table there. Played
+    /// only by the old engine; it goes with it.
     Pocket,
+    /// The built-in instrument on the Tracktion engine, a front for Tracktion's 4OSC: two
+    /// oscillators and a sub oscillator. Users know it as "Pocket" too. Parameters in
+    /// [`crate::two_osc`].
+    TwoOsc,
 }

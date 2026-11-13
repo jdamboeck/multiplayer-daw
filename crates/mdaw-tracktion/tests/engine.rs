@@ -368,6 +368,8 @@ fn the_engine_follows_the_model() {
     track_removed(&mut world, &ids);
     sync_by_difference(&world, &mut ids_gen);
     world.load();
+    builtin_instrument(&mut world, &mut ids_gen);
+    world.load();
     plugins(&mut world, &mut ids_gen, have_clap);
 
     drop(world);
@@ -1284,6 +1286,398 @@ fn sync_by_difference(world: &World, ids_gen: &mut IdGen) {
     let calls = engine.call_count();
     sync_project(engine, &next, &next, &no_blobs).expect("sync: nothing");
     assert_eq!(engine.call_count() - calls, 0, "no change: no call");
+}
+
+/// Energy of the left channel between two times.
+fn energy_between(wav: &Wav, from: f64, to: f64) -> f64 {
+    wav.samples[wav.frame_range(from, to)]
+        .chunks_exact(2)
+        .map(|f| f64::from(f[0]).powi(2))
+        .sum()
+}
+
+/// A crude measure of low end: the share of the energy (left channel, between two times) that
+/// passes two one-pole low-passes at 100 Hz.
+fn lowness(wav: &Wav, from: f64, to: f64) -> f64 {
+    let a = 1.0 - (-2.0 * std::f64::consts::PI * 100.0 / wav.rate).exp();
+    let (mut y1, mut y2, mut low, mut all) = (0.0, 0.0, 0.0, 0.0);
+    for frame in wav.samples[wav.frame_range(from, to)].chunks_exact(2) {
+        let x = f64::from(frame[0]);
+        y1 += a * (x - y1);
+        y2 += a * (y1 - y2);
+        low += y2 * y2;
+        all += x * x;
+    }
+    low / all.max(1e-12)
+}
+
+/// The number at the start of a text 4osc shows ("-6.00dB", "300ms"), and the place of its
+/// last digit (0.01 for "-6.00").
+fn text_number(text: &str) -> Option<(f64, f64)> {
+    let end = text
+        .find(|c: char| !(c.is_ascii_digit() || c == '-' || c == '+' || c == '.'))
+        .unwrap_or(text.len());
+    let number = &text[..end];
+    let decimals = number.split_once('.').map_or(0, |(_, d)| d.len());
+    Some((number.parse().ok()?, 10f64.powi(-(decimals as i32))))
+}
+
+/// Step 7c: the built-in instrument for this engine (`BuiltinKind::TwoOsc`, "Pocket" to users, a
+/// front for 4osc; mapping in `src/two_osc.rs`), driven through model ops: the defaults sound;
+/// the sub oscillator adds low end and takes it away again; oscillator 2 and the filter change
+/// the sound; mono plays one voice; every continuous value reaches 4osc as 4osc shows it; and
+/// syncing by difference ends where a fresh load does.
+fn builtin_instrument(world: &mut World, ids_gen: &mut IdGen) {
+    use mdaw_model::two_osc::{self, Kind, PARAMS, id};
+    let (track, synth, clip) = (ids_gen.track(), ids_gen.device(), ids_gen.clip());
+    let (c3, e3, g3) = (ids_gen.note(), ids_gen.note(), ids_gen.note());
+    // 120 bpm whatever the steps before left: this point wins at tick 0 (highest id).
+    let tempo = ids_gen.tempo();
+    let held = |pitch| Note {
+        start: Tick(0),
+        dur: Tick(4 * Q),
+        pitch,
+        vel: 100,
+    };
+    let kind = DeviceKind::Builtin {
+        kind: BuiltinKind::TwoOsc,
+        dsp_version: two_osc::DSP_VERSION,
+    };
+    for op in [
+        Op::TempoPut {
+            id: tempo,
+            point: TempoPoint {
+                tick: Tick(0),
+                milli_bpm: 120_000,
+            },
+        },
+        Op::TrackAdd {
+            id: track,
+            shell: TrackShell {
+                name: "Pocket".into(),
+                color: 0,
+            },
+            content: TrackContent::default(),
+            after: None,
+        },
+        Op::DeviceAdd {
+            track,
+            device: Device::new(synth, kind.clone()),
+            after: None,
+        },
+        Op::ClipAdd {
+            track,
+            id: clip,
+            clip: Clip {
+                start: Tick(0),
+                length: Tick(8 * Q),
+                name: "c".into(),
+                notes: Default::default(),
+            },
+        },
+        Op::NoteAdd {
+            track,
+            clip,
+            id: c3,
+            note: held(48),
+        },
+    ] {
+        let problems = world.op(op);
+        assert!(problems.is_empty(), "instrument setup: {problems:?}");
+    }
+    let raw = synth.0.0;
+    let set = |world: &mut World, param: u32, value: Option<f64>| {
+        if let Some(v) = value {
+            two_osc::check(param, v).unwrap_or_else(|e| panic!("instrument param {param} = {v}: {e}"));
+        }
+        let problems = world.op(Op::DeviceSetParam {
+            track,
+            id: synth,
+            param,
+            value,
+        });
+        assert!(problems.is_empty(), "instrument param {param}: {problems:?}");
+    };
+    let params = |world: &World| world.engine.device_params(raw).expect("4osc params");
+    let text = |world: &World, four_osc: &str| {
+        params(world)
+            .into_iter()
+            .find(|p| p.id == four_osc)
+            .unwrap_or_else(|| panic!("4osc has no {four_osc}"))
+            .text
+    };
+    let end = 8 * Q;
+
+    // (1) The defaults sound, at a level that leaves headroom.
+    let defaults = render(&world.engine, "instrument_default", end);
+    let level = (energy_between(&defaults, 0.1, 1.9) / (1.8 * defaults.rate)).sqrt();
+    println!(
+        "RESULT instrument_default_peak={:.4} instrument_default_rms={level:.4}",
+        defaults.peak()
+    );
+    assert!(
+        defaults.peak() > SOUND && defaults.peak() < 0.9,
+        "instrument defaults: plausible level ({})",
+        defaults.peak()
+    );
+    assert!(
+        defaults.last_above(SILENT).is_some_and(|t| t < 2.6),
+        "instrument defaults: the note ends after its release"
+    );
+    for (four_osc, expected) in [
+        ("filterFreq", "2500Hz"),
+        ("level1", "-6.00dB"),
+        ("fineTune2", "7.00"),
+        ("masterLevel", "-3.00"),
+        ("ampSustain", "70.0%"),
+        ("filterAmount", "30%"),
+        ("tune3", "-12st"),
+    ] {
+        assert_eq!(
+            text(world, four_osc),
+            expected,
+            "instrument default on 4osc: {four_osc}"
+        );
+    }
+
+    // (2) SUB On adds low end; Off takes it away again.
+    let low_off = lowness(&defaults, 0.1, 1.9);
+    let calls = world.engine.call_count();
+    set(world, id::SUB_ON, Some(1.0));
+    let state_calls = world.engine.call_count() - calls;
+    let sub = render(&world.engine, "instrument_sub", end);
+    let low_on = lowness(&sub, 0.1, 1.9);
+    set(world, id::SUB_ON, None);
+    let off_again = render(&world.engine, "instrument_sub_off", end);
+    let low_off_again = lowness(&off_again, 0.1, 1.9);
+    println!(
+        "RESULT instrument_lowness_off={low_off:.4} on={low_on:.4} off_again={low_off_again:.4} sub_on_calls={state_calls}"
+    );
+    assert!(
+        low_on > 2.0 * low_off,
+        "SUB On: more low end ({low_off} -> {low_on})"
+    );
+    assert!(
+        low_off_again < 0.6 * low_on,
+        "SUB Off: low end gone again ({low_on} -> {low_off_again})"
+    );
+    assert_eq!(
+        state_calls, 3,
+        "a setting in 4osc's state: is the device there, read the state, write it"
+    );
+
+    // (3) OSC 2 Wave None against Saw: one oscillator fewer, less energy.
+    set(world, id::OSC2_WAVE, Some(0.0));
+    let one = render(&world.engine, "instrument_osc2_none", end);
+    set(world, id::OSC2_WAVE, None);
+    let ratio = energy_between(&defaults, 0.1, 1.9) / energy_between(&one, 0.1, 1.9);
+    println!("RESULT instrument_osc2_energy_ratio={ratio:.3}");
+    assert!(ratio > 1.3, "OSC 2 Saw against None: more energy ({ratio})");
+
+    // (4) Filter Type Off against LP at 200 Hz (no envelope): much brighter.
+    set(world, id::FILTER_ENV_AMOUNT, Some(0.0));
+    set(world, id::FILTER_FREQ, Some(200.0));
+    assert_eq!(text(world, "filterFreq"), "200Hz");
+    let dark = brightness(&render(&world.engine, "instrument_lp200", end));
+    set(world, id::FILTER_TYPE, Some(0.0));
+    let open = brightness(&render(&world.engine, "instrument_filter_off", end));
+    println!("RESULT instrument_brightness_lp200={dark:.4} off={open:.4}");
+    assert!(
+        dark < 0.5 * open,
+        "Filter Off: brighter than LP 200 Hz ({dark} vs {open})"
+    );
+    for param in [id::FILTER_TYPE, id::FILTER_FREQ, id::FILTER_ENV_AMOUNT] {
+        set(world, param, None);
+    }
+
+    // (5) Every continuous value reaches 4osc as 4osc shows it: min, inside, max and back to the
+    //     default (`None`). The texts are 4osc's own, so a wrong range or skew shows.
+    let four_osc_of = |param: u32| -> &'static str {
+        match param {
+            id::OSC1_TUNE => "tune1",
+            id::OSC1_FINE => "fineTune1",
+            id::OSC1_LEVEL => "level1",
+            id::OSC1_PW => "pulseWidth1",
+            id::OSC2_TUNE => "tune2",
+            id::OSC2_FINE => "fineTune2",
+            id::OSC2_LEVEL => "level2",
+            id::OSC2_PW => "pulseWidth2",
+            id::SUB_LEVEL => "level3",
+            id::FILTER_FREQ => "filterFreq",
+            id::FILTER_RES => "filterResonance",
+            id::FILTER_KEY => "filterKey",
+            id::FILTER_ENV_AMOUNT => "filterAmount",
+            id::FILTER_VELOCITY => "filterVelocity",
+            id::FILTER_ATTACK => "filterAttack",
+            id::FILTER_DECAY => "filterDecay",
+            id::FILTER_SUSTAIN => "filterSustain",
+            id::FILTER_RELEASE => "filterRelease",
+            id::AMP_ATTACK => "ampAttack",
+            id::AMP_DECAY => "ampDecay",
+            id::AMP_SUSTAIN => "ampSustain",
+            id::AMP_RELEASE => "ampRelease",
+            id::AMP_VELOCITY => "ampVelocity",
+            id::GLIDE => "legato",
+            id::LEVEL => "masterLevel",
+            other => panic!("parameter {other} is not continuous"),
+        }
+    };
+    let mut checked = 0;
+    for p in PARAMS
+        .iter()
+        .filter(|p| matches!(p.kind, Kind::Continuous { .. }))
+    {
+        let four_osc = four_osc_of(p.id);
+        let mut values: Vec<Option<f64>> = [0.0, 0.3, 0.7, 1.0]
+            .into_iter()
+            .map(|t| Some(p.from_travel(t)))
+            .collect();
+        values.push(None);
+        for value in values {
+            let calls = world.engine.call_count();
+            set(world, p.id, value);
+            assert_eq!(
+                world.engine.call_count() - calls,
+                2,
+                "{}: is the device there, set one parameter",
+                p.name
+            );
+            let expected = value.unwrap_or(p.default);
+            let shown = text(world, four_osc);
+            let (number, place) =
+                text_number(&shown).unwrap_or_else(|| panic!("{four_osc}: no number in {shown:?}"));
+            let seconds_as_ms = p.unit == "s" && shown.ends_with("ms");
+            let got = if seconds_as_ms { number / 1000.0 } else { number };
+            let place = if seconds_as_ms { place / 1000.0 } else { place };
+            let tolerance = 0.5 * place + 1e-4 * expected.abs() + 1e-9;
+            assert!(
+                (got - expected).abs() <= tolerance,
+                "{} {} = {expected}: 4osc's {four_osc} shows {shown:?}",
+                p.group.title(),
+                p.name
+            );
+            checked += 1;
+        }
+    }
+    println!("RESULT instrument_values_checked={checked}");
+    set(world, id::SUB_OCTAVE, Some(1.0));
+    assert_eq!(text(world, "tune3"), "-24st", "SUB Octave -2");
+    set(world, id::SUB_OCTAVE, None);
+
+    // (6) Mode Mono: a chord of three notes sounds as one voice.
+    for (note, pitch) in [(e3, 52), (g3, 55)] {
+        world.op(Op::NoteAdd {
+            track,
+            clip,
+            id: note,
+            note: held(pitch),
+        });
+    }
+    set(world, id::OSC2_WAVE, Some(0.0));
+    let poly = energy_between(&render(&world.engine, "instrument_chord_poly", end), 0.1, 1.9);
+    set(world, id::MODE, Some(1.0));
+    let mono = energy_between(&render(&world.engine, "instrument_chord_mono", end), 0.1, 1.9);
+    let single = energy_between(&one, 0.1, 1.9);
+    println!(
+        "RESULT instrument_chord_energy poly={:.3} mono={:.3} (one note = 1)",
+        poly / single,
+        mono / single
+    );
+    assert!(mono < 0.6 * poly, "Mono: one voice, not three ({mono} vs {poly})");
+    assert!(
+        (0.4..2.0).contains(&(mono / single)),
+        "Mono: about the energy of one note ({})",
+        mono / single
+    );
+    set(world, id::MODE, None);
+    set(world, id::OSC2_WAVE, None);
+    for note in [e3, g3] {
+        world.op(Op::NoteRemove {
+            track,
+            clip,
+            id: note,
+        });
+    }
+
+    // (7) Syncing by difference ends where a fresh load does. One oscillator in the end state
+    //     (OSC 2 None, SUB Off), so the level repeats and a missed setting shows.
+    let no_blobs = |_: &BlobHash| None;
+    let before = world.model.clone();
+    world.load();
+    let mut model = before.clone();
+    let mut synced = before.clone();
+    let param_op = |param, value| Op::DeviceSetParam {
+        track,
+        id: synth,
+        param,
+        value,
+    };
+    let steps: Vec<Vec<Op>> = vec![
+        vec![param_op(id::OSC2_WAVE, Some(0.0))],
+        vec![param_op(id::SUB_ON, Some(1.0)), param_op(id::SUB_WAVE, Some(1.0))],
+        vec![param_op(id::FILTER_FREQ, Some(1200.0))],
+        vec![param_op(id::FILTER_TYPE, Some(2.0))],
+        vec![param_op(id::FILTER_SLOPE, Some(1.0))],
+        vec![Op::DeviceSetBypass {
+            track,
+            id: synth,
+            bypass: true,
+        }],
+        vec![
+            param_op(id::SUB_ON, None),
+            param_op(id::OSC1_WAVE, Some(1.0)),
+            param_op(id::OSC1_PW, Some(30.0)),
+        ],
+        vec![Op::DeviceSetBypass {
+            track,
+            id: synth,
+            bypass: false,
+        }],
+        vec![
+            param_op(id::AMP_RELEASE, Some(1.0)),
+            param_op(id::LEVEL, Some(-8.0)),
+        ],
+        vec![param_op(id::FILTER_TYPE, None), param_op(id::MODE, Some(2.0))],
+        vec![Op::DeviceRemove { track, id: synth }],
+        vec![Op::DeviceAdd {
+            track,
+            device: {
+                let mut device = Device::new(synth, kind.clone());
+                device.params.insert(id::OSC2_WAVE, 0.0);
+                device.params.insert(id::FILTER_FREQ, 900.0);
+                device.params.insert(id::AMP_RELEASE, 0.8);
+                device
+            },
+            after: None,
+        }],
+        vec![param_op(id::FILTER_RES, Some(60.0))],
+    ];
+    for (i, ops) in steps.into_iter().enumerate() {
+        for op in &ops {
+            assert!(op.validate().and_then(|()| op.fits(&model)).is_ok(), "{op:?}");
+            mdaw_model::apply(&mut model, op);
+        }
+        let problems = sync_project(&world.engine, &synced, &model, &no_blobs)
+            .unwrap_or_else(|e| panic!("instrument sync {i}: {e}"));
+        assert!(problems.is_empty(), "instrument sync {i}: {problems:?}");
+        synced = model.clone();
+    }
+    let by_diff = render(&world.engine, "instrument_sync", end);
+    load_project(&world.engine, &model, &no_blobs).expect("instrument: reload");
+    let loaded = render(&world.engine, "instrument_sync_loaded", end);
+    assert_same_envelope(&by_diff, &loaded, "instrument sync");
+    let energy = |wav: &Wav| wav.envelope().iter().map(|x| x * x).sum::<f64>();
+    let ratio = (energy(&by_diff) / energy(&loaded)).sqrt();
+    println!("RESULT instrument_sync_level_ratio={ratio:.4}");
+    assert!(
+        (0.98..1.02).contains(&ratio),
+        "instrument sync: level differs by {ratio:.4}"
+    );
+    assert!(by_diff.peak() > SOUND, "instrument sync: sounds");
+
+    world.model = before;
+    world.op(Op::TrackRemove { id: track });
+    world.op(Op::TempoRemove { id: tempo });
 }
 
 /// Step 8: plugin devices. One whose plugin is not installed is left out and reported; the

@@ -13,13 +13,16 @@
 //! first, then the values (which the model keeps in the plugin's own units, converted here with
 //! the range the engine reports).
 //!
-//! The built-in Pocket synth is played by the engine's own synth, Tracktion's 4osc, set up from
-//! Pocket's parameters through [`POCKET_TO_FOUR_OSC`]. That is an approximation for the
-//! migration, not the same synth: the oscillators, filter and envelopes are 4osc's, and only
-//! their settings follow Pocket's.
+//! Both built-in devices are played by the engine's own synth, Tracktion's 4osc. The built-in
+//! instrument for this engine (`BuiltinKind::TwoOsc`) is a front for 4osc whose values are 4osc's
+//! own (see [`crate::two_osc`]). The old engine's Pocket synth is set up from Pocket's
+//! parameters through [`POCKET_TO_FOUR_OSC`]: an approximation kept for old projects, not the
+//! same synth.
 
+use crate::two_osc::{self as two_osc_map, Target};
 use crate::{Engine, EntityKind, Error, Note as EngineNote, ParamInfo, PluginInfo, Status};
 use mdaw_dsp::pocket::{PocketParams, param as pocket};
+use mdaw_model::two_osc::Values as TwoOscValues;
 use mdaw_model::{
     BlobHash, BuiltinKind, ClipId, ClipProp, Device, DeviceId, DeviceKind, MAX_MILLI_BPM, MAX_TICK,
     MIN_MILLI_BPM, Note, NoteId, Op, PluginFormat, Project, ShellProp, TempoId, TrackContent, TrackId,
@@ -47,8 +50,8 @@ pub enum Problem {
         reason: String,
     },
     /// A device parameter the engine cannot be given: one the plugin does not have, or one the
-    /// built-in Pocket synth does not have (the engine's stand-in for Pocket takes all of
-    /// Pocket's own, see [`POCKET_TO_FOUR_OSC`]).
+    /// built-in device does not have (the engine takes all of Pocket's own, see
+    /// [`POCKET_TO_FOUR_OSC`], and all of the built-in instrument's, see [`crate::two_osc`]).
     ParamNotMapped {
         track: TrackId,
         device: DeviceId,
@@ -354,7 +357,7 @@ impl<'a> Sync<'a> {
                 match &device.kind {
                     DeviceKind::Builtin { .. } => {
                         if engine.has(EntityKind::Device, raw_device(*id)) {
-                            self.put_pocket(*track, device)?;
+                            self.put_builtin_changes(*track, device, [*param])?;
                         }
                     }
                     DeviceKind::Plugin { .. } => {
@@ -536,11 +539,8 @@ impl<'a> Sync<'a> {
     ) -> Result<bool, Error> {
         let raw = raw_device(device.id);
         let added = match &device.kind {
-            // The engine's own synth stands in for Pocket until the engine has Pocket.
-            DeviceKind::Builtin {
-                kind: BuiltinKind::Pocket,
-                ..
-            } => self
+            // The engine's own synth plays both built-in devices.
+            DeviceKind::Builtin { .. } => self
                 .engine
                 .device_add(raw_track(track), raw, after_device, "builtin", "4osc")
                 .map(|()| true)?,
@@ -587,7 +587,7 @@ impl<'a> Sync<'a> {
         }
         self.engine.device_set_bypass(raw, device.bypass)?;
         match &device.kind {
-            DeviceKind::Builtin { .. } => self.put_pocket(track, device)?,
+            DeviceKind::Builtin { .. } => self.put_builtin(track, device)?,
             DeviceKind::Plugin { state, .. } => {
                 if let Some(blob) = state {
                     self.put_state(track, device.id, *blob);
@@ -605,10 +605,114 @@ impl<'a> Sync<'a> {
         }
         let params = match &device.kind {
             DeviceKind::Plugin { .. } => self.engine.device_params(raw_device(device.id))?,
-            DeviceKind::Builtin { .. } => return self.put_pocket(track, device),
+            DeviceKind::Builtin { .. } => return self.put_builtin(track, device),
         };
         for (param, value) in &device.params {
             self.put_param(track, device.id, &params, *param, Some(*value))?;
+        }
+        Ok(())
+    }
+
+    /// Sets the engine's synth up from all of a built-in device's parameters, defaults included.
+    pub(crate) fn put_builtin(&mut self, track: TrackId, device: &Device) -> Result<(), Error> {
+        match &device.kind {
+            DeviceKind::Builtin {
+                kind: BuiltinKind::TwoOsc,
+                ..
+            } => self.put_two_osc(track, device),
+            _ => self.put_pocket(track, device),
+        }
+    }
+
+    /// Carries changes of some of a built-in device's parameters over; the values are read from
+    /// `device`. For Pocket the whole synth is set up again.
+    pub(crate) fn put_builtin_changes(
+        &mut self,
+        track: TrackId,
+        device: &Device,
+        params: impl IntoIterator<Item = u32>,
+    ) -> Result<(), Error> {
+        let DeviceKind::Builtin {
+            kind: BuiltinKind::TwoOsc,
+            ..
+        } = &device.kind
+        else {
+            return self.put_pocket(track, device);
+        };
+        let raw = raw_device(device.id);
+        let values = TwoOscValues::from_map(&device.params);
+        let mut state = false;
+        for param in params {
+            match two_osc_map::target(param) {
+                None => self.problems.push(Problem::ParamNotMapped {
+                    track,
+                    device: device.id,
+                    param,
+                }),
+                Some(Target::State) => state = true,
+                Some(Target::Param {
+                    four_osc,
+                    range,
+                    convert,
+                }) => {
+                    let plain = convert(values.get(param));
+                    self.engine
+                        .device_set_param(raw, four_osc, range.normalise(plain) as f32)?;
+                }
+            }
+        }
+        if state {
+            self.put_two_osc_state(raw, &values)?;
+        }
+        Ok(())
+    }
+
+    /// Sets 4osc up as the built-in instrument (`BuiltinKind::TwoOsc`, see [`crate::two_osc`]):
+    /// first the settings that are part of its state, then every parameter.
+    fn put_two_osc(&mut self, track: TrackId, device: &Device) -> Result<(), Error> {
+        let raw = raw_device(device.id);
+        let values = TwoOscValues::from_map(&device.params);
+        self.put_two_osc_state(raw, &values)?;
+        for p in &mdaw_model::two_osc::PARAMS {
+            if let Some(Target::Param {
+                four_osc,
+                range,
+                convert,
+            }) = two_osc_map::target(p.id)
+            {
+                let plain = convert(values.get(p.id));
+                self.engine
+                    .device_set_param(raw, four_osc, range.normalise(plain) as f32)?;
+            }
+        }
+        for (four_osc, range, plain) in two_osc_map::FIXED_PARAMS {
+            self.engine
+                .device_set_param(raw, four_osc, range.normalise(*plain) as f32)?;
+        }
+        for param in device.params.keys() {
+            if two_osc_map::target(*param).is_none() {
+                self.problems.push(Problem::ParamNotMapped {
+                    track,
+                    device: device.id,
+                    param: *param,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Patches the instrument's settings into 4osc's state; no call if it holds them already.
+    fn put_two_osc_state(&mut self, raw: u64, values: &TwoOscValues) -> Result<(), Error> {
+        let state = self.engine.device_get_state(raw);
+        let patched = value_tree::with_int_properties(&state, &two_osc_map::state_properties(values))
+            .ok_or_else(|| {
+                Error::new(
+                    Status::Internal,
+                    "the engine's synth gave a state that is not a ValueTree",
+                )
+            })?;
+        if patched != state {
+            self.engine.device_set_state(raw, &patched)?;
         }
         Ok(())
     }
@@ -707,14 +811,14 @@ impl<'a> Sync<'a> {
 /// A 4osc parameter's range, as Tracktion's `FourOscPlugin` declares it
 /// (`juce::NormalisableRange (start, end, interval, skew)`): normalised = proportion^skew.
 #[derive(Clone, Copy, Debug)]
-struct FourOscRange {
+pub(crate) struct FourOscRange {
     start: f64,
     end: f64,
     skew: f64,
 }
 
 impl FourOscRange {
-    fn normalise(self, plain: f64) -> f64 {
+    pub(crate) fn normalise(self, plain: f64) -> f64 {
         let proportion = ((plain - self.start) / (self.end - self.start)).clamp(0.0, 1.0);
         if self.skew == 1.0 {
             proportion
@@ -724,60 +828,73 @@ impl FourOscRange {
     }
 }
 
-/// amp attack, decay, release: 0.001..60 s, skewed.
-const AMP_TIME: FourOscRange = FourOscRange {
-    start: 0.001,
-    end: 60.0,
-    skew: 0.2,
-};
-/// filter attack, decay, release: 0..60 s, skewed.
-const FILTER_TIME: FourOscRange = FourOscRange {
-    start: 0.0,
-    end: 60.0,
-    skew: 0.2,
-};
-/// Sustain levels, resonance, key tracking: 0..100 %.
-const PERCENT: FourOscRange = FourOscRange {
-    start: 0.0,
-    end: 100.0,
-    skew: 1.0,
-};
-/// Oscillator and master levels: -100..0 dB, skewed (-100 dB is silence).
-const LEVEL_DB: FourOscRange = FourOscRange {
-    start: -100.0,
-    end: 0.0,
-    skew: 4.0,
-};
-/// Oscillator tune: -36..36 semitones in steps of 1.
-const TUNE: FourOscRange = FourOscRange {
-    start: -36.0,
-    end: 36.0,
-    skew: 1.0,
-};
-/// Oscillator fine tune: -100..100 cents.
-const FINE_TUNE: FourOscRange = FourOscRange {
-    start: -100.0,
-    end: 100.0,
-    skew: 1.0,
-};
-/// Pulse width: 0.01..0.99.
-const PULSE_WIDTH: FourOscRange = FourOscRange {
-    start: 0.01,
-    end: 0.99,
-    skew: 1.0,
-};
-/// Filter frequency as a MIDI note number: 0..135.076232 (20 kHz).
-const FILTER_NOTE: FourOscRange = FourOscRange {
-    start: 0.0,
-    end: 135.076_232,
-    skew: 1.0,
-};
-/// Filter envelope amount: -1..1, in units of 137 semitones.
-const FILTER_AMOUNT: FourOscRange = FourOscRange {
-    start: -1.0,
-    end: 1.0,
-    skew: 1.0,
-};
+/// The ranges of the 4osc parameters the built-in devices use.
+pub(crate) mod four_osc_range {
+    use super::FourOscRange;
+
+    /// amp attack, decay, release: 0.001..60 s, skewed.
+    pub(crate) const AMP_TIME: FourOscRange = FourOscRange {
+        start: 0.001,
+        end: 60.0,
+        skew: 0.2,
+    };
+    /// filter attack, decay, release: 0..60 s, skewed.
+    pub(crate) const FILTER_TIME: FourOscRange = FourOscRange {
+        start: 0.0,
+        end: 60.0,
+        skew: 0.2,
+    };
+    /// Sustain levels, resonance, key tracking: 0..100 %.
+    pub(crate) const PERCENT: FourOscRange = FourOscRange {
+        start: 0.0,
+        end: 100.0,
+        skew: 1.0,
+    };
+    /// Oscillator and master levels: -100..0 dB, skewed (-100 dB is silence).
+    pub(crate) const LEVEL_DB: FourOscRange = FourOscRange {
+        start: -100.0,
+        end: 0.0,
+        skew: 4.0,
+    };
+    /// Oscillator tune: -36..36 semitones in steps of 1.
+    pub(crate) const TUNE: FourOscRange = FourOscRange {
+        start: -36.0,
+        end: 36.0,
+        skew: 1.0,
+    };
+    /// Oscillator fine tune: -100..100 cents.
+    pub(crate) const FINE_TUNE: FourOscRange = FourOscRange {
+        start: -100.0,
+        end: 100.0,
+        skew: 1.0,
+    };
+    /// Pulse width: 0.01..0.99.
+    pub(crate) const PULSE_WIDTH: FourOscRange = FourOscRange {
+        start: 0.01,
+        end: 0.99,
+        skew: 1.0,
+    };
+    /// Filter frequency as a MIDI note number: 0..135.076232 (20 kHz).
+    pub(crate) const FILTER_NOTE: FourOscRange = FourOscRange {
+        start: 0.0,
+        end: 135.076_232,
+        skew: 1.0,
+    };
+    /// Filter envelope amount: -1..1, in units of 137 semitones.
+    pub(crate) const FILTER_AMOUNT: FourOscRange = FourOscRange {
+        start: -1.0,
+        end: 1.0,
+        skew: 1.0,
+    };
+    /// Legato (glide) time: 0..500 ms.
+    pub(crate) const GLIDE: FourOscRange = FourOscRange {
+        start: 0.0,
+        end: 500.0,
+        skew: 1.0,
+    };
+}
+
+use four_osc_range::*;
 
 /// How a Pocket value (in Pocket's units) becomes a 4osc value (in 4osc's units).
 #[derive(Clone, Copy, Debug)]

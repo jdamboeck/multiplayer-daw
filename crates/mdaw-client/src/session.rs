@@ -137,6 +137,7 @@ impl Session {
 
     /// A local session on a new project with one instrument track.
     pub fn starter(audio: impl Into<Box<dyn Audio>>) -> Self {
+        let audio: Box<dyn Audio> = audio.into();
         let mut ids = IdGen::new(TEMPLATE_ACTOR);
         let mut project = Project::default();
         let tempo = TempoPoint {
@@ -150,7 +151,7 @@ impl Session {
                     id: ids.tempo(),
                     point: tempo,
                 },
-                new_track(&mut ids, 0, None),
+                new_track(&mut ids, 0, None, audio.default_instrument()),
             ],
         );
         Self::local(project, audio)
@@ -502,12 +503,14 @@ impl Session {
         self.edit(vec![Op::DeviceAdd { track, device, after }])
     }
 
-    /// Makes the built-in Pocket synth the track's instrument again.
-    pub fn use_pocket(&mut self, track: TrackId) -> bool {
-        let kind = DeviceKind::Builtin {
-            kind: BuiltinKind::Pocket,
-            dsp_version: pocket::DSP_VERSION,
-        };
+    /// The built-in instrument new tracks get here: the one this client's engine plays.
+    pub fn default_instrument(&self) -> BuiltinKind {
+        self.audio.default_instrument()
+    }
+
+    /// Makes the engine's built-in instrument the track's instrument again.
+    pub fn use_builtin(&mut self, track: TrackId) -> bool {
+        let kind = builtin_kind(self.audio.default_instrument());
         let device = mdaw_model::Device::new(self.replica.ids().device(), kind);
         let ops = self.replace_instrument(track, device);
         self.edit(ops)
@@ -1197,14 +1200,22 @@ fn record_displaced(displaced: &mut Vec<Displaced>, event: Event) {
     }
 }
 
-/// The op that adds an instrument track named after its position.
-pub fn new_track(ids: &mut IdGen, index: usize, after: Option<TrackId>) -> Op {
-    let mut content = TrackContent::default();
-    let kind = DeviceKind::Builtin {
-        kind: BuiltinKind::Pocket,
-        dsp_version: pocket::DSP_VERSION,
+/// A built-in device of this kind, as a new one is made.
+pub fn builtin_kind(kind: BuiltinKind) -> DeviceKind {
+    let dsp_version = match kind {
+        BuiltinKind::Pocket => pocket::DSP_VERSION,
+        BuiltinKind::TwoOsc => mdaw_model::two_osc::DSP_VERSION,
     };
-    content.devices.push_back(Device::new(ids.device(), kind));
+    DeviceKind::Builtin { kind, dsp_version }
+}
+
+/// The op that adds an instrument track named after its position, with the built-in
+/// `instrument` (the engine's own, [`Session::default_instrument`]).
+pub fn new_track(ids: &mut IdGen, index: usize, after: Option<TrackId>, instrument: BuiltinKind) -> Op {
+    let mut content = TrackContent::default();
+    content
+        .devices
+        .push_back(Device::new(ids.device(), builtin_kind(instrument)));
     let shell = TrackShell {
         name: format!("Track {}", index + 1),
         color: theme::PALETTE[index % theme::PALETTE.len()],

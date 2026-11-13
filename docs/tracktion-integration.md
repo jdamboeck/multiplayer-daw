@@ -283,17 +283,31 @@ settings folder. The list offers only plugins whose file is still there, each id
 parameters report their plain range, so the model's values (plain, by CLAP id) are applied,
 after the state. `mdaw_project_has`, `mdaw_clip_set_name`, `mdaw_device_reset_state` (back to
 the state captured when the device was made) and `mdaw_last_status` are new. The engine's
-tempo range (20–300 bpm) is still narrower than the model's (20–400); the Pocket synth's
-parameters are still not mapped to the engine's synth.
+tempo range (20–300 bpm) was narrower than the model's; the model now has the same limit.
 
 One VST3 and one LV2 instrument each were loaded and rendered through the bridge by hand
 (ChowKick and Vital as VST3; Dexed and String machine as LV2), not by the committed tests.
 
-The built-in Pocket synth of the model is played by Tracktion's 4osc. All twenty Pocket
-parameters are mapped (table in `crates/mdaw-tracktion/src/apply.rs`); it is an approximation
-for the migration — velocity response, voice count and the exact filter and envelope shapes
-differ. For that table `mdaw-tracktion` depends on `mdaw-dsp`; when the Rust engine is retired
-the table moves or the model's built-in device becomes 4osc itself.
+**The built-in instrument.** On Tracktion the built-in instrument is a front for 4osc
+(`BuiltinKind::TwoOsc` in the model; users know it as "Pocket", like the old one): two
+oscillators (Sine, Square, Saw, Triangle, Noise; oscillator 2 also None) with tune, fine tune,
+level and pulse width; a sub oscillator, switched on or off, one or two octaves down, sine or
+square (4osc's oscillator 3); filter type (off, low-, high-, band-pass, notch), frequency,
+resonance, slope, key tracking, envelope amount and velocity, with its ADSR; the amp ADSR and
+velocity; voice mode (poly, mono, legato), glide and level. The table is
+`crates/mdaw-model/src/two_osc.rs`; values are 4osc's own units, so nothing is lost on the way.
+The mapping (`crates/mdaw-tracktion/src/two_osc.rs`) normalises them with 4osc's ranges and
+skews; wave shapes, filter type and slope and voice mode are properties of 4osc's state, not
+parameters, and are patched into it. Oscillator 4, unison, pan, the LFOs, modulation envelopes,
+modulation matrix and effects are not used (4osc's matrix starts empty and its effects off). A
+parameter change costs one `mdaw_device_set_param`, a change of a state setting a state read and
+write. Two free-running oscillators make the level of a note vary from play to play (accepted).
+The integration test checks every continuous value against the text 4osc shows for it.
+
+The old Rust engine's synth, also Pocket (`BuiltinKind::Pocket`), stays for old projects and goes
+with that engine. Tracktion plays it through 4osc as an approximation (table
+`POCKET_TO_FOUR_OSC` in `crates/mdaw-tracktion/src/apply.rs`, which is why `mdaw-tracktion` still
+depends on `mdaw-dsp`); the Rust engine leaves the new instrument silent.
 
 The model's tempo limit is now 20–300 bpm, the range Tracktion plays.
 
