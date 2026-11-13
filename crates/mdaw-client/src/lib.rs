@@ -5,7 +5,6 @@
 //! real server (M2 on).
 
 mod app;
-pub mod checkout;
 mod link;
 pub mod live;
 pub mod plugins;
@@ -17,4 +16,4 @@ pub mod ui;
 
 pub use app::{DawApp, Focus, Selection, Tab};
 pub use link::{Waker, Who};
-pub use session::{CommitState, Displaced, LogEntry, Logged, Session, Status, Timing};
+pub use session::{Displaced, Session, Status};

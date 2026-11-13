@@ -6,25 +6,9 @@ use mdaw_model::TrackId;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering::Relaxed};
 
-/// While following, a playhead further than this from where it should be is put right, once
-/// it has been so for [`DRIFT_PATIENCE`] buffers in a row: a single late callback is not drift.
-const MAX_DRIFT_MICROS: i64 = 20_000;
-const DRIFT_PATIENCE: u32 = 3;
-/// Right after a new anchor the playhead is put right at once, unless it is as good as there:
-/// this is where seeks arrive, and nobody wants to wait for those.
-const FRESH_DRIFT_MICROS: i64 = 2_000;
-
 /// The part of an audio callback's time that plugins in other processes may use, in percent of
 /// the buffer's length. The rest is for everything else, and for the device.
 const DEADLINE_PERCENT: u64 = 60;
-
-/// A point of the timeline pinned to a moment of the engine's clock.
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub(crate) struct Anchor {
-    pub tick: f64,
-    /// On the clock that `fill` is given the buffers' play times on.
-    pub micros: i64,
-}
 
 pub(crate) enum Command {
     /// Replace the graph. The old one travels back for disposal.
@@ -32,16 +16,6 @@ pub(crate) enum Command {
     /// Play freely from where the playhead is.
     Play,
     Stop,
-    /// Play so that the playhead is at the anchor's tick at the anchor's time: wait there if
-    /// that is still to come, otherwise be wherever that puts the playhead by now, and stay
-    /// in step from then on. `fresh` marks an anchor that describes a new playback rather
-    /// than a better estimate of the same one.
-    Follow {
-        anchor: Anchor,
-        fresh: bool,
-    },
-    /// Stop following; what was following plays on freely.
-    Unfollow,
     /// Jump to a tick.
     Seek(f64),
     /// Loop region in ticks.
@@ -57,13 +31,6 @@ pub(crate) enum Command {
         key: u64,
     },
     Panic,
-    /// Play a piece of audio on its own, beside the transport: interleaved stereo at the
-    /// engine's rate. `None` stops what plays. The control side keeps a reference to the audio
-    /// until `Shared::preview_id` has moved past `id`, so the audio thread never frees it.
-    Preview {
-        id: u64,
-        audio: Option<Arc<[f32]>>,
-    },
 }
 
 /// A live note from any thread, through [`crate::LiveInput`].
@@ -96,17 +63,6 @@ pub(crate) struct Shared {
     /// Callbacks that took longer than the audio they produced.
     pub overruns: AtomicU64,
     pub stream_errors: AtomicU64,
-    /// Whether playback follows an anchor and has started.
-    pub following: AtomicBool,
-    /// While following: how far the playhead was ahead of where it should be at the start of
-    /// the last buffer, in microseconds.
-    pub drift_micros: AtomicI64,
-    /// Jumps made to get back in step.
-    pub resyncs: AtomicU64,
-    /// The `id` of the last preview command taken.
-    pub preview_id: AtomicU64,
-    /// Frames of the preview played so far, or `u64::MAX` once it is over or stopped.
-    pub preview_pos: AtomicU64,
     /// When the playhead in `tick` is heard, on the engine's clock.
     pub tick_heard_at: AtomicI64,
     /// The listener's own volume, as `f32` bits: applied to everything this engine outputs,
@@ -125,17 +81,7 @@ pub(crate) struct RtCore {
     pos: i64,
     loop_ticks: Option<(f64, f64)>,
     loop_samples: Option<(i64, i64)>,
-    follow: Option<Anchor>,
-    /// The anchor has not been compared with the playhead yet.
-    fresh: bool,
-    /// Frames until a start that falls into the buffer being filled, or after it.
-    start_in: Option<usize>,
-    /// Buffers in a row that began with too much drift.
-    adrift: u32,
     scratch: [f32; MAX_BLOCK * 2],
-    preview: Option<Arc<[f32]>>,
-    /// Next sample of `preview` to play.
-    preview_at: usize,
 }
 
 impl RtCore {
@@ -156,13 +102,7 @@ impl RtCore {
             pos: 0,
             loop_ticks: None,
             loop_samples: None,
-            follow: None,
-            fresh: false,
-            start_in: None,
-            adrift: 0,
             scratch: [0.0; MAX_BLOCK * 2],
-            preview: None,
-            preview_at: 0,
         }
     }
 
@@ -195,29 +135,8 @@ impl RtCore {
                     std::mem::forget(old);
                 }
             }
-            Command::Play => {
-                self.follow = None;
-                self.start_in = None;
-                self.start();
-            }
-            Command::Stop => {
-                self.follow = None;
-                self.start_in = None;
-                self.halt();
-            }
-            Command::Follow { anchor, fresh } => {
-                self.fresh |= fresh || self.follow.is_none();
-                self.follow = Some(anchor);
-                self.adrift = 0;
-            }
-            Command::Unfollow => {
-                // Whoever followed is playing as far as the control side knows, even if the
-                // start was still to come.
-                if self.follow.take().is_some() {
-                    self.start_in = None;
-                    self.start();
-                }
-            }
+            Command::Play => self.start(),
+            Command::Stop => self.halt(),
             Command::Seek(tick) => self.jump(self.graph.sample_at(tick.max(0.0))),
             Command::SetLoop(range) => {
                 self.loop_ticks = range;
@@ -231,12 +150,6 @@ impl RtCore {
             } => self.graph.note_on(track, key, pitch, vel),
             Command::NoteOff { track, key } => self.graph.note_off(track, key),
             Command::Panic => self.graph.release_all_notes(),
-            Command::Preview { id, audio } => {
-                // Dropping the old audio frees nothing: the control side still holds it.
-                self.preview = audio;
-                self.preview_at = 0;
-                self.shared.preview_id.store(id, Relaxed);
-            }
         }
     }
 
@@ -262,87 +175,9 @@ impl RtCore {
         }
     }
 
-    fn frames(&self, micros: i64) -> i64 {
-        (micros as f64 * self.graph.sample_rate() as f64 / 1e6).round() as i64
-    }
-
-    /// Where playback that passed `from` is `elapsed` frames later: it wraps at the end of
-    /// the loop if it started before it, like [`RtCore::block`] does.
-    fn ahead(&self, from: i64, elapsed: i64) -> i64 {
-        let at = from.saturating_add(elapsed);
-        match self.loop_samples {
-            Some((start, end)) if from < end && at >= end => start + (at - start).rem_euclid(end - start),
-            _ => at,
-        }
-    }
-
-    /// Brings the transport in line with the anchor, for a buffer whose first frame is heard
-    /// at `play_micros`.
-    fn steer(&mut self, play_micros: i64) {
-        self.start_in = None;
-        let Some(anchor) = self.follow else {
-            self.shared.following.store(false, Relaxed);
-            return;
-        };
-        let at = self.graph.sample_at(anchor.tick.max(0.0));
-        let lead = anchor.micros.saturating_sub(play_micros);
-        if lead > 0 {
-            // The start is still to come: wait at the anchor, and begin on the exact frame.
-            self.halt();
-            self.pos = at;
-            self.start_in = Some(self.frames(lead) as usize);
-            self.shared.following.store(false, Relaxed);
-            return;
-        }
-        let expected = self.ahead(at, self.frames(-lead));
-        if !self.playing {
-            self.pos = expected;
-            self.start();
-            self.fresh = false;
-            self.adrift = 0;
-        }
-        let mut drift = self.pos - expected;
-        if let Some((start, end)) = self.loop_samples
-            && (start..end).contains(&self.pos)
-            && (start..end).contains(&expected)
-        {
-            // Inside the loop, the short way round is what counts.
-            let len = end - start;
-            drift = (drift + len / 2).rem_euclid(len) - len / 2;
-        }
-        let micros = (drift as f64 * 1e6 / self.graph.sample_rate() as f64) as i64;
-        let limit = if self.fresh {
-            FRESH_DRIFT_MICROS
-        } else {
-            MAX_DRIFT_MICROS
-        };
-        self.adrift = if micros.abs() > limit { self.adrift + 1 } else { 0 };
-        if self.adrift >= DRIFT_PATIENCE || (self.fresh && self.adrift > 0) {
-            self.jump(expected);
-            self.adrift = 0;
-            self.shared.resyncs.fetch_add(1, Relaxed);
-            self.shared.drift_micros.store(0, Relaxed);
-        } else {
-            self.shared.drift_micros.store(micros, Relaxed);
-        }
-        self.fresh = false;
-        self.shared.following.store(true, Relaxed);
-    }
-
     /// Renders up to `max` frames into the scratch buffer and returns how many.
     fn block(&mut self, max: usize) -> usize {
         let mut frames = max.min(MAX_BLOCK);
-        match self.start_in {
-            Some(0) => {
-                self.start_in = None;
-                self.start();
-            }
-            Some(wait) => {
-                frames = frames.min(wait);
-                self.start_in = Some(wait - frames);
-            }
-            None => {}
-        }
         let pos = self.playing.then_some(self.pos);
         if let (Some(pos), Some((_, end))) = (pos, self.loop_samples)
             && pos < end
@@ -350,19 +185,6 @@ impl RtCore {
             frames = frames.min((end - pos) as usize);
         }
         self.graph.process(pos, &mut self.scratch[..frames * 2]);
-        if let Some(preview) = &self.preview {
-            let left = preview.len().saturating_sub(self.preview_at).min(frames * 2);
-            for (out, sample) in self.scratch[..left]
-                .iter_mut()
-                .zip(&preview[self.preview_at..self.preview_at + left])
-            {
-                *out += sample;
-            }
-            self.preview_at += left;
-            if self.preview_at >= preview.len() {
-                self.preview = None;
-            }
-        }
         if self.playing {
             self.pos += frames as i64;
             if let Some((start, end)) = self.loop_samples
@@ -377,7 +199,7 @@ impl RtCore {
     }
 
     /// Fills a device buffer of interleaved frames with `channels` channels each. Its first
-    /// frame is heard at `play_micros` on the clock that anchors are given on.
+    /// frame is heard at `play_micros` on [`crate::clock::now_micros`].
     pub fn fill<T: Copy>(
         &mut self,
         data: &mut [T],
@@ -399,7 +221,6 @@ impl RtCore {
                 LiveNote::Off { track, key } => self.graph.note_off(track, key),
             }
         }
-        self.steer(play_micros);
         let channels = channels.max(1);
         // Plugins in other processes may take part of the callback, together; whatever they
         // have not delivered by then goes without them.
@@ -449,11 +270,6 @@ impl RtCore {
             // Positive floats order like their bit patterns.
             slot.fetch_max(value.to_bits(), Relaxed);
         }
-        let preview_pos = match self.preview {
-            Some(_) => (self.preview_at / 2) as u64,
-            None => u64::MAX,
-        };
-        shared.preview_pos.store(preview_pos, Relaxed);
         shared.callbacks.fetch_add(1, Relaxed);
         shared.frames.fetch_add(total, Relaxed);
     }

@@ -1,5 +1,5 @@
 use mdaw_model::*;
-use mdaw_proto::{Event, EventBody, SyncData, Txn};
+use mdaw_proto::{Event, SyncData, Txn};
 use mdaw_sync::{Gesture, Loopback, Replica, SyncError};
 use proptest::prelude::*;
 use std::collections::VecDeque;
@@ -124,11 +124,9 @@ impl Server {
             actor,
             user: UserId(actor.0),
             wall_ts: 0,
-            body: EventBody::Txn {
-                client_txn_id: txn.client_txn_id,
-                ops: txn.ops,
-                superseded: vec![],
-            },
+            client_txn_id: txn.client_txn_id,
+            ops: txn.ops,
+            superseded: vec![],
         };
         self.log.push(event.clone());
         event

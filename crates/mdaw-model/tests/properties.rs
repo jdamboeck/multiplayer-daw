@@ -255,35 +255,7 @@ proptest! {
     #[test]
     fn generated_ops_are_valid(op in op()) {
         prop_assert_eq!(op.validate(), Ok(()));
-        let entity = op.entity();
-        match op.scope() {
-            Scope::Project => {}
-            Scope::TrackStructure(t) | Scope::TrackContent(t) => prop_assert_eq!(entity.track(), Some(t)),
-        }
-        let _ = (op.prop(), op.is_removal(), op.adds_plugin(), op.blobs());
-    }
-
-    /// The diff reports exactly the tracks whose content changed.
-    #[test]
-    fn affected_ranges_match_changed_tracks(setup in ops(30), txn in ops(10)) {
-        let before = build(&setup);
-        let mut after = before.clone();
-        apply_all(&mut after, &txn);
-        let affected = affected_ranges(&before, &txn);
-
-        let mut seen = std::collections::BTreeSet::new();
-        for a in &affected {
-            prop_assert!(seen.insert(a.track), "track listed twice");
-            if let Some(r) = a.range { prop_assert!(!r.is_empty()); }
-        }
-        let ids: std::collections::BTreeSet<TrackId> =
-            before.tracks.keys().chain(after.tracks.keys()).copied().collect();
-        for id in ids {
-            let content = |p: &Project| p.track(id).map(|t| t.content.clone());
-            if content(&before) != content(&after) {
-                prop_assert!(seen.contains(&id), "{:?} changed but was not reported", id);
-            }
-        }
+        let _ = (op.entity(), op.prop(), op.is_removal(), op.blobs());
     }
 }
 
@@ -420,30 +392,6 @@ fn removing_a_clip_and_undoing_brings_back_its_notes() {
     assert!(p.track(track).unwrap().content.clips.is_empty());
     apply_all(&mut p, &undo);
     assert_eq!(p, with_note);
-
-    // The diff of adding that note is the note's absolute span.
-    let before = build(&setup[..2]);
-    let affected = affected_ranges(&before, &setup[2..]);
-    let start = Tick::bars(2) + Tick::beats(1);
-    assert_eq!(
-        affected,
-        [Affected {
-            track,
-            range: Some(TickRange::new(start, start + Tick::beats(1)))
-        }]
-    );
-    // ... and the sample covers the bar around it.
-    let listen = listening_range(&p.track(track).unwrap().content, affected[0].range).unwrap();
-    assert_eq!(listen, TickRange::new(Tick::bars(2), Tick::bars(3)));
-    // A mix change has no range; the sample starts at the first bar with notes.
-    let mix = [Op::TrackSetMix {
-        track,
-        prop: MixProp::Gain(0.5),
-    }];
-    let affected = affected_ranges(&p, &mix);
-    assert_eq!(affected, [Affected { track, range: None }]);
-    let listen = listening_range(&p.track(track).unwrap().content, None).unwrap();
-    assert_eq!(listen, TickRange::new(Tick::bars(2), Tick::bars(6)));
 }
 
 #[test]

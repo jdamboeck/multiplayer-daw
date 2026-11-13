@@ -7,7 +7,7 @@ use mdaw_model::{ClipId, EntityRef, NoteId, Op, Tick, TickRange, TrackId};
 
 use crate::live::MidiWatch;
 use crate::session::{Session, new_track};
-use crate::ui::{arrange, changelog, checkout, devices, live, piano_roll, transport};
+use crate::ui::{arrange, changelog, devices, live, piano_roll, transport};
 
 /// The view that keyboard commands such as Delete act on: the one clicked last.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -47,10 +47,6 @@ pub struct DawApp {
     pub(crate) rename: Option<(TrackId, String, bool)>,
     /// What the user is dragging in this frame; the views set it, the session shares it.
     pub(crate) editing: Option<EntityRef>,
-    /// The commit dialog, while open.
-    pub commit: Option<checkout::CommitDialog>,
-    /// A track whose checkout by someone else the user asked to end, awaiting confirmation.
-    pub confirm_force: Option<TrackId>,
     /// The changelog lists the whole project rather than the selected track.
     pub changelog_all: bool,
     pub live: live::LiveState,
@@ -74,8 +70,6 @@ impl DawApp {
             gestures: crate::ui::Gestures::default(),
             rename: None,
             editing: None,
-            commit: None,
-            confirm_force: None,
             changelog_all: false,
             live: live::LiveState::default(),
         }
@@ -100,11 +94,6 @@ impl DawApp {
     /// Runs one frame.
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         self.session.frame();
-        // The loop belongs to the transport, which others may have moved.
-        match self.session.loop_range() {
-            Some(range) => (self.loop_on, self.loop_range) = (true, range),
-            None => self.loop_on = false,
-        }
         self.drop_stale_selection();
         self.session.live().set_target(live::target(self));
         live::keyboard(self, ui.ctx());
@@ -138,7 +127,6 @@ impl DawApp {
                 }
             });
         egui::CentralPanel::no_frame().show(ui, |ui| arrange::show(self, ui));
-        checkout::dialogs(self, ui.ctx());
 
         let editing = self.editing.take();
         self.session.set_editing(editing);
@@ -169,17 +157,6 @@ impl DawApp {
     pub fn apply_loop(&mut self) {
         let range = (self.loop_on && !self.loop_range.is_empty()).then_some(self.loop_range);
         self.session.set_loop(range);
-    }
-
-    /// Opens the commit dialog for this user's checkout of `track`, which stops edits to it
-    /// while the samples render.
-    pub fn open_commit(&mut self, track: TrackId) {
-        if self.session.commit_state().is_none() && !self.session.start_commit(track) {
-            return;
-        }
-        if self.commit.is_none() {
-            self.commit = Some(checkout::CommitDialog::default());
-        }
     }
 
     pub fn add_track(&mut self) {

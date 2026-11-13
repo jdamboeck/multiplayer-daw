@@ -32,9 +32,14 @@ Prototype of a server/client DAW for collaborative editing. Working name.
   carries their state and a stem. Clients with the plugin run it, the others play the stem. The
   host sits behind a format-neutral interface, so VST3 can be added as another backend.
 
-**In progress** (branch `tracktion-integration`): moving local audio to Tracktion Engine and
-dropping shared transport, live MIDI and checkout in favour of plain concurrent editing. So far
-a native spike under `native/` and the documents above; the app itself is unchanged.
+M3 to M6 describe history. On branch `tracktion-integration` (2026-11-13) the shared transport
+and clock sync, live MIDI over the network, checkout/commit with changelog samples, and stems
+were removed: people collaborate on the project, not on the audio clock. Every edit, plugins
+included, is an ordinary transaction; each client plays the project on its own; a client
+without a plugin hears nothing from that track and says so.
+
+**In progress** (branch `tracktion-integration`): moving local audio to Tracktion Engine. So far
+a native spike under `native/`, a C bridge with its Rust side, and the documents above.
 
 ## Native build (Tracktion spike)
 
@@ -62,15 +67,15 @@ for Linux x86-64 and Windows x86-64. The Linux build needs PipeWire and ALSA lib
 ```sh
 cargo run -p mdaw-client      # a local project; falls back to a silent engine if no audio device opens
 cargo xtask demo              # a server and two clients (Ann, Ben) on this machine
-cargo test --workspace --exclude 'spike-*'
+cargo test --workspace --exclude mdaw-tracktion --exclude mdaw-tracktion-sys
 ```
 
 Double-click an empty lane to create a clip, double-click a clip to edit its notes, Space plays,
 Ctrl+Z undoes.
 
 Clients load the CLAP plugins installed in the usual folders (and in `CLAP_PATH`), plus a
-built-in test synth; `--no-plugins` starts one without plugins, which plays their tracks from
-stems. On Linux every plugin runs in a helper process of its own (`mdaw-plugin-host`, which must
+built-in test synth; `--no-plugins` starts one without plugins, in which their tracks are
+silent. On Linux every plugin runs in a helper process of its own (`mdaw-plugin-host`, which must
 sit next to `mdaw`), so a plugin that crashes or hangs takes only itself down;
 `MDAW_PLUGINS_IN_PROCESS=1` runs them inside `mdaw` instead.
 

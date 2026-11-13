@@ -1,6 +1,6 @@
 [package]
 name = "mdaw-net"
-description = "QUIC transport, framing streams, blob transfer and clock sync."
+description = "QUIC transport, framing streams and blob transfer."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -1,12 +1,7 @@
-use imbl::OrdMap;
-use mdaw_model::{
-    ActorId, IdGen, Op, Project, PropKey, Scope, TempoId, TempoPoint, Track, TrackId, UserId, apply,
-    apply_all,
-};
-use mdaw_proto::{Event, EventBody, ReleaseReason, SyncData, Txn, apply_event};
-use std::collections::{BTreeMap, VecDeque};
+use mdaw_model::{ActorId, IdGen, Op, Project, PropKey, apply, apply_all};
+use mdaw_proto::{Event, SyncData, Txn, apply_event};
+use std::collections::VecDeque;
 use std::fmt;
-use std::sync::Arc;
 
 /// Undo steps kept per client.
 const UNDO_LIMIT: usize = 500;
@@ -46,67 +41,6 @@ struct UndoEntry {
     gesture: Option<Gesture>,
 }
 
-/// A track this client's user has checked out. Edits to its contents stay here, in the
-/// journal, until they are committed; the view shows the track with the journal applied.
-#[derive(Clone, PartialEq, Debug)]
-pub struct Workspace {
-    pub track: TrackId,
-    /// Server sequence number of the `Checkout` event: which checkout of the track this is.
-    pub base_seq: u64,
-    /// The track when the checkout began. Its contents stay so in the shared document while the
-    /// checkout lasts; the shell may change.
-    pub base: Arc<Track>,
-    /// The edits so far, in order. They apply to the track's confirmed contents, which nobody
-    /// else can change while the checkout lasts. A property written again keeps only its latest
-    /// write, so a long checkout grows with what changed, not with how often.
-    pub journal: Vec<Op>,
-    /// The tempo points when the checkout began: what the work was made against.
-    pub base_tempo: OrdMap<TempoId, TempoPoint>,
-    /// A commit of this workspace is on its way. No more edits are taken.
-    pub committing: bool,
-    /// Counts the edits recorded, so that a change of the journal is seen even when its length
-    /// stays the same.
-    pub changes: u64,
-}
-
-impl Workspace {
-    fn new(track: TrackId, base_seq: u64, base: Arc<Track>, base_tempo: OrdMap<TempoId, TempoPoint>) -> Self {
-        Self {
-            track,
-            base_seq,
-            base,
-            journal: Vec::new(),
-            base_tempo,
-            committing: false,
-            changes: 0,
-        }
-    }
-
-    fn record(&mut self, op: Op) {
-        let (entity, prop) = (op.entity(), op.prop());
-        // Values are written whole, so only the last write of one counts. Adding, removing and
-        // moving depend on what is around them and stay as they were.
-        if !matches!(prop, PropKey::Existence | PropKey::Order) {
-            self.journal.retain(|o| o.entity() != entity || o.prop() != prop);
-        }
-        self.journal.push(op);
-        self.changes += 1;
-    }
-}
-
-/// How a checkout of this client's user came to an end.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Ended {
-    /// The journal is in the document now.
-    Committed,
-    /// Given up by its owner: the journal is thrown away.
-    Abandoned,
-    /// Someone ended it. The journal is all that is left of the work.
-    Forced { by: UserId },
-    /// The track is gone, or the checkout ended in events this client did not see one by one.
-    Lost,
-}
-
 /// One client's copy of the project.
 ///
 /// `confirmed` is the document as of the last event received. `pending` are this client's own
@@ -121,12 +55,6 @@ pub struct Replica {
     next_txn: u64,
     undo: Vec<UndoEntry>,
     redo: Vec<UndoEntry>,
-    /// Whose checkouts are this client's.
-    user: Option<UserId>,
-    workspaces: BTreeMap<TrackId, Workspace>,
-    ended: Vec<(Workspace, Ended)>,
-    /// Counts the local edits applied to the view.
-    revision: u64,
 }
 
 impl Replica {
@@ -141,86 +69,6 @@ impl Replica {
             next_txn: 1,
             undo: Vec::new(),
             redo: Vec::new(),
-            user: None,
-            workspaces: BTreeMap::new(),
-            ended: Vec::new(),
-            revision: 0,
-        }
-    }
-
-    /// Tells the replica which user it belongs to, so it knows its checkouts. Until then it
-    /// has none.
-    pub fn set_user(&mut self, user: UserId) {
-        if self.user != Some(user) {
-            self.user = Some(user);
-            self.reconcile();
-            self.rebuild();
-        }
-    }
-
-    pub fn user(&self) -> Option<UserId> {
-        self.user
-    }
-
-    /// Goes up with every local edit, undo and redo that changed the view, also those that
-    /// only went into a journal and so return no transaction.
-    pub fn revision(&self) -> u64 {
-        self.revision
-    }
-
-    /// This client's checkouts.
-    pub fn workspaces(&self) -> impl Iterator<Item = &Workspace> {
-        self.workspaces.values()
-    }
-
-    pub fn workspace(&self, track: TrackId) -> Option<&Workspace> {
-        self.workspaces.get(&track)
-    }
-
-    /// Replaces the journal of a checkout, as when it is read back from disk after a restart.
-    /// False if `track` is not checked out by this client.
-    pub fn restore_journal(
-        &mut self,
-        track: TrackId,
-        journal: Vec<Op>,
-        base_tempo: OrdMap<TempoId, TempoPoint>,
-    ) -> bool {
-        let Some(workspace) = self.workspaces.get_mut(&track) else {
-            return false;
-        };
-        workspace.journal = journal;
-        workspace.base_tempo = base_tempo;
-        workspace.changes += 1;
-        self.rebuild();
-        true
-    }
-
-    /// Freezes the workspace of `track` for a commit and returns it. `None` if there is no
-    /// such workspace or it is being committed already.
-    pub fn begin_commit(&mut self, track: TrackId) -> Option<Workspace> {
-        let workspace = self.workspaces.get_mut(&track).filter(|w| !w.committing)?;
-        workspace.committing = true;
-        Some(workspace.clone())
-    }
-
-    /// The commit did not go through: the workspace takes edits again.
-    pub fn cancel_commit(&mut self, track: TrackId) {
-        if let Some(workspace) = self.workspaces.get_mut(&track) {
-            workspace.committing = false;
-        }
-    }
-
-    /// Checkouts of this client's user that ended since the last call, with their journals.
-    pub fn take_ended(&mut self) -> Vec<(Workspace, Ended)> {
-        std::mem::take(&mut self.ended)
-    }
-
-    /// True when edits to the contents of `track` are taken: it is live, or checked out here and
-    /// not being committed.
-    pub fn can_edit_content(&self, track: TrackId) -> bool {
-        match self.confirmed.track(track).and_then(|t| t.checkout) {
-            None => true,
-            Some(_) => self.workspaces.get(&track).is_some_and(|w| !w.committing),
         }
     }
 
@@ -280,9 +128,6 @@ impl Replica {
                 debug_assert!(false, "invalid op submitted: {op:?}");
                 continue;
             }
-            if self.frozen(&op) {
-                continue;
-            }
             if let Some(inverse) = apply(&mut self.view, &op) {
                 steps.push(Step { forward: op, inverse });
             }
@@ -290,8 +135,7 @@ impl Replica {
         if steps.is_empty() {
             return None;
         }
-        self.revision += 1;
-        let txn = self.dispatch(steps.iter().map(|s| s.forward.clone()).collect());
+        let txn = self.enqueue(steps.iter().map(|s| s.forward.clone()).collect());
         self.redo.clear();
         match self.undo.last_mut() {
             Some(top) if gesture.is_some() && top.gesture == gesture => merge(&mut top.steps, steps),
@@ -302,7 +146,7 @@ impl Replica {
                 }
             }
         }
-        txn
+        Some(txn)
     }
 
     /// Wraps ops already applied to the view into a pending transaction.
@@ -317,38 +161,15 @@ impl Replica {
         txn
     }
 
-    /// True for an op on a workspace that is being committed.
-    fn frozen(&self, op: &Op) -> bool {
-        match op.scope() {
-            Scope::TrackContent(track) => self.workspaces.get(&track).is_some_and(|w| w.committing),
-            _ => false,
-        }
-    }
-
-    /// Ops already applied to the view: those on a checked-out track go to its journal, the
-    /// rest into a pending transaction, if any are left.
-    fn dispatch(&mut self, ops: Vec<Op>) -> Option<Txn> {
-        let mut live = Vec::with_capacity(ops.len());
-        for op in ops {
-            match op.scope() {
-                Scope::TrackContent(track) if self.workspaces.contains_key(&track) => {
-                    self.workspaces.get_mut(&track).expect("checked").record(op);
-                }
-                _ => live.push(op),
-            }
-        }
-        (!live.is_empty()).then(|| self.enqueue(live))
-    }
-
     /// Takes back this client's most recent edit that can still be taken back. Parts of it that
     /// someone else has overwritten since are left alone.
     ///
-    /// Returns the transaction to send, if the undone edit was not wholly inside a checkout.
+    /// Returns the transaction to send, if anything could be taken back.
     pub fn undo(&mut self) -> Option<Txn> {
         while let Some(entry) = self.undo.pop() {
             if let Some((ops, reverse)) = self.revert(entry) {
                 self.redo.push(reverse);
-                return self.dispatch(ops);
+                return Some(self.enqueue(ops));
             }
         }
         None
@@ -359,7 +180,7 @@ impl Replica {
         while let Some(entry) = self.redo.pop() {
             if let Some((ops, reverse)) = self.revert(entry) {
                 self.undo.push(reverse);
-                return self.dispatch(ops);
+                return Some(self.enqueue(ops));
             }
         }
         None
@@ -371,9 +192,6 @@ impl Replica {
         let mut ops = Vec::new();
         let mut steps = Vec::new();
         for step in entry.steps.into_iter().rev() {
-            if self.frozen(&step.inverse) {
-                continue;
-            }
             // Only take back what is still as this client left it: if applying the op again
             // would change something, someone has written there since.
             let mut probe = self.view.clone();
@@ -391,7 +209,6 @@ impl Replica {
         if ops.is_empty() {
             return None;
         }
-        self.revision += 1;
         Some((ops, UndoEntry { steps, gesture: None }))
     }
 
@@ -405,112 +222,26 @@ impl Replica {
         }
         self.seq = event.seq;
         apply_event(&mut self.confirmed, event);
-        let workspaces_changed = self.follow_checkouts(event);
 
         // The server sequences one client's transactions in the order they were sent.
         let own = event.actor == self.actor()
             && self
                 .pending
                 .front()
-                .is_some_and(|txn| event.client_txn_id() == Some(txn.client_txn_id));
-        if own && !workspaces_changed {
+                .is_some_and(|txn| event.client_txn_id == txn.client_txn_id);
+        if own {
             // The view already contains this edit and everything pending after it.
             self.pending.pop_front();
-            if self.pending.is_empty() && self.workspaces.is_empty() {
+            if self.pending.is_empty() {
                 debug_assert!(self.confirmed == self.view, "view diverged from the server");
                 // Equal in content; share the view's allocations so the next foreign event
                 // does not make every track look changed.
                 self.confirmed = self.view.clone();
             }
         } else {
-            if own {
-                self.pending.pop_front();
-            }
             self.rebuild();
         }
         Ok(())
-    }
-
-    /// Starts and ends workspaces as the event says. True if any did.
-    fn follow_checkouts(&mut self, event: &Event) -> bool {
-        let Some(user) = self.user else {
-            return false;
-        };
-        let changed = match &event.body {
-            EventBody::Checkout { track } if event.user == user => match self.confirmed.track(*track) {
-                Some(base) => {
-                    let workspace =
-                        Workspace::new(*track, event.seq, base.clone(), self.confirmed.tempo.clone());
-                    self.workspaces.insert(*track, workspace);
-                    true
-                }
-                None => false,
-            },
-            EventBody::Commit { track, .. } => self.end(*track, Ended::Committed),
-            EventBody::Release { track, reason } => {
-                let how = match reason {
-                    ReleaseReason::Abandoned => Ended::Abandoned,
-                    ReleaseReason::Forced { .. } if event.user == user => Ended::Abandoned,
-                    ReleaseReason::Forced { .. } => Ended::Forced { by: event.user },
-                };
-                self.end(*track, how)
-            }
-            _ => false,
-        };
-        // A removed track takes its checkout with it.
-        self.reconcile() || changed
-    }
-
-    fn end(&mut self, track: TrackId, how: Ended) -> bool {
-        match self.workspaces.remove(&track) {
-            Some(workspace) => {
-                self.ended.push((workspace, how));
-                true
-            }
-            None => false,
-        }
-    }
-
-    /// Makes the workspaces match the checkouts of the confirmed document: a checkout of this
-    /// user without a workspace gets an empty one, a workspace without a checkout ends. True if
-    /// anything changed.
-    fn reconcile(&mut self) -> bool {
-        let Some(user) = self.user else {
-            return false;
-        };
-        let confirmed = &self.confirmed;
-        // A workspace ends when its checkout is gone, and also when the track is checked out
-        // again since: that is another checkout, with another base.
-        let gone: Vec<TrackId> = self
-            .workspaces
-            .values()
-            .filter(|w| {
-                confirmed
-                    .track(w.track)
-                    .and_then(|t| t.checkout)
-                    .is_none_or(|c| c.user != user || c.base_seq != w.base_seq)
-            })
-            .map(|w| w.track)
-            .collect();
-        for track in &gone {
-            self.end(*track, Ended::Lost);
-        }
-        let confirmed = &self.confirmed;
-        let new: Vec<(TrackId, u64, Arc<Track>)> = confirmed
-            .tracks
-            .iter()
-            .filter(|(id, _)| !self.workspaces.contains_key(id))
-            .filter_map(|(id, t)| {
-                let checkout = t.checkout.filter(|c| c.user == user)?;
-                Some((*id, checkout.base_seq, t.clone()))
-            })
-            .collect();
-        let changed = !gone.is_empty() || !new.is_empty();
-        for (track, base_seq, base) in new {
-            let workspace = Workspace::new(track, base_seq, base, self.confirmed.tempo.clone());
-            self.workspaces.insert(track, workspace);
-        }
-        changed
     }
 
     /// Continues on a new connection, after the server's `Welcome`.
@@ -530,7 +261,6 @@ impl Replica {
         match sync {
             SyncData::Snapshot(project) => {
                 self.confirmed = project;
-                self.reconcile();
             }
             SyncData::Events(events) => {
                 // Checked before anything changes, so a refused resync leaves the replica whole.
@@ -552,7 +282,6 @@ impl Replica {
                 }
                 for event in &events {
                     apply_event(&mut self.confirmed, event);
-                    self.follow_checkouts(event);
                 }
             }
         }
@@ -581,14 +310,6 @@ impl Replica {
         let mut view = self.confirmed.clone();
         for txn in &self.pending {
             apply_all(&mut view, &txn.ops);
-        }
-        for workspace in self.workspaces.values() {
-            let Some(base) = self.confirmed.track(workspace.track) else {
-                continue;
-            };
-            // Pending live ops cannot touch these contents: the server would refuse them.
-            view.set_content(workspace.track, base.content.clone());
-            apply_all(&mut view, &workspace.journal);
         }
         self.view = view;
     }

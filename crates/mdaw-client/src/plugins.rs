@@ -1,10 +1,9 @@
 //! Plugins on this client: which are installed, the running instances of the document's plugin
-//! devices, their state blobs, and the stems of tracks played from audio.
+//! devices, and their state blobs.
 //!
-//! Whether a track with plugins is heard live or from its stem is decided here, by each client
-//! for itself: with every plugin of the track installed and its state at hand it runs them, and
-//! otherwise it plays the track's stem. Everything here speaks to `mdaw_plugin`'s format-neutral
-//! interface only.
+//! Each client decides for itself how a track with plugins is heard: with every plugin of the
+//! track installed and its state at hand it runs them; otherwise the track is silent here.
+//! Everything here speaks to `mdaw_plugin`'s format-neutral interface only.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -14,18 +13,11 @@ use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::{Duration, Instant};
 
 use mdaw_dsp::{ExternalDevice, MAX_BLOCK, PluginRef, PluginSource};
-use mdaw_model::{BlobHash, DeviceId, DeviceKind, PluginFormat, Project, Stem, TrackId};
+use mdaw_model::{BlobHash, DeviceId, DeviceKind, PluginFormat, Project, TrackId};
 use mdaw_plugin::{Host, Instance, ParamInfo, PluginInfo, Settings, Waker};
 
 /// A state saved from an instance: its hash and its bytes.
 pub type SavedState = (BlobHash, Arc<[u8]>);
-
-/// What a blob that is not here yet is wanted for.
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub enum Want {
-    State,
-    Stem(Stem),
-}
 
 /// How a track is heard on this client.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -34,13 +26,12 @@ pub enum TrackSound {
     Builtin,
     /// Its plugins run here.
     Live,
-    /// A plugin is not installed here, or not ready: the stem plays. `stale` when the tempo
-    /// changed since it was rendered.
-    Stem { stale: bool },
-    /// A plugin is missing and there is no stem (yet): silent.
+    /// A plugin of the track is not installed here (or plugins are off): silent here.
+    NotInstalled,
+    /// A plugin is installed but cannot run, as while its settings are not here: silent.
     Silent,
-    /// A plugin crashed. The stem plays if there is one (`stem`), else the track is silent.
-    Crashed { stem: bool },
+    /// A plugin crashed: silent until it is restarted.
+    Crashed,
     /// A plugin is starting.
     Loading,
 }
@@ -49,8 +40,6 @@ pub enum TrackSound {
 struct Made {
     instance: Box<dyn Instance + Send>,
     baseline: Option<BlobHash>,
-    /// It was given settings kept aside, not the document's.
-    kept: bool,
 }
 
 /// An instance being made on another thread, for this state of the document.
@@ -64,16 +53,15 @@ struct Starting {
 /// How long parameter values read for the panel are good for.
 const PARAMS_FRESH: Duration = Duration::from_millis(100);
 
-/// How often the settings of a plugin that changed are kept aside, for when it crashes.
-const KEEP_EVERY: Duration = Duration::from_secs(2);
+/// How often the settings of plugins are looked at, to put those that changed into the
+/// document.
+pub const SAVE_EVERY: Duration = Duration::from_secs(2);
 
 struct Running {
     instance: Box<dyn Instance>,
     /// The state the instance was made from or last saved to: what the document says, unless
     /// the document has moved on.
     state: Option<BlobHash>,
-    /// It was changed since `state`: its settings are not in the document.
-    unsaved: bool,
     /// What the instance's own save gave right after it was made, or when it was last saved:
     /// a save that gives something else means its settings changed. Plugins do not always say
     /// so themselves (Vital does not for its presets), and the same instance saves the same
@@ -86,23 +74,15 @@ pub struct Plugins {
     sample_rate: u32,
     running: HashMap<(TrackId, DeviceId), Running>,
     states: HashMap<BlobHash, Arc<[u8]>>,
-    /// Decoded stems at the engine's rate, gain applied.
-    stems: HashMap<BlobHash, Arc<[f32]>>,
-    /// Blobs asked for that are not here, and what for.
-    wanted: HashMap<BlobHash, Want>,
+    /// State blobs asked for that are not here.
+    wanted: HashSet<BlobHash>,
     /// Something became available since the graph was built: build it again.
     dirty: bool,
     /// Devices whose plugin crashed or failed, with the plugin's name, until they are
-    /// restarted. Their tracks play their stems.
+    /// restarted. Their tracks are silent.
     crashed: HashMap<(TrackId, DeviceId), String>,
     /// Failures to tell the user about at the next `idle`.
     failures: Vec<((TrackId, DeviceId), String)>,
-    /// Tracks this user may change the plugins of: their settings are kept aside, for after a
-    /// crash, and they are what a commit carries.
-    editable: HashSet<TrackId>,
-    /// The settings of instances as last kept aside, to come back with after a crash.
-    kept: HashMap<(TrackId, DeviceId), Arc<[u8]>>,
-    kept_at: Instant,
     /// Instances being made on other threads, and those made, waiting for the graph.
     starting: HashMap<(TrackId, DeviceId), Starting>,
     ready: HashMap<(TrackId, DeviceId), (Option<BlobHash>, Made)>,
@@ -119,14 +99,10 @@ impl Plugins {
             sample_rate,
             running: HashMap::new(),
             states: HashMap::new(),
-            stems: HashMap::new(),
-            wanted: HashMap::new(),
+            wanted: HashSet::new(),
             dirty: false,
             crashed: HashMap::new(),
             failures: Vec::new(),
-            editable: HashSet::new(),
-            kept: HashMap::new(),
-            kept_at: Instant::now(),
             starting: HashMap::new(),
             ready: HashMap::new(),
             waker: None,
@@ -164,16 +140,12 @@ impl Plugins {
     }
 
     /// Blobs wanted and not asked for yet. Each is given out once.
-    pub fn take_wanted(&mut self, asked: &HashSet<BlobHash>) -> Vec<(BlobHash, Want)> {
-        self.wanted
-            .iter()
-            .filter(|(hash, _)| !asked.contains(hash))
-            .map(|(h, w)| (*h, *w))
-            .collect()
+    pub fn take_wanted(&mut self, asked: &HashSet<BlobHash>) -> Vec<BlobHash> {
+        self.wanted.difference(asked).copied().collect()
     }
 
-    pub fn wanted(&self, hash: &BlobHash) -> Option<Want> {
-        self.wanted.get(hash).copied()
+    pub fn wanted(&self, hash: &BlobHash) -> bool {
+        self.wanted.contains(hash)
     }
 
     /// A blob could not be had; it is not asked for again until something wants it anew.
@@ -189,17 +161,6 @@ impl Plugins {
 
     pub fn state(&self, hash: &BlobHash) -> Option<Arc<[u8]>> {
         self.states.get(hash).cloned()
-    }
-
-    /// A stem, decoded, at the engine's rate with its gain applied.
-    pub fn add_stem(&mut self, hash: BlobHash, audio: Arc<[f32]>) {
-        self.wanted.remove(&hash);
-        self.stems.insert(hash, audio);
-        self.dirty = true;
-    }
-
-    pub fn has_stem(&self, hash: &BlobHash) -> bool {
-        self.stems.contains_key(hash)
     }
 
     pub fn sample_rate(&self) -> u32 {
@@ -237,8 +198,6 @@ impl Plugins {
         self.starting.retain(|key, _| exists(key));
         self.ready.retain(|key, _| exists(key));
         for key in gone.iter().chain(&renew) {
-            // What was kept aside is of another state than the document's now.
-            self.kept.remove(key);
             self.params.remove(key);
             if let Some(running) = self.running.remove(key)
                 && let Some(host) = self.host.as_mut()
@@ -251,7 +210,7 @@ impl Plugins {
 
     /// Main-thread chores of every instance; call once per frame. Returns the plugins that
     /// crashed or failed since the last call, each with a word for the user: they are let go,
-    /// and their tracks play their stems once the graph has forgotten them.
+    /// and their tracks are silent once the graph has forgotten them.
     pub fn idle(&mut self) -> Vec<((TrackId, DeviceId), String)> {
         for running in self.running.values_mut() {
             running.instance.idle();
@@ -303,38 +262,31 @@ impl Plugins {
                 host.dispose(running.instance);
             }
         }
-        if self.kept_at.elapsed() >= KEEP_EVERY {
-            self.kept_at = Instant::now();
-            self.keep_aside();
-        }
         if let Some(host) = self.host.as_mut() {
             host.idle();
         }
         names
     }
 
-    /// Saves the settings of every instance that changed, for after a crash. The plugin then
-    /// counts as unchanged; `unsaved` remembers that the document does not have them.
-    fn keep_aside(&mut self) {
-        for (key, running) in &mut self.running {
-            if !self.editable.contains(&key.0) && !running.instance.changed() {
-                continue;
-            }
-            let Ok(bytes) = running.instance.save_state() else {
-                continue;
-            };
-            let hash = mdaw_proto::blob_hash(&bytes);
-            let kept = self.kept.get(key).map(|k| mdaw_proto::blob_hash(k));
-            if Some(hash) != running.baseline && Some(hash) != kept {
-                running.unsaved = true;
-                self.kept.insert(*key, bytes.into());
+    /// Saves the state of every instance whose settings may have changed: one that says so,
+    /// or whose own window is open (some plugins do not say, as Vital for its presets). Returns
+    /// the states that differ from what the instance last stood for; each instance now stands
+    /// for its new state, which belongs in the document.
+    pub fn save_changed(&mut self) -> Vec<((TrackId, DeviceId), SavedState)> {
+        let keys: Vec<(TrackId, DeviceId)> = self
+            .running
+            .iter()
+            .filter(|(_, r)| r.instance.changed() || r.instance.editor_open())
+            .map(|(key, _)| *key)
+            .collect();
+        let mut saved = Vec::new();
+        for key in keys {
+            // A plugin that will not save now is asked again next time.
+            if let Ok(Some(state)) = self.capture(key.0, key.1) {
+                saved.push((key, state));
             }
         }
-    }
-
-    /// Sets the tracks whose plugins this user may change.
-    pub fn set_editable(&mut self, tracks: HashSet<TrackId>) {
-        self.editable = tracks;
+        saved
     }
 
     /// Whether a device's plugin crashed and waits to be restarted.
@@ -342,7 +294,7 @@ impl Plugins {
         self.crashed.contains_key(&(track, device))
     }
 
-    /// Starts a crashed plugin again, with the settings it had as last kept aside.
+    /// Starts a crashed plugin again, with the settings the document has for it.
     pub fn restart(&mut self, track: TrackId, device: DeviceId) {
         if self.crashed.remove(&(track, device)).is_some() {
             self.dirty = true;
@@ -362,12 +314,15 @@ impl Plugins {
         let Some(t) = project.track(track) else {
             return TrackSound::Silent;
         };
-        if !t.content.has_plugin() {
+        let mut plugins = t.content.devices.iter().filter_map(|d| match &d.kind {
+            DeviceKind::Plugin { format, id, .. } => Some((d.id, *format, id.as_str())),
+            DeviceKind::Builtin { .. } => None,
+        });
+        if plugins.clone().next().is_none() {
             return TrackSound::Builtin;
         }
         if t.content.devices.iter().any(|d| self.crashed(track, d.id)) {
-            let stem = t.stem.is_some_and(|s| self.stems.contains_key(&s.blob));
-            return TrackSound::Crashed { stem };
+            return TrackSound::Crashed;
         }
         let loading = |d: &mdaw_model::Device| {
             self.starting.contains_key(&(track, d.id)) || self.ready.contains_key(&(track, d.id))
@@ -375,21 +330,16 @@ impl Plugins {
         if t.content.devices.iter().any(loading) {
             return TrackSound::Loading;
         }
-        let live = t
-            .content
-            .devices
-            .iter()
-            .filter(|d| matches!(d.kind, DeviceKind::Plugin { .. }))
-            .all(|d| self.running.contains_key(&(track, d.id)));
-        if live {
+        if plugins
+            .clone()
+            .all(|(id, ..)| self.running.contains_key(&(track, id)))
+        {
             return TrackSound::Live;
         }
-        match t.stem {
-            Some(stem) if self.stems.contains_key(&stem.blob) => TrackSound::Stem {
-                stale: stem.tempo_hash != project.tempo_map().hash(),
-            },
-            _ => TrackSound::Silent,
+        if plugins.any(|(_, format, id)| self.installed(format, id).is_none()) {
+            return TrackSound::NotInstalled;
         }
+        TrackSound::Silent
     }
 
     /// The instance of a device, if it runs here.
@@ -455,21 +405,8 @@ impl Plugins {
         }
         running.state = Some(hash);
         running.baseline = Some(hash);
-        running.unsaved = false;
-        self.kept.remove(&(track, device));
         self.states.insert(hash, bytes.clone());
         Ok(Some((hash, bytes)))
-    }
-
-    /// Makes fresh instances for an offline render at `sample_rate`, from the states at hand.
-    /// They are kept in `made` for as long as the render runs.
-    pub fn offline(&mut self, sample_rate: u32) -> OfflineSource<'_> {
-        OfflineSource {
-            plugins: self,
-            sample_rate,
-            made: Vec::new(),
-            failures: Vec::new(),
-        }
     }
 }
 
@@ -485,13 +422,11 @@ impl PluginSource for Plugins {
         }
         let host = self.host.as_mut()?;
         host.find(plugin.format, plugin.id)?;
-        // After a crash, the settings it had, which the document may not have yet.
-        let kept = self.kept.get(&(track, device)).cloned();
         let state = match plugin.state {
             Some(hash) => match self.states.get(&hash) {
                 Some(bytes) => Some(bytes.clone()),
                 None => {
-                    self.wanted.insert(hash, Want::State);
+                    self.wanted.insert(hash);
                     return None;
                 }
             },
@@ -520,7 +455,6 @@ impl PluginSource for Plugins {
                     Running {
                         instance,
                         state: plugin.state,
-                        unsaved: made.kept,
                         baseline: made.baseline,
                     },
                 );
@@ -539,8 +473,8 @@ impl PluginSource for Plugins {
         match host.create_later(plugin.format, plugin.id, settings) {
             Some(Ok(creation)) => {
                 let (tx, result) = channel();
-                let settings_bytes = kept.clone().or(state.clone());
-                let (waker, called, kept_used) = (self.waker.clone(), name.clone(), kept.is_some());
+                let settings_bytes = state.clone();
+                let (waker, called) = (self.waker.clone(), name.clone());
                 std::thread::spawn(move || {
                     let made = (|| {
                         let mut instance = creation().map_err(|e| format!("{called} did not start: {e}."))?;
@@ -550,11 +484,7 @@ impl PluginSource for Plugins {
                                 .map_err(|e| format!("{called} did not take its settings: {e}."))?;
                         }
                         let baseline = instance.save_state().ok().map(|b| mdaw_proto::blob_hash(&b));
-                        Ok(Made {
-                            instance,
-                            baseline,
-                            kept: kept_used,
-                        })
+                        Ok(Made { instance, baseline })
                     })();
                     let _ = tx.send(made);
                     if let Some(waker) = waker {
@@ -580,7 +510,7 @@ impl PluginSource for Plugins {
         }
         // A plugin that does not start, or will not take its settings, is not tried again on
         // every edit, and does not play with the wrong settings: like a crash, it waits for
-        // Restart, and the stem plays.
+        // Restart.
         let fail = |plugins: &mut Self, text: String| {
             plugins.crashed.insert((track, device), name.clone());
             plugins.failures.push(((track, device), text));
@@ -590,7 +520,7 @@ impl PluginSource for Plugins {
             Ok(instance) => instance,
             Err(err) => return fail(self, format!("{name} did not start: {err}.")),
         };
-        if let Some(bytes) = kept.as_ref().or(state.as_ref())
+        if let Some(bytes) = state.as_ref()
             && let Err(err) = instance.load_state(bytes)
         {
             if let Some(host) = self.host.as_mut() {
@@ -607,88 +537,10 @@ impl PluginSource for Plugins {
             Running {
                 instance,
                 state: plugin.state,
-                unsaved: kept.is_some(),
                 baseline,
             },
         );
         Some(processor)
-    }
-
-    fn stem(&mut self, stem: &Stem) -> Option<Arc<[f32]>> {
-        match self.stems.get(&stem.blob) {
-            Some(audio) => Some(audio.clone()),
-            None => {
-                self.wanted.insert(stem.blob, Want::Stem(*stem));
-                None
-            }
-        }
-    }
-}
-
-/// Plugins for an offline render: new instances, in offline mode, from the states at hand.
-pub struct OfflineSource<'a> {
-    plugins: &'a mut Plugins,
-    sample_rate: u32,
-    made: Vec<Box<dyn Instance>>,
-    /// What went wrong: a render with a plugin missing is no render of the track.
-    failures: Vec<String>,
-}
-
-impl OfflineSource<'_> {
-    /// The instances made, to keep alive while the render runs, and what failed.
-    pub fn finish(self) -> (Vec<Box<dyn Instance>>, Vec<String>) {
-        (self.made, self.failures)
-    }
-
-    fn make(&mut self, plugin: PluginRef<'_>) -> Result<Box<dyn ExternalDevice>, String> {
-        let host = self.plugins.host.as_mut().ok_or("plugins are switched off")?;
-        let name = host
-            .find(plugin.format, plugin.id)
-            .map_or_else(|| plugin.id.to_string(), |p| p.name.clone());
-        let state = match plugin.state {
-            Some(hash) => Some(
-                self.plugins
-                    .states
-                    .get(&hash)
-                    .ok_or_else(|| format!("the settings of {name} are not here"))?
-                    .clone(),
-            ),
-            None => None,
-        };
-        let settings = Settings {
-            sample_rate: self.sample_rate,
-            max_block: MAX_BLOCK,
-            offline: true,
-        };
-        let mut instance = host
-            .create(plugin.format, plugin.id, settings)
-            .map_err(|e| format!("{name} did not start: {e}"))?;
-        if let Some(bytes) = &state {
-            instance
-                .load_state(bytes)
-                .map_err(|e| format!("{name} did not take its settings: {e}"))?;
-        }
-        let processor = instance
-            .take_processor()
-            .ok_or_else(|| format!("{name} did not start"))?;
-        self.made.push(instance);
-        Ok(processor)
-    }
-}
-
-impl PluginSource for OfflineSource<'_> {
-    fn device(&mut self, _: TrackId, _: DeviceId, plugin: PluginRef<'_>) -> Option<Box<dyn ExternalDevice>> {
-        match self.make(plugin) {
-            Ok(processor) => Some(processor),
-            Err(failure) => {
-                self.failures.push(failure);
-                None
-            }
-        }
-    }
-
-    fn stem(&mut self, _: &Stem) -> Option<Arc<[f32]>> {
-        None
     }
 }
 
@@ -704,10 +556,6 @@ impl PluginSource for Shared {
         plugin: PluginRef<'_>,
     ) -> Option<Box<dyn ExternalDevice>> {
         self.0.borrow_mut().device(track, device, plugin)
-    }
-
-    fn stem(&mut self, stem: &Stem) -> Option<Arc<[f32]>> {
-        self.0.borrow_mut().stem(stem)
     }
 }
 
@@ -760,7 +608,7 @@ mod tests {
     }
 
     #[test]
-    fn a_change_the_plugin_does_not_announce_is_still_committed() {
+    fn a_change_the_plugin_does_not_announce_is_still_saved() {
         let mut plugins = Plugins::new(48_000);
         plugins.set_host(Some(Host::test_synth_only()));
         let mut ids = IdGen::new(ActorId(3));

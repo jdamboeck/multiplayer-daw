@@ -3,9 +3,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
 
-use mdaw_client::checkout::Files;
 use mdaw_client::{DawApp, Session, Waker, profile};
 use mdaw_engine::Engine;
 use mdaw_net::JoinInfo;
@@ -25,16 +23,12 @@ Usage: mdaw [--join <mdaw://...>] [--name <name>] [--profile <dir>] [--no-plugin
   --name <name>     The name others see. Remembered in the profile.
   --profile <dir>   Where this install keeps its identity. Use different directories to run
                     several clients as different people on one machine.
-  --no-plugins      Load no plugins (also --no-clap). Tracks with plugins play their stems:
-                    how they sounded at their last commit.
+  --no-plugins      Load no plugins (also --no-clap). Tracks with plugins are silent.
   --test-synth      Also offer the built-in test synth, a plugin for trying things out that
                     can be told to fail or crash.
   -h, --help        Show this text.
 
 Plugins are looked for in the usual CLAP folders and in CLAP_PATH.
-
-With MDAW_SYNC_LOG=1 in the environment, a joined client prints once a second where its
-playhead is against the server's clock.
 ";
 
 #[derive(Default)]
@@ -69,8 +63,6 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Option<Args>, String>
 
 struct Shell {
     app: DawApp,
-    /// When the sync log last wrote a line, if it is switched on.
-    sync_logged: Option<Instant>,
 }
 
 impl eframe::App for Shell {
@@ -84,37 +76,7 @@ impl eframe::App for Shell {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.app.ui(ui);
-        if let Some(last) = &mut self.sync_logged
-            && last.elapsed() >= Duration::from_secs(1)
-        {
-            *last = Instant::now();
-            log_sync(&self.app.session);
-        }
-        if self.sync_logged.is_some() {
-            // A window with nothing to draw sleeps; the log goes on.
-            ui.ctx().request_repaint_after(Duration::from_secs(1));
-        }
     }
-}
-
-/// One line on where this client is in the shared transport. Lines of several clients are
-/// compared by their server time.
-fn log_sync(session: &Session) {
-    let Some(timing) = session.timing() else {
-        return;
-    };
-    let ms = |micros: i64| micros as f64 / 1000.0;
-    let drift = match timing.drift_micros {
-        Some(drift) => format!("audio {:+.2} ms off the shared playhead", ms(drift)),
-        None => "stopped".into(),
-    };
-    eprintln!(
-        "sync: server time {:.3} s, playhead at tick {:.0}, {drift}, clock known to ±{:.2} ms, {} resyncs",
-        timing.server_micros as f64 / 1e6,
-        session.position(),
-        ms(timing.rtt_micros) / 2.0,
-        timing.resyncs,
-    );
 }
 
 fn main() -> ExitCode {
@@ -164,14 +126,8 @@ fn main() -> ExitCode {
                     }
                 })
             };
-            // Checkouts and forks are kept per server, inside the profile.
-            let server: String = join.fingerprint[..8].iter().map(|b| format!("{b:02x}")).collect();
-            let files = Files::new(dir.join("projects").join(server));
             match Session::join(join, who, engine, waker) {
-                Ok(mut session) => {
-                    session.set_files(files);
-                    session
-                }
+                Ok(session) => session,
                 Err(err) => {
                     eprintln!("mdaw: {err:#}");
                     return ExitCode::FAILURE;
@@ -197,13 +153,9 @@ fn main() -> ExitCode {
         Box::new(move |cc| {
             DawApp::setup(&cc.egui_ctx);
             let _ = ctx.set(cc.egui_ctx.clone());
-            let sync_log = std::env::var_os("MDAW_SYNC_LOG").is_some_and(|value| value != "0");
             let mut app = DawApp::new(session);
             app.enable_midi();
-            Ok(Box::new(Shell {
-                app,
-                sync_logged: sync_log.then(Instant::now),
-            }))
+            Ok(Box::new(Shell { app }))
         }),
     );
     match run {

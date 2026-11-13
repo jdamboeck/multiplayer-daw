@@ -26,7 +26,7 @@ pub fn render_offline(
     render_with_block(project, tracks, range, sample_rate, 256)
 }
 
-/// As [`render_offline`], with plugins and stems from `source`.
+/// As [`render_offline`], with plugins from `source`.
 pub fn render_offline_with(
     project: &Project,
     tracks: Option<&[TrackId]>,

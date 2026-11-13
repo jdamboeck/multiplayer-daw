@@ -1,7 +1,7 @@
 # Migration checklist
 
-What happens to each existing part. Nothing in the "remove" column has been removed yet; each
-goes only when the thing that replaces it has passed its tests. Order follows the phases in
+What happens to each existing part. The rows of the "Remove" table are done (2026-11-13, see
+"Removed" below); everything else goes only when the thing that replaces it has passed its tests. Order follows the phases in
 the mission: bridge (4), collaborative slice (5), reliability (6), retire the Rust engine (7).
 
 ## Keep
@@ -34,14 +34,16 @@ the mission: bridge (4), collaborative slice (5), reliability (6), retire the Ru
 
 | Part | Into |
 |---|---|
-| Stems for clients without a plugin | an optional "missing plugin → play the stem" fallback, no longer tied to checkout |
-| Changelog with rendered samples | a history view over revisions; samples optional |
+| Stems for clients without a plugin | removed 2026-11-13 with checkout; a missing plugin is silent and shown as "plugin not installed". An optional fallback may come back later |
+| Changelog with rendered samples | done 2026-11-13: samples and commit entries removed; the panel lists edits displaced by concurrent ones, with Restore. A full history view over revisions is still to come |
 | Device model (`DeviceAdd`, `DeviceSetParam`, `DeviceSetState`) | gains plugin format + identifier, parameters by plugin parameter ID, state as blob hash |
 | Tempo map | gains time signatures; maps to Tracktion's `TempoSequence` |
 | Model | gains automation and audio clips |
-| Presence | kept for "who is here, what are they looking at"; loses transport and checkout fields |
+| Presence | done 2026-11-13: `Presence { editing }` only; the playhead field is gone |
 
 ## Remove
+
+All done on 2026-11-13 (branch `tracktion-integration`, protocol version 6).
 
 | Part | Where | Why |
 |---|---|---|
@@ -49,10 +51,23 @@ the mission: bridge (4), collaborative slice (5), reliability (6), retire the Ru
 | Clock sync | `mdaw-net/src/clock.rs` | no shared clock |
 | Live MIDI relay and jam | `mdaw-proto/src/midi.rs`, `mdaw-server/src/relay.rs`, `mdaw-client/src/live.rs`, `ui/live.rs` | no network MIDI; local MIDI input and recording move to Tracktion |
 | Mandatory checkout, lease renewal, force release, commit | `ClientMsg::{Checkout, LeaseRenew, Release, ForceRelease, Commit, Attach}`, refusals `CheckedOut`, `PluginTrack`, `PluginOutsideCommit`, `NotOwner`, `NotCheckedOut`, `OutOfScope`, `StemRequired`; `mdaw-sync` workspaces; server lease code; `mdaw-client/src/checkout.rs`, `ui/checkout.rs` | ordinary editing needs no checkout |
-| `spikes/clap-host` | | superseded |
+| `spikes/clap-host` | | superseded; `docs/spikes/clap-host.md` stays as history |
 | Tests of the above | `tests/checkout.rs`, `tests/live.rs`, `tests/transport.rs`, parts of `tests/hub.rs`, `ui_net.rs` | go with the feature |
 
-Removing these changes the wire protocol; the protocol version goes up once, in phase 5.
+Removing these changed the wire protocol: version 6. Data directories of earlier servers are
+not readable (store format `2/6`).
+
+## Removed (2026-11-13)
+
+- Shared transport, follow and Link; clock sync (client and server); the datagram path.
+- Live MIDI relay and receiving others' notes. Playing one's own instrument from the keyboard or
+  a MIDI device, and recording it into a clip, stay local.
+- Checkout, lease renewal, force release, commit, attach; `mdaw-sync` workspaces; forks; the
+  checkout UI and commit dialog.
+- Stems, changelog samples and their preview playback; FLAC encoding and decoding in
+  `mdaw-engine`.
+- `spikes/clap-host`.
+- Their tests.
 
 ## Capabilities that change — nothing is dropped silently
 

@@ -483,32 +483,6 @@ fn paint_lanes(app: &DawApp, painter: &Painter, layout: &ArrangeLayout, tracks: 
         } else {
             color
         };
-        // Someone else's checkout: shown as it was, and not to be touched.
-        let locked = track
-            .checkout
-            .filter(|c| c.user != app.session.user())
-            .map(|c| app.session.user_name(c.user));
-        let color = if locked.is_some() {
-            theme::mix(color, theme::LANE, 0.5)
-        } else {
-            color
-        };
-        if let Some(owner) = &locked {
-            let stale = if app.session.is_stale(*track_id) {
-                ", not heard from lately"
-            } else {
-                ""
-            };
-            let band = Rect::from_min_max(pos2(lanes.left(), top), pos2(lanes.right(), top + ROW_H));
-            let text = format!("checked out by {owner}{stale}");
-            painter.with_clip_rect(band.intersect(painter.clip_rect())).text(
-                pos2(lanes.left() + 8.0, top + ROW_H - 4.0),
-                Align2::LEFT_BOTTOM,
-                text,
-                FontId::proportional(11.0),
-                theme::WARN,
-            );
-        }
         for (clip_id, clip) in &track.content.clips {
             let (mut start, mut length) = (clip.start, clip.length);
             match app.arrange.drag {
@@ -665,26 +639,13 @@ fn header(app: &mut DawApp, ui: &mut Ui, rect: Rect, clip: Rect, id: TrackId, tr
                 FontId::proportional(14.0),
                 color,
             );
-            // Who else plays on the track right now, and how it is heard here.
-            let mut x = written.right() + 8.0;
-            let players = app.session.players(id);
-            if !players.is_empty() {
-                let shown = text.text(
-                    pos2(x, name.center().y),
-                    Align2::LEFT_CENTER,
-                    format!("{} playing", players.join(", ")),
-                    FontId::proportional(12.0),
-                    theme::METER,
-                );
-                x = shown.right() + 8.0;
-            }
+            // How the track is heard here.
+            let x = written.right() + 8.0;
             let sound = match app.session.track_sound(id) {
                 TrackSound::Builtin | TrackSound::Live => None,
-                TrackSound::Stem { stale: false } => Some(("stem", theme::TEXT_DIM)),
-                TrackSound::Stem { stale: true } => Some(("stem, old tempo", theme::WARN)),
+                TrackSound::NotInstalled => Some(("plugin not installed", theme::WARN)),
                 TrackSound::Silent => Some(("no sound here", theme::WARN)),
-                TrackSound::Crashed { stem: true } => Some(("plugin crashed, stem plays", theme::METER_HOT)),
-                TrackSound::Crashed { stem: false } => Some(("plugin crashed", theme::METER_HOT)),
+                TrackSound::Crashed => Some(("plugin crashed", theme::METER_HOT)),
                 TrackSound::Loading => Some(("loading plugin…", theme::TEXT_DIM)),
             };
             if let Some((label, color)) = sound {
@@ -720,12 +681,6 @@ fn header(app: &mut DawApp, ui: &mut Ui, rect: Rect, clip: Rect, id: TrackId, tr
         {
             app.remove_track(id);
         }
-        let left_of_mute = button(2.0).left();
-        let slot = Rect::from_min_max(
-            pos2(left_of_mute - 78.0, rect.top() + 7.0),
-            pos2(left_of_mute - 4.0, rect.top() + 27.0),
-        );
-        checkout_button(app, ui, slot, id);
 
         // Volume and pan.
         let line = rect.top() + 35.0;
@@ -769,67 +724,6 @@ fn header(app: &mut DawApp, ui: &mut Ui, rect: Rect, clip: Rect, id: TrackId, tr
             app.sel.focus = Focus::Arrange;
         }
     });
-}
-
-/// Check out, commit or free a track, depending on who has it.
-fn checkout_button(app: &mut DawApp, ui: &mut Ui, rect: Rect, id: TrackId) {
-    let session = &app.session;
-    if session.linked().is_none() {
-        // Alone there is nobody to keep out.
-        return;
-    }
-    match session.checkout_owner(id) {
-        None => {
-            let enabled = session.can_check_out(id);
-            let hint = "Check out: work on this track alone. The others hear it as it is now and \
-                        cannot change it until you commit.";
-            let response = ui.add_enabled_ui(enabled, |ui| {
-                ui.put(
-                    rect,
-                    Button::new("Check out")
-                        .small()
-                        .wrap_mode(egui::TextWrapMode::Extend),
-                )
-            });
-            if response
-                .inner
-                .on_hover_text(hint)
-                .on_disabled_hover_text("Not connected to the server")
-                .clicked()
-            {
-                app.session.check_out(id);
-            }
-        }
-        Some(owner) if owner == session.user() => {
-            let hint = "Your checkout: commit your changes, or drop them";
-            let button = Button::new("Commit…")
-                .small()
-                .wrap_mode(egui::TextWrapMode::Extend)
-                .fill(theme::ACCENT_DIM);
-            if ui.put(rect, button).on_hover_text(hint).clicked() {
-                app.open_commit(id);
-            }
-        }
-        Some(owner) => {
-            let name = session.user_name(owner);
-            let stale = session.is_stale(id);
-            let hint = if stale {
-                format!(
-                    "{name} has this track checked out, but has not been heard from for a while. Click to end the checkout."
-                )
-            } else {
-                format!("{name} has this track checked out. Click to end the checkout.")
-            };
-            let label = if stale { "Stale" } else { "Locked" };
-            if ui
-                .put(rect, Button::new(label).small().fill(theme::WARN_DIM))
-                .on_hover_text(hint)
-                .clicked()
-            {
-                app.confirm_force = Some(id);
-            }
-        }
-    }
 }
 
 /// Row index of a track, for tests and tools that drive the view by position.

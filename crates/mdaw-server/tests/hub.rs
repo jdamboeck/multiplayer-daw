@@ -67,13 +67,14 @@ fn rename(n: u64) -> Txn {
     }
 }
 
-fn clap(n: u64) -> Txn {
+/// Adds a plugin whose state was never uploaded: the server refuses it.
+fn refused(n: u64) -> Txn {
     let device = Device::new(
         DeviceId(EntityId(9)),
         DeviceKind::Plugin {
             format: PluginFormat::Clap,
             id: "x".into(),
-            state: None,
+            state: Some(missing()),
         },
     );
     Txn {
@@ -85,6 +86,10 @@ fn clap(n: u64) -> Txn {
             after: None,
         }],
     }
+}
+
+fn missing() -> BlobHash {
+    blob_hash(b"never uploaded")
 }
 
 fn hub() -> Hub {
@@ -167,16 +172,16 @@ fn events_go_to_everyone_and_rejections_to_the_sender() {
     let [ServerMsg::Event(event)] = &ann_inbox.drain()[..] else {
         panic!("expected one event")
     };
-    assert_eq!((event.seq, event.actor, event.client_txn_id()), (1, ann, Some(1)));
+    assert_eq!((event.seq, event.actor, event.client_txn_id), (1, ann, 1));
     assert_eq!(ben_inbox.drain(), [ServerMsg::Event(event.clone())]);
     assert_eq!(hub.doc().name, "take 1");
 
-    hub.submit(ann, clap(2));
+    hub.submit(ann, refused(2));
     assert_eq!(
         ann_inbox.drain(),
         [ServerMsg::Rejected {
             client_txn_id: 2,
-            reason: RejectReason::PluginOutsideCommit
+            reason: RejectReason::MissingBlob(missing())
         }]
     );
     assert!(ben_inbox.drain().is_empty());
@@ -193,7 +198,6 @@ fn presence_is_relayed_to_the_others() {
 
     let presence = Presence {
         editing: Some(EntityRef::Track(TrackId(EntityId(1)))),
-        playhead: None,
     };
     hub.handle(ann, ClientMsg::Presence(presence));
     assert!(ann_inbox.drain().is_empty());
@@ -209,7 +213,7 @@ fn a_resuming_client_gets_what_it_missed() {
     // The connection breaks. Two more of Ann's edits still arrive, one of them refused; she
     // sees neither outcome.
     hub.submit(ann, rename(2));
-    hub.submit(ann, clap(3));
+    hub.submit(ann, refused(3));
     hub.leave(ann);
     hub.submit(ben, rename(1));
 
@@ -357,7 +361,7 @@ fn the_project_survives_a_restart() {
     for n in 1..=1005 {
         hub.submit(ann, rename(n));
     }
-    hub.submit(ann, clap(1006));
+    hub.submit(ann, refused(1006));
     let (doc, token) = (hub.doc().clone(), hub.token().to_string());
     drop(hub);
 
@@ -497,183 +501,6 @@ fn a_store_in_another_format_is_refused() {
     );
 }
 
-/// The next message, which must be the transport, answering a request of `by`.
-fn transport(inbox: &Inbox, by: Option<ActorId>) -> TransportState {
-    match inbox.next() {
-        Some(ServerMsg::Transport { state, by: asker }) if asker == by => state,
-        other => panic!("expected the transport by {by:?}, got {other:?}"),
-    }
-}
-
-/// A request to play from `tick`, the usual lead ahead.
-fn play_from(hub: &Hub, tick: f64) -> TransportState {
-    TransportState {
-        playing: true,
-        anchor_tick: tick,
-        anchor_server_micros: hub.clock().micros() + START_LEAD_MICROS,
-        ..TransportState::default()
-    }
-}
-
-#[test]
-fn the_transport_is_shared_and_the_last_request_wins() {
-    let mut hub = hub();
-    let (ann, ann_inbox, welcome) = join(&mut hub, 1);
-    let (bob, bob_inbox, _) = join(&mut hub, 2);
-    assert_eq!(welcome.transport, TransportState::default());
-    ann_inbox.drain();
-    bob_inbox.drain();
-
-    let wanted = TransportState {
-        epoch: 77,
-        loop_range: Some(TickRange::new(Tick::bars(1), Tick::bars(3))),
-        ..play_from(&hub, 960.0)
-    };
-    hub.handle(ann, ClientMsg::SetTransport(wanted));
-    // Everyone hears the same, the one who asked included, and the server counts the changes.
-    let state = transport(&ann_inbox, Some(ann));
-    assert_eq!(transport(&bob_inbox, Some(ann)), state);
-    assert_eq!(state, TransportState { epoch: 1, ..wanted });
-    assert_eq!(*hub.transport(), state);
-
-    hub.handle(
-        bob,
-        ClientMsg::SetTransport(TransportState {
-            anchor_tick: 480.0,
-            ..TransportState::default()
-        }),
-    );
-    let stopped = transport(&ann_inbox, Some(bob));
-    assert_eq!(transport(&bob_inbox, Some(bob)), stopped);
-    assert!(!stopped.playing);
-    assert_eq!(stopped.anchor_tick, 480.0);
-    assert_eq!(stopped.loop_range, None);
-    assert_eq!(stopped.epoch, 2);
-
-    // Someone who joins now starts from there.
-    let (_, _, welcome) = join(&mut hub, 3);
-    assert_eq!(welcome.transport, stopped);
-}
-
-#[test]
-fn a_transport_request_that_makes_no_sense_is_answered_with_the_truth() {
-    let mut hub = hub();
-    let (ann, ann_inbox, _) = join(&mut hub, 1);
-    let (_, bob_inbox, _) = join(&mut hub, 2);
-    ann_inbox.drain();
-    hub.handle(ann, ClientMsg::SetTransport(play_from(&hub, 0.0)));
-    let before = transport(&ann_inbox, Some(ann));
-    ann_inbox.drain();
-    bob_inbox.drain();
-
-    hub.handle(ann, ClientMsg::SetTransport(play_from(&hub, f64::NAN)));
-    assert_eq!(transport(&ann_inbox, Some(ann)), before);
-    assert!(bob_inbox.drain().is_empty());
-    assert_eq!(*hub.transport(), before);
-
-    // Anchors far from the server's clock are pulled in.
-    let far = TransportState {
-        anchor_server_micros: i64::MAX,
-        ..play_from(&hub, 0.0)
-    };
-    hub.handle(ann, ClientMsg::SetTransport(far));
-    let state = transport(&ann_inbox, Some(ann));
-    assert!(state.anchor_server_micros <= hub.clock().micros() + MAX_LEAD_MICROS);
-}
-
-#[test]
-fn a_tempo_change_during_playback_keeps_the_playhead_where_it_is() {
-    let mut hub = hub();
-    let (ann, ann_inbox, _) = join(&mut hub, 1);
-    let (bob, bob_inbox, _) = join(&mut hub, 2);
-    let id = *hub.doc().tempo.keys().next().expect("a new project has a tempo");
-    let retime = |n: u64, milli_bpm: u32| Txn {
-        client_txn_id: n,
-        base_seq: 0,
-        ops: vec![Op::TempoPut {
-            id,
-            point: TempoPoint {
-                tick: Tick::ZERO,
-                milli_bpm,
-            },
-        }],
-    };
-    let old = hub.doc().tempo_map();
-
-    // Stopped, or before a start that is still to come, the anchor stays true.
-    hub.handle(ann, ClientMsg::Submit(retime(1, 120_000)));
-    hub.handle(ann, ClientMsg::SetTransport(play_from(&hub, 960.0)));
-    hub.handle(ann, ClientMsg::Submit(retime(2, 121_000)));
-    hub.handle(ann, ClientMsg::Submit(retime(3, 120_000)));
-    let msgs = ann_inbox.drain();
-    let transports = msgs
-        .iter()
-        .filter(|m| matches!(m, ServerMsg::Transport { .. }))
-        .count();
-    assert_eq!(transports, 1, "{msgs:?}");
-    bob_inbox.drain();
-
-    // Playing since 20 ms ago.
-    let started = TransportState {
-        anchor_server_micros: hub.clock().micros() - 20_000,
-        ..play_from(&hub, 960.0)
-    };
-    hub.handle(ann, ClientMsg::SetTransport(started));
-    let playing = transport(&ann_inbox, Some(ann));
-    bob_inbox.drain();
-
-    let before = hub.clock().micros();
-    hub.handle(bob, ClientMsg::Submit(retime(1, 60_000)));
-    let after = hub.clock().micros();
-    // The event comes first: the new anchor is meant for the new tempo.
-    assert!(matches!(ann_inbox.next(), Some(ServerMsg::Event(_))));
-    let moved = transport(&ann_inbox, None);
-    assert!(matches!(bob_inbox.next(), Some(ServerMsg::Event(_))));
-    assert_eq!(transport(&bob_inbox, None), moved);
-    assert!(moved.playing);
-    assert_eq!(moved.epoch, playing.epoch + 1);
-    assert!((before..=after).contains(&moved.anchor_server_micros));
-    assert_eq!(
-        moved.anchor_tick,
-        playing.position(moved.anchor_server_micros, &old)
-    );
-    assert!(moved.anchor_tick > 960.0);
-
-    // An edit that leaves the tempo alone does not move the transport.
-    hub.handle(bob, ClientMsg::Submit(rename(2)));
-    assert!(matches!(ann_inbox.next(), Some(ServerMsg::Event(_))));
-    assert_eq!(ann_inbox.next(), None);
-}
-
-#[test]
-fn the_transport_stops_when_the_last_client_leaves() {
-    let mut hub = hub();
-    let (ann, ann_inbox, _) = join(&mut hub, 1);
-    let (bob, _, _) = join(&mut hub, 2);
-    let started = TransportState {
-        anchor_server_micros: hub.clock().micros() - 500_000,
-        loop_range: Some(TickRange::new(Tick::bars(8), Tick::bars(9))),
-        ..play_from(&hub, 0.0)
-    };
-    ann_inbox.drain();
-    hub.handle(ann, ClientMsg::SetTransport(started));
-    let playing = transport(&ann_inbox, Some(ann));
-
-    hub.leave(bob);
-    assert!(hub.transport().playing, "someone is still listening");
-    hub.leave(ann);
-    let left = *hub.transport();
-    assert!(!left.playing);
-    assert_eq!(left.loop_range, started.loop_range);
-    assert!(left.epoch > playing.epoch);
-    // Half a second at 120 bpm is a beat; the playhead rests on a whole tick near there.
-    assert_eq!(left.anchor_tick, left.anchor_tick.round());
-    assert!((960.0..1100.0).contains(&left.anchor_tick), "{left:?}");
-
-    let (_, _, welcome) = join(&mut hub, 3);
-    assert_eq!(welcome.transport, left);
-}
-
 /// Prints the tracks of a copy of a server's project. Run by hand with
 /// `MDAW_PROBE_DB=<copied project.db> cargo test -p mdaw-server --test hub -- --ignored probe --nocapture`.
 #[test]
@@ -690,57 +517,20 @@ fn probe_a_project() {
     .unwrap();
     let store = Store::open(std::path::Path::new(&path)).unwrap();
     for event in store.events_after(0, 100_000).unwrap() {
-        let kind = match &event.body {
-            EventBody::Txn { .. } => "txn",
-            EventBody::Checkout { .. } => "checkout",
-            EventBody::Commit { .. } => "commit",
-            EventBody::Release { .. } => "release",
-            EventBody::Attach { .. } => "attach",
-        };
         let ops: Vec<String> = event
-            .ops()
-            .filter(|op| {
-                matches!(
-                    op,
-                    Op::DeviceSetState { .. } | Op::DeviceAdd { .. } | Op::DeviceRemove { .. }
-                )
-            })
-            .map(|op| format!("{op:?}").chars().take(120).collect())
+            .ops
+            .iter()
+            .map(|op| format!("{op:?}").chars().take(90).collect())
             .collect();
-        let stem = match &event.body {
-            EventBody::Commit { stem, .. } => format!("{:?}", stem.map(|s| s.blob)),
-            _ => String::new(),
-        };
-        if kind == "txn" {
-            let all: Vec<String> = event
-                .ops()
-                .map(|op| format!("{op:?}").chars().take(90).collect())
-                .collect();
-            eprintln!("  {} txn {:?}", event.seq, all);
-        }
-        if kind != "txn" || !ops.is_empty() {
-            eprintln!(
-                "{} {} {} {:?} {}",
-                event.seq,
-                event.wall_ts / 1000 % 86400,
-                kind,
-                ops,
-                stem
-            );
-        }
+        eprintln!("{} {} {:?}", event.seq, event.wall_ts / 1000 % 86400, ops);
     }
     let doc = hub.doc();
     eprintln!("master gain {}, tempo {:?}", doc.master_gain, doc.tempo);
     for (id, track) in doc.ordered_tracks() {
         let c = &track.content;
         eprintln!(
-            "{:?} {:?}: gain {} pan {} mute {} stem {:?}",
-            id,
-            track.shell.name,
-            c.gain,
-            c.pan,
-            c.mute,
-            track.stem.map(|s| (s.blob, s.gain, s.len_samples))
+            "{:?} {:?}: gain {} pan {} mute {}",
+            id, track.shell.name, c.gain, c.pan, c.mute
         );
         for d in &c.devices {
             eprintln!("    device {:?}", d.kind);

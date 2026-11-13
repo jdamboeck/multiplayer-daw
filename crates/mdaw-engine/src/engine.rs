@@ -1,4 +1,4 @@
-use crate::rt::{Anchor, Command, LiveNote, RtCore, Shared};
+use crate::rt::{Command, LiveNote, RtCore, Shared};
 use crate::{alloc_guard, clock};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use mdaw_dsp::{Compiler, Graph, NoPlugins, PluginSource};
@@ -65,8 +65,6 @@ pub struct Stats {
     pub max_callback_micros: u64,
     pub overruns: u64,
     pub stream_errors: u64,
-    /// Jumps made to get back in step with a followed transport.
-    pub resyncs: u64,
 }
 
 /// Control-side handle of the audio engine. Lives on the UI thread; every method returns
@@ -86,17 +84,13 @@ pub struct Engine {
     waiting: Option<Project>,
     playing: bool,
     backend: Backend,
-    /// The `id` of the last preview sent.
-    preview_seq: u64,
-    /// Previews the audio thread may still hold, by `id`.
-    previews: Vec<(u64, Arc<[f32]>)>,
     live: LiveInput,
-    /// Where plugin devices and stems come from. `None`: nowhere.
+    /// Where plugin devices come from. `None`: nowhere.
     plugins: Option<Box<dyn PluginSource>>,
 }
 
 /// Plays live notes from any thread, straight into the audio thread: a note played on a MIDI
-/// device or arriving from the network does not wait for the UI. Cheap to clone.
+/// device does not wait for the UI. Cheap to clone.
 #[derive(Clone)]
 pub struct LiveInput {
     ring: Arc<Mutex<rtrb::Producer<LiveNote>>>,
@@ -214,8 +208,7 @@ impl Engine {
 
     /// An engine without an audio device. With `real_time`, [`Engine::tick`] renders (and
     /// discards) as much audio as wall-clock time has passed, so the transport moves as if a
-    /// device were attached. Without it, only [`Engine::pump`] advances time, and
-    /// [`Engine::now_micros`] with it.
+    /// device were attached. Without it, only [`Engine::pump`] advances time.
     pub fn manual(sample_rate: u32, real_time: bool) -> Engine {
         let Parts {
             core,
@@ -258,14 +251,12 @@ impl Engine {
             waiting: None,
             playing: false,
             backend,
-            preview_seq: 0,
-            previews: Vec::new(),
             live,
             plugins: None,
         }
     }
 
-    /// Where plugin devices and stems come from from now on. Builds the graph anew.
+    /// Where plugin devices come from from now on. Builds the graph anew.
     pub fn set_plugins(&mut self, plugins: Box<dyn PluginSource>) {
         self.plugins = Some(plugins);
         self.refresh();
@@ -277,8 +268,7 @@ impl Engine {
         self.compiler.forget(track, device);
     }
 
-    /// Builds the graph anew from the last document, as when a plugin or a stem has become
-    /// available.
+    /// Builds the graph anew from the last document, as when a plugin has become available.
     pub fn refresh(&mut self) {
         if let Some(project) = self.current.take().or_else(|| self.waiting.take()) {
             self.waiting = Some(project);
@@ -316,9 +306,6 @@ impl Engine {
             drop(graph);
             self.graphs_in_flight = self.graphs_in_flight.saturating_sub(1);
         }
-        // The audio thread takes previews in order: older ones than its current are let go.
-        let taken = self.shared.preview_id.load(Relaxed);
-        self.previews.retain(|(id, _)| *id >= taken);
         self.flush();
         if let Backend::Manual { core, clock } = &mut self.backend
             && clock.real_time
@@ -334,15 +321,6 @@ impl Engine {
                 core.fill(&mut sink[..n * 2], 2, clock.micros(self.sample_rate), |s| s);
                 clock.frames += n as u64;
             }
-        }
-    }
-
-    /// The time [`Engine::follow`] is given anchors on: [`clock::now_micros`], except for a
-    /// manual engine that is not real-time, whose time is the audio pumped so far.
-    pub fn now_micros(&self) -> i64 {
-        match &self.backend {
-            Backend::Manual { clock, .. } if !clock.real_time => clock.micros(self.sample_rate),
-            _ => clock::now_micros(),
         }
     }
 
@@ -391,36 +369,6 @@ impl Engine {
         self.send(Command::Stop);
     }
 
-    /// Plays in step with a transport kept elsewhere: the playhead is at `tick` at `at_micros`
-    /// on [`Engine::now_micros`]. If that is still to come, the playhead waits at `tick` and
-    /// starts on time; if it has passed, playback is wherever that puts it by now. The engine
-    /// then keeps to it, jumping when it finds itself more than 20 ms off.
-    ///
-    /// `fresh` says the anchor describes a new playback, as after a seek, and not a better
-    /// estimate of the same one; the playhead then moves there without delay.
-    pub fn follow(&mut self, tick: f64, at_micros: i64, fresh: bool) {
-        self.playing = true;
-        let anchor = Anchor {
-            tick,
-            micros: at_micros,
-        };
-        self.send(Command::Follow { anchor, fresh });
-    }
-
-    /// Stops following. Playback goes on freely from where it is.
-    pub fn unfollow(&mut self) {
-        self.send(Command::Unfollow);
-    }
-
-    /// While following, once started: how far the playhead is ahead of where the anchor puts
-    /// it, in microseconds.
-    pub fn drift_micros(&self) -> Option<i64> {
-        self.shared
-            .following
-            .load(Relaxed)
-            .then(|| self.shared.drift_micros.load(Relaxed))
-    }
-
     /// What the transport was last told, without waiting for the audio thread to catch up.
     pub fn is_playing(&self) -> bool {
         self.playing
@@ -456,40 +404,6 @@ impl Engine {
     /// Ends every sounding note.
     pub fn panic(&mut self) {
         self.send(Command::Panic);
-    }
-
-    /// Plays interleaved stereo at the engine's rate on its own, beside whatever else plays,
-    /// replacing an earlier preview. Returns an `id` for [`Engine::preview_position`].
-    pub fn preview(&mut self, audio: Arc<[f32]>) -> u64 {
-        self.preview_seq += 1;
-        let id = self.preview_seq;
-        self.previews.push((id, audio.clone()));
-        self.send(Command::Preview {
-            id,
-            audio: Some(audio),
-        });
-        id
-    }
-
-    pub fn stop_preview(&mut self) {
-        self.preview_seq += 1;
-        let id = self.preview_seq;
-        self.send(Command::Preview { id, audio: None });
-    }
-
-    /// How far preview `id` has played, in seconds. `None` once it is over, replaced or
-    /// stopped. A preview just started counts as at its beginning.
-    pub fn preview_position(&self, id: u64) -> Option<f64> {
-        if id != self.preview_seq {
-            return None;
-        }
-        if self.shared.preview_id.load(Relaxed) != id {
-            return Some(0.0);
-        }
-        match self.shared.preview_pos.load(Relaxed) {
-            u64::MAX => None,
-            frames => Some(frames as f64 / self.sample_rate as f64),
-        }
     }
 
     /// Playhead in ticks.
@@ -532,7 +446,6 @@ impl Engine {
             max_callback_micros: self.shared.max_micros.load(Relaxed),
             overruns: self.shared.overruns.load(Relaxed),
             stream_errors: self.shared.stream_errors.load(Relaxed),
-            resyncs: self.shared.resyncs.load(Relaxed),
         }
     }
 

@@ -361,10 +361,6 @@ fn playing(h: &App) -> bool {
 #[test]
 fn a_window_without_a_server_shows_no_server_controls() {
     let h = harness();
-    for label in ["Link", "Check out"] {
-        assert!(h.query_by_label(label).is_none(), "{label} needs a server");
-    }
-    assert!(h.query_by_label_contains("clock").is_none());
     assert!(h.query_by_label_contains("Online").is_none());
 }
 
@@ -699,7 +695,7 @@ fn a_plugin_is_added_from_the_device_tab_and_its_settings_shown() {
         matches!(&devices(&h)[0].kind, mdaw_model::DeviceKind::Plugin { id, .. } if id == mdaw_plugin::TEST_SYNTH),
         "a plugin device"
     );
-    // Without a server there is nobody to check out from: the plugin is simply there, and runs.
+    // The plugin is simply there, and runs.
     assert!(
         h.query_all_by_label_contains("Balance").count() > 0,
         "its settings are shown"

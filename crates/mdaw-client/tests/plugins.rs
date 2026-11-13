@@ -1,16 +1,15 @@
-//! The M6 demo as a test: a plugin goes onto a track through a checkout and is committed with
-//! a stem. A client with the plugin plays it live from the committed state; one without plays
-//! the stem. The plugin is the built-in test synth, hosted through CLAP like any other.
+//! Plugins between clients: a plugin goes onto a track, and its settings into the document, by
+//! ordinary edits. A client with the plugin plays it from those settings; one without hears
+//! nothing from the track and says so. The plugin is the built-in test synth, hosted through
+//! CLAP like any other.
 
 use mdaw_client::plugins::TrackSound;
-use mdaw_client::{CommitState, Session, Status, Who};
+use mdaw_client::{Session, Status, Who};
 use mdaw_dsp::pocket;
 use mdaw_engine::Engine;
 use mdaw_model::*;
 use mdaw_plugin::{Host, TEST_SYNTH};
 use mdaw_server::{Config, Server};
-use std::cell::RefCell;
-use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -110,7 +109,6 @@ fn add_track(session: &mut Session) -> (TrackId, DeviceId) {
 
 /// Plays the first bar on this client alone and returns the peak of each channel.
 fn listen(session: &mut Session) -> [f32; 2] {
-    session.set_linked(false);
     session.seek(Tick::ZERO);
     session.play();
     session.frame();
@@ -139,7 +137,7 @@ fn plugin_device(session: &Session, track: TrackId) -> DeviceId {
 }
 
 #[test]
-fn a_plugin_is_heard_live_where_it_is_installed_and_from_its_stem_elsewhere() {
+fn a_plugin_and_its_settings_reach_the_others_by_ordinary_edits() {
     let (_dir, server) = serve();
     let mut ann = join(&server, "ann", true);
     let mut ben = join(&server, "ben", true);
@@ -152,14 +150,7 @@ fn a_plugin_is_heard_live_where_it_is_installed_and_from_its_stem_elsewhere() {
         .find(|p| p.id == TEST_SYNTH)
         .expect("the test synth is installed");
 
-    // Plugins go onto a track only through a checkout.
-    assert!(!ann.add_plugin(track, &synth));
-    assert!(ann.notices().iter().any(|n| n.contains("Check out")));
-
-    ann.check_out(track);
-    until(&mut [&mut ann, &mut ben, &mut cat], "the checkout lands", |s| {
-        s.iter().all(|s| s.checkout_owner(track).is_some()) && s[0].workspace(track).is_some()
-    });
+    // Anyone puts a plugin on any track, with an ordinary edit.
     assert!(ann.add_plugin(track, &synth));
     // A track has one instrument: the synth takes Pocket's place.
     let devices = &ann.project().track(track).unwrap().content.devices;
@@ -186,67 +177,52 @@ fn a_plugin_is_heard_live_where_it_is_installed_and_from_its_stem_elsewhere() {
         params.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
         ["Level", "Balance", "Misbehave on lowest note"]
     );
-    // All to the right: a setting that only the plugin's state carries.
+    // All to the right: a setting that only the plugin's state carries. Its settings go into
+    // the document as a state blob, uploaded first, every couple of seconds; here at once.
     ann.set_plugin_param(track, device, mdaw_test_plugin::BALANCE, 1.0);
-    // A fader and a master away from unity: they apply where the track plays, so the stem is
-    // rendered without them, or they would count twice.
-    assert!(ann.edit(vec![Op::TrackSetMix {
-        track,
-        prop: MixProp::Gain(0.5),
-    }]));
-    assert!(ann.edit(vec![Op::MasterSetGain { gain: 1.5 }]));
+    ann.engine_mut().pump(256);
+    ann.save_plugin_states();
+    settle(&mut [&mut ann, &mut ben, &mut cat]);
+    let state = match &ben
+        .project()
+        .track(track)
+        .unwrap()
+        .content
+        .device(device)
+        .unwrap()
+        .kind
+    {
+        DeviceKind::Plugin { state, .. } => state.expect("the settings are in the document"),
+        DeviceKind::Builtin { .. } => panic!("a plugin"),
+    };
+    // Ann's own instance carries on with what she set.
+    assert_eq!(ann.track_sound(track), TrackSound::Live);
     let [left, right] = listen(&mut ann);
     assert!(
         right > 0.02 && left < 1e-4,
         "ann hears the plugin: {left} {right}"
     );
-    // The others hear the track as it was, from Pocket.
-    assert_eq!(ben.track_sound(track), TrackSound::Builtin);
 
-    assert!(ann.start_commit(track));
-    until(&mut [&mut ann, &mut ben, &mut cat], "the stem is rendered", |s| {
-        matches!(s[0].commit_state(), Some(CommitState::Ready { .. }))
-    });
-    ann.finish_commit("the test synth, all right", false);
-    until(&mut [&mut ann, &mut ben, &mut cat], "the commit lands", |s| {
-        s.iter().all(|s| s.checkout_owner(track).is_none())
-    });
-    settle(&mut [&mut ann, &mut ben, &mut cat]);
-    let committed = ben.project().track(track).unwrap().clone();
-    let stem = committed.stem.expect("the commit carries a stem");
-    assert_eq!(stem.tempo_hash, ben.project().tempo_map().hash());
-    assert!(matches!(
-        committed.content.device(device).unwrap().kind,
-        DeviceKind::Plugin { state: Some(_), .. }
-    ));
-    // Ann's own instance carries on with what she set.
-    assert_eq!(ann.track_sound(track), TrackSound::Live);
-
-    // Ben has the plugin: it runs on his machine, from the committed state.
+    // Ben has the plugin: it runs on his machine, from the state in the document.
     until(&mut [&mut ann, &mut ben, &mut cat], "ben runs the plugin", |s| {
         s[1].track_sound(track) == TrackSound::Live
     });
     let balance = ben.plugin_params(track, device, usize::MAX).unwrap().0[1].value;
-    assert_eq!(balance, 1.0, "the state came with the commit");
+    assert_eq!(balance, 1.0, "the state came with the edit");
     let [left, right] = listen(&mut ben);
     assert!(
         right > 0.02 && left < 1e-4,
         "ben hears the plugin: {left} {right}"
     );
-    let ben_heard = right;
 
-    // Cat has no plugins: she hears the stem, which sounds the same.
-    until(&mut [&mut ann, &mut ben, &mut cat], "cat has the stem", |s| {
-        s[2].track_sound(track) == TrackSound::Stem { stale: false }
-    });
+    // Cat has no plugins: the track is silent for her, and says why.
+    assert_eq!(cat.track_sound(track), TrackSound::NotInstalled);
     assert!(!cat.plugin_running(track, device));
     let [left, right] = listen(&mut cat);
-    assert!(right > 0.02 && left < 1e-3, "cat hears the stem: {left} {right}");
-    // As loud as the plugin itself, through the same fader and master.
-    let db = 20.0 * (right / ben_heard).log10();
-    assert!(db.abs() < 0.5, "the stem is {db:+.1} dB against the plugin");
+    assert!(left.max(right) < 1e-6, "cat hears nothing: {left} {right}");
 
-    // A track with plugins is changed only through a checkout.
+    // The track with a plugin takes ordinary edits from anyone: Ben adds a note, Cat turns
+    // the plugin off, and everyone has both.
     let clip = *ben
         .project()
         .track(track)
@@ -267,19 +243,41 @@ fn a_plugin_is_heard_live_where_it_is_installed_and_from_its_stem_elsewhere() {
             vel: 90,
         },
     };
-    assert!(!ben.edit(vec![note]));
-    assert!(ben.notices().iter().any(|n| n.contains("checkout")));
-
-    // Another tempo: the stem no longer fits, and says so; it still plays.
-    let id = *ben.project().tempo.keys().next().unwrap();
-    let point = TempoPoint {
-        tick: Tick::ZERO,
-        milli_bpm: 90_000,
-    };
-    assert!(ben.edit(vec![Op::TempoPut { id, point }]));
+    assert!(ben.edit(vec![note]));
+    assert!(cat.edit(vec![Op::DeviceSetBypass {
+        track,
+        id: device,
+        bypass: true,
+    }]));
     settle(&mut [&mut ann, &mut ben, &mut cat]);
-    assert_eq!(cat.track_sound(track), TrackSound::Stem { stale: true });
-    assert_eq!(ben.track_sound(track), TrackSound::Live);
+    for session in [&ann, &ben, &cat] {
+        let content = &session.project().track(track).unwrap().content;
+        assert_eq!(content.clips[&clip].notes.len(), 5);
+        assert!(content.device(device).unwrap().bypass);
+    }
+
+    // Settings the server never got are refused, and taken back where they were made.
+    let nowhere = mdaw_proto::blob_hash(b"never uploaded");
+    assert!(ben.edit(vec![Op::DeviceSetState {
+        track,
+        id: device,
+        state: Some(nowhere),
+    }]));
+    until(&mut [&mut ann, &mut ben, &mut cat], "the edit is refused", |s| {
+        s[1].notices().iter().any(|n| n.contains("not accepted"))
+    });
+    settle(&mut [&mut ann, &mut ben, &mut cat]);
+    for session in [&ann, &ben, &cat] {
+        let kind = &session
+            .project()
+            .track(track)
+            .unwrap()
+            .content
+            .device(device)
+            .unwrap()
+            .kind;
+        assert!(matches!(kind, DeviceKind::Plugin { state: Some(s), .. } if *s == state));
+    }
 }
 
 /// The helper that runs plugins in processes of their own, built if it is not there yet.
@@ -321,14 +319,27 @@ fn a_plugin_that_crashes_leaves_the_session_running_and_can_be_restarted() {
         s[0].track_sound(track) == TrackSound::Live
     });
     let device = plugin_device(&session, track);
-    // A setting the document does not have: it is kept aside, for after a crash.
+    // A setting changed in the plugin: within a couple of seconds it is in the document.
     session.set_plugin_param(track, device, mdaw_test_plugin::BALANCE, 1.0);
     session.engine_mut().pump(1024);
-    let kept = Instant::now() + Duration::from_millis(2500);
-    while Instant::now() < kept {
+    let saved = Instant::now() + Duration::from_millis(2500);
+    while Instant::now() < saved {
         session.frame();
         std::thread::sleep(Duration::from_millis(10));
     }
+    let in_document = |session: &Session| match &session
+        .project()
+        .track(track)
+        .unwrap()
+        .content
+        .device(device)
+        .unwrap()
+        .kind
+    {
+        DeviceKind::Plugin { state, .. } => state.is_some(),
+        DeviceKind::Builtin { .. } => false,
+    };
+    assert!(in_document(&session), "the setting was saved into the document");
 
     // Told to, the plugin crashes on this note.
     session.set_plugin_param(
@@ -348,7 +359,7 @@ fn a_plugin_that_crashes_leaves_the_session_running_and_can_be_restarted() {
     until(&mut [&mut session], "the crash is noticed", |s| {
         s[0].plugin_crashed(track, device)
     });
-    assert_eq!(session.track_sound(track), TrackSound::Crashed { stem: false });
+    assert_eq!(session.track_sound(track), TrackSound::Crashed);
     assert!(
         session
             .notices()
@@ -367,230 +378,4 @@ fn a_plugin_that_crashes_leaves_the_session_running_and_can_be_restarted() {
     });
     let (params, _) = session.plugin_params(track, device, usize::MAX).unwrap();
     assert_eq!(params[1].value, 1.0, "with the setting it had");
-}
-
-/// Ann's track with the test synth in place of Pocket, checked out by her.
-fn synth_track(ann: &mut Session, others: &mut [&mut Session]) -> (TrackId, DeviceId) {
-    let (track, _) = add_track(ann);
-    let mut all: Vec<&mut Session> = vec![&mut *ann];
-    all.extend(others.iter_mut().map(|s| &mut **s));
-    settle(&mut all);
-    ann.check_out(track);
-    until(&mut [&mut *ann], "the checkout lands", |s| {
-        s[0].workspace(track).is_some()
-    });
-    let synth = ann
-        .plugin_catalog()
-        .into_iter()
-        .find(|p| p.id == TEST_SYNTH)
-        .unwrap();
-    assert!(ann.add_plugin(track, &synth));
-    until(&mut [&mut *ann], "the plugin runs", |s| {
-        s[0].track_sound(track) == TrackSound::Live
-    });
-    (track, plugin_device(ann, track))
-}
-
-/// Starts the commit and waits until it is either ready or given up. True if ready.
-fn try_commit(ann: &mut Session, track: TrackId) -> bool {
-    if !ann.start_commit(track) {
-        return false;
-    }
-    until(&mut [&mut *ann], "the render ends", |s| {
-        !matches!(s[0].commit_state(), Some(CommitState::Rendering { .. }))
-    });
-    matches!(ann.commit_state(), Some(CommitState::Ready { .. }))
-}
-
-#[test]
-fn a_commit_whose_render_goes_wrong_is_not_sent() {
-    let (_dir, server) = serve();
-    let mut ann = join(&server, "ann", true);
-    let mut ben = join(&server, "ben", false);
-    let (track, device) = synth_track(&mut ann, &mut [&mut ben]);
-    let clip = *ann
-        .project()
-        .track(track)
-        .unwrap()
-        .content
-        .clips
-        .keys()
-        .next()
-        .unwrap();
-    let low = Op::NoteAdd {
-        track,
-        clip,
-        id: ann.ids().note(),
-        note: Note {
-            start: Tick::beats(3),
-            dur: Tick::beats(1),
-            pitch: mdaw_test_plugin::CRASH_PITCH,
-            vel: 100,
-        },
-    };
-    assert!(ann.edit(vec![low]));
-
-    // The plugin fails while the stem is rendered: nothing is committed, and Ann is told.
-    ann.set_plugin_param(track, device, mdaw_test_plugin::MISBEHAVE, mdaw_test_plugin::FAIL);
-    // Settings reach a plugin with its next block.
-    ann.engine_mut().pump(256);
-    assert!(!try_commit(&mut ann, track));
-    assert!(ann.commit_state().is_none());
-    assert!(
-        ann.notices()
-            .iter()
-            .any(|n| n.contains("crashed while the commit was rendered")),
-        "{:?}",
-        ann.notices()
-    );
-    assert_eq!(ann.checkout_owner(track), Some(ann.user()), "still checked out");
-
-    // A plugin that plays nothing: a silent stem is not committed either.
-    ann.set_plugin_param(track, device, mdaw_test_plugin::MISBEHAVE, 0.0);
-    ann.set_plugin_param(track, device, mdaw_test_plugin::LEVEL, 0.0);
-    ann.engine_mut().pump(256);
-    assert!(!try_commit(&mut ann, track));
-    assert!(ann.notices().iter().any(|n| n.contains("rendered as silence")));
-
-    // A track that runs too long for a stem is turned down before anything is rendered.
-    ann.set_plugin_param(track, device, mdaw_test_plugin::LEVEL, 0.5);
-    ann.engine_mut().pump(256);
-    let late = Op::ClipSet {
-        track,
-        id: clip,
-        prop: ClipProp::Start(Tick::bars(500)),
-    };
-    assert!(ann.edit(vec![late]));
-    assert!(!ann.start_commit(track));
-    assert!(
-        ann.notices()
-            .iter()
-            .any(|n| n.contains("can be committed up to 15 minutes"))
-    );
-
-    // Put right, it commits.
-    let back = Op::ClipSet {
-        track,
-        id: clip,
-        prop: ClipProp::Start(Tick::ZERO),
-    };
-    assert!(ann.edit(vec![back]));
-    assert!(try_commit(&mut ann, track));
-    ann.finish_commit("", false);
-    until(&mut [&mut ann, &mut ben], "the commit lands", |s| {
-        s[1].checkout_owner(track).is_none()
-    });
-    assert!(ben.project().track(track).unwrap().stem.is_some());
-}
-
-/// Renders a track with an installed plugin three ways and prints their levels: live, as the
-/// audio graph runs it; offline, as a commit renders its stem; and a stem file. Run by hand:
-/// `MDAW_PROBE_PLUGIN=<id> MDAW_PROBE_STATE=<state blob> MDAW_PROBE_STEM=<flac> cargo test -p
-/// mdaw-client --test plugins -- --ignored probe --nocapture`.
-#[test]
-#[ignore = "depends on the plugins installed here"]
-fn probe_levels_live_offline_and_stem() {
-    use mdaw_client::plugins::{Plugins, Shared};
-    use mdaw_dsp::{Compiler, OfflineRender};
-    let (Ok(id), Ok(state)) = (
-        std::env::var("MDAW_PROBE_PLUGIN"),
-        std::env::var("MDAW_PROBE_STATE"),
-    ) else {
-        return;
-    };
-    let state: Arc<[u8]> = if state == "none" {
-        Arc::from(&[][..])
-    } else {
-        std::fs::read(state).unwrap().into()
-    };
-    let hash = mdaw_proto::blob_hash(&state);
-    let mut ids = IdGen::new(ActorId(9));
-    let (track, clip, device) = (ids.track(), ids.clip(), ids.device());
-    let mut content = TrackContent::default();
-    content.devices.push_back(Device::new(
-        device,
-        DeviceKind::Plugin {
-            format: PluginFormat::Clap,
-            id: id.clone(),
-            state: (!state.is_empty()).then_some(hash),
-        },
-    ));
-    let notes = (0..8)
-        .map(|n| {
-            let note = Note {
-                start: Tick(n * 960),
-                dur: Tick(240),
-                pitch: 60,
-                vel: 100,
-            };
-            (ids.note(), note)
-        })
-        .collect();
-    let mut project = Project::default();
-    apply_all(
-        &mut project,
-        &[
-            Op::TrackAdd {
-                id: track,
-                shell: TrackShell {
-                    name: "t".into(),
-                    color: 0,
-                },
-                content,
-                after: None,
-            },
-            Op::ClipAdd {
-                track,
-                id: clip,
-                clip: Clip {
-                    start: Tick::bars(1),
-                    length: Tick::bars(2),
-                    name: "c".into(),
-                    notes,
-                },
-            },
-        ],
-    );
-    let rms = |s: &[f32]| (s.iter().map(|x| (*x as f64).powi(2)).sum::<f64>() / s.len().max(1) as f64).sqrt();
-    let report = |what: &str, audio: &[f32]| {
-        let peak = audio.iter().fold(0.0f32, |m, s| m.max(s.abs()));
-        eprintln!("{what:28} rms {:.4}  peak {:.4}", rms(audio), peak);
-    };
-    let range = TickRange::new(Tick::ZERO, Tick::bars(3));
-
-    let plugins = Shared(Rc::new(RefCell::new(Plugins::new(48_000))));
-    plugins.0.borrow_mut().set_host(Some(Host::standard(false)));
-    plugins.0.borrow_mut().add_state(hash, state.clone());
-
-    // Offline, as a commit renders it.
-    let audio = {
-        let mut p = plugins.0.borrow_mut();
-        let mut source = p.offline(48_000);
-        let mut render = OfflineRender::new(&project, Some(&[track]), range, 48_000, 256, &mut source);
-        let (_instances, failures) = source.finish();
-        assert!(failures.is_empty(), "{failures:?}");
-        while !render.step(usize::MAX) {}
-        render.finish()
-    };
-    report("offline (the stem's render)", &audio);
-
-    // Live: the graph with a running instance, block by block, as the audio thread does.
-    let mut source = plugins.clone();
-    let mut graph = Compiler::new(48_000).build_with(&project, None, &mut source);
-    let mut live = Vec::new();
-    let mut pos = 0i64;
-    graph.chase(0);
-    while live.len() < audio.len() {
-        let mut out = vec![0.0f32; 256 * 2];
-        graph.process(Some(pos), &mut out);
-        live.extend(out);
-        pos += 256;
-        plugins.0.borrow_mut().idle();
-    }
-    report("live (the graph)", &live);
-
-    if let Ok(stem) = std::env::var("MDAW_PROBE_STEM") {
-        let decoded = mdaw_engine::flac::decode(&std::fs::read(stem).unwrap(), 900).unwrap();
-        report("stem file", &decoded.samples);
-    }
 }

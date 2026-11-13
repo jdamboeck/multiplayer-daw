@@ -13,7 +13,7 @@ fn int(n: u64) -> i64 {
 }
 
 /// Bumped when the tables change.
-const STORE_VERSION: u32 = 1;
+const STORE_VERSION: u32 = 2;
 
 pub struct Store {
     db: Connection,
@@ -38,7 +38,7 @@ impl Store {
              CREATE TABLE IF NOT EXISTS events (
                  seq INTEGER PRIMARY KEY,
                  actor INTEGER NOT NULL,
-                 txn INTEGER,
+                 txn INTEGER NOT NULL,
                  data BLOB NOT NULL);
              CREATE INDEX IF NOT EXISTS events_by_actor ON events (actor, txn);
              CREATE TABLE IF NOT EXISTS snapshots (seq INTEGER PRIMARY KEY, data BLOB NOT NULL);
@@ -101,7 +101,7 @@ impl Store {
             .execute(params![
                 int(event.seq),
                 event.actor.0,
-                event.client_txn_id().map(int),
+                int(event.client_txn_id),
                 data
             ])?;
         Ok(())

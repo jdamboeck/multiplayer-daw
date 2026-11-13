@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*", "spikes/*", "xtask"]
+members = ["crates/*", "xtask"]
 # Everything but the Tracktion bridge crates, which build native code with CMake (submodules,
 # a C++ toolchain, ~10 minutes cold). Plain `cargo build` / `cargo test` leave them out;
 # `-p mdaw-tracktion` or `--workspace` take them in. New crates must be added here too.
@@ -15,7 +15,6 @@ default-members = [
     "crates/mdaw-server",
     "crates/mdaw-sync",
     "crates/mdaw-test-plugin",
-    "spikes/clap-host",
     "xtask",
 ]
 
@@ -58,8 +57,6 @@ rcgen = "0.14"
 sha2 = "0.11"
 getrandom = "0.4"
 rusqlite = { version = "0.41", features = ["bundled"] }
-flacenc = { version = "0.5", default-features = false }
-claxon = "0.4"
 midir = "0.11"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 

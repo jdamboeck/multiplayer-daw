@@ -190,22 +190,6 @@ impl TempoMap {
             milli_bpm: s.milli_bpm,
         })
     }
-
-    /// Identifies the timing a stem was rendered against (FNV-1a over the effective points).
-    pub fn hash(&self) -> u64 {
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        let mut eat = |bytes: &[u8]| {
-            for &b in bytes {
-                h ^= b as u64;
-                h = h.wrapping_mul(0x0000_0100_0000_01b3);
-            }
-        };
-        for s in &self.segments {
-            eat(&s.tick.to_le_bytes());
-            eat(&s.milli_bpm.to_le_bytes());
-        }
-        h
-    }
 }
 
 #[cfg(test)]
@@ -239,12 +223,10 @@ mod tests {
     }
 
     #[test]
-    fn same_tick_last_wins_and_hash_follows_effective_points() {
+    fn same_tick_last_wins() {
         let a = TempoMap::from_points([point(0, 100), point(0, 140)]);
         let b = TempoMap::from_points([point(0, 140)]);
         assert_eq!(a, b);
-        assert_eq!(a.hash(), b.hash());
-        assert_ne!(a.hash(), TempoMap::default().hash());
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! The graph with devices it does not know: plugins, through `ExternalDevice`, and stems.
+//! The graph with devices it does not know: plugins, through `ExternalDevice`.
 
 use mdaw_dsp::{BlockTime, Compiler, ExternalDevice, PluginRef, PluginSource};
 use mdaw_model::*;
@@ -47,7 +47,6 @@ impl ExternalDevice for Fake {
 struct Source {
     log: Arc<Log>,
     installed: bool,
-    stem: Option<Arc<[f32]>>,
 }
 
 impl PluginSource for Source {
@@ -60,9 +59,6 @@ impl PluginSource for Source {
                 sounding: 0,
             }) as Box<dyn ExternalDevice>
         })
-    }
-    fn stem(&mut self, _: &Stem) -> Option<Arc<[f32]>> {
-        self.stem.clone()
     }
 }
 
@@ -128,7 +124,6 @@ fn a_plugin_plays_its_notes_in_stereo_and_is_kept_across_rebuilds() {
     let mut source = Source {
         log: log.clone(),
         installed: true,
-        stem: None,
     };
     let mut compiler = Compiler::new(RATE);
     let mut graph = compiler.build_with(&project, None, &mut source);
@@ -172,44 +167,17 @@ fn a_plugin_plays_its_notes_in_stereo_and_is_kept_across_rebuilds() {
 }
 
 #[test]
-fn without_the_plugin_the_stem_plays_from_the_start_of_the_timeline() {
-    let (mut project, track, _) = project();
-    // A stem whose every frame holds its own index, so the position can be read off the output.
-    let frames = RATE as usize;
-    let stem: Arc<[f32]> = (0..frames).flat_map(|i| [i as f32, -(i as f32)]).collect();
-    project.set_stem(
-        track,
-        Some(Stem {
-            blob: BlobHash([1; 32]),
-            tempo_hash: project.tempo_map().hash(),
-            len_samples: frames as u64,
-            gain: 1.0,
-        }),
-    );
+fn without_the_plugin_the_track_is_silent() {
+    let (project, _, _) = project();
     let log = Arc::new(Log::default());
     let mut source = Source {
         log: log.clone(),
         installed: false,
-        stem: Some(stem),
     };
     let mut graph = Compiler::new(RATE).build_with(&project, None, &mut source);
     assert_eq!(log.made.load(Relaxed), 0);
-    let [left, right] = last_frame(&mut graph, 1000, 100);
-    // Frame 1099 of the stem, at the track's unity gain (within rounding of the pan law).
-    assert!(
-        (left - 1099.0).abs() < 1e-3 && (right + 1099.0).abs() < 1e-3,
-        "{left} {right}"
-    );
-    // Past its end it is silent, and so is a stopped transport.
-    assert_eq!(last_frame(&mut graph, frames as i64, 100), [0.0, 0.0]);
-    let mut out = vec![0.0; 200];
-    graph.process(None, &mut out);
-    assert!(out.iter().all(|s| *s == 0.0));
-
-    // Neither plugin nor stem: silent.
-    source.stem = None;
-    let mut graph = Compiler::new(RATE).build_with(&project, None, &mut source);
-    assert_eq!(last_frame(&mut graph, 1000, 100), [0.0, 0.0]);
+    // Where the note of the second beat would sound.
+    assert_eq!(last_frame(&mut graph, RATE as i64 / 2, 256), [0.0, 0.0]);
 }
 
 /// Records what it is given, for checking the timing of events.
@@ -235,9 +203,6 @@ struct RecorderSource(Arc<Mutex<Vec<String>>>);
 impl PluginSource for RecorderSource {
     fn device(&mut self, _: TrackId, _: DeviceId, _: PluginRef<'_>) -> Option<Box<dyn ExternalDevice>> {
         Some(Box::new(Recorder { log: self.0.clone() }))
-    }
-    fn stem(&mut self, _: &Stem) -> Option<Arc<[f32]>> {
-        None
     }
 }
 

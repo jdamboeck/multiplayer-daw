@@ -66,8 +66,6 @@ fn plugin_panel(
     format: PluginFormat,
     id: &str,
 ) {
-    let mine =
-        app.session.checkout_owner(track) == Some(app.session.user()) || app.session.linked().is_none();
     let name = app
         .session
         .plugin_name(format, id)
@@ -88,7 +86,7 @@ fn plugin_panel(
             }
         }
         let mut on = !device.bypass;
-        if ui.add_enabled(mine, egui::Checkbox::new(&mut on, "On")).changed() {
+        if ui.checkbox(&mut on, "On").changed() {
             app.session.edit(vec![Op::DeviceSetBypass {
                 track,
                 id: device.id,
@@ -96,7 +94,7 @@ fn plugin_panel(
             }]);
         }
         if ui
-            .add_enabled(mine, egui::Button::new("Remove"))
+            .button("Remove")
             .on_hover_text("Take the plugin off the track")
             .clicked()
         {
@@ -107,7 +105,7 @@ fn plugin_panel(
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new(format!(
-                    "{name} crashed. The rest of mdaw goes on; the track plays its stem, if it has one."
+                    "{name} crashed. The rest of mdaw goes on; the track is silent here until the plugin is restarted."
                 ))
                 .color(theme::METER_HOT),
             );
@@ -123,17 +121,12 @@ fn plugin_panel(
     }
     if !running {
         let why = if app.session.plugin_name(format, id).is_none() {
-            format!("{name} is not installed here. The track plays its stem: the sound of its last commit.")
+            format!("{name} is not installed here, so this track gives no sound on this computer.")
         } else {
             "Starting the plugin…".to_string()
         };
         ui.label(RichText::new(why).color(theme::TEXT_DIM));
         return;
-    }
-    if !mine {
-        ui.label(
-            RichText::new("Check out the track to change the plugin's settings.").color(theme::TEXT_DIM),
-        );
     }
     let (params, count) = app
         .session
@@ -149,7 +142,7 @@ fn plugin_panel(
                     .show_value(true)
                     .step_by(if param.stepped { 1.0 } else { 0.0 })
                     .text(&param.name);
-                if ui.add_enabled(mine, slider).changed() {
+                if ui.add(slider).changed() {
                     app.session.set_plugin_param(track, device.id, param.id, value);
                 }
                 if index % 2 == 1 {
@@ -169,8 +162,6 @@ fn add_plugin(app: &mut DawApp, ui: &mut Ui, track: TrackId) {
         ui.label(RichText::new("Plugins are switched off in this window.").color(theme::TEXT_DIM));
         return;
     }
-    let mine =
-        app.session.checkout_owner(track) == Some(app.session.user()) || app.session.linked().is_none();
     let catalog = app.session.plugin_catalog();
     let label = |plugin: &mdaw_plugin::PluginInfo| {
         if plugin.vendor.is_empty() {
@@ -186,38 +177,28 @@ fn add_plugin(app: &mut DawApp, ui: &mut Ui, track: TrackId) {
     }
     let mut pick = None;
     ui.horizontal(|ui| {
-        ui.add_enabled_ui(mine, |ui| {
-            ui.menu_button("Instrument…", |ui| {
-                ui.label(RichText::new("A track has one instrument; this one takes its place.").small());
-                if ui.button("Pocket (built in)").clicked() {
-                    pick = Some(Pick::Pocket);
+        ui.menu_button("Instrument…", |ui| {
+            ui.label(RichText::new("A track has one instrument; this one takes its place.").small());
+            if ui.button("Pocket (built in)").clicked() {
+                pick = Some(Pick::Pocket);
+                ui.close();
+            }
+            for plugin in &instruments {
+                if ui.button(label(plugin)).on_hover_text(&plugin.location).clicked() {
+                    pick = Some(Pick::Plugin((*plugin).clone()));
                     ui.close();
                 }
-                for plugin in &instruments {
+            }
+        });
+        if !effects.is_empty() {
+            ui.menu_button("Add effect…", |ui| {
+                for plugin in &effects {
                     if ui.button(label(plugin)).on_hover_text(&plugin.location).clicked() {
                         pick = Some(Pick::Plugin((*plugin).clone()));
                         ui.close();
                     }
                 }
             });
-            if !effects.is_empty() {
-                ui.menu_button("Add effect…", |ui| {
-                    for plugin in &effects {
-                        if ui.button(label(plugin)).on_hover_text(&plugin.location).clicked() {
-                            pick = Some(Pick::Plugin((*plugin).clone()));
-                            ui.close();
-                        }
-                    }
-                });
-            }
-        });
-        if !mine {
-            // Said out loud: a greyed-out button does not tell why.
-            let why = match app.session.checkout_owner(track) {
-                Some(_) => "The track is checked out by someone else.",
-                None => "Plugins go onto a track while you have it checked out: click \"Check out\" first.",
-            };
-            ui.label(RichText::new(why).color(theme::TEXT_DIM));
         }
     });
     match pick {

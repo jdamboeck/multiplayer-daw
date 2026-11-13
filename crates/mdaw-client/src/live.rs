@@ -1,11 +1,11 @@
-//! Live notes: what this player plays, heard here at once and sent to the others, and what the
-//! others play, heard here as it arrives.
+//! Live notes: what this player plays on the computer keyboard or a MIDI device, heard here at
+//! once and kept for recording. Nothing of it goes over the network; a recording becomes an
+//! ordinary edit.
 //!
-//! [`Live`] is shared by the UI, the network thread and the thread of a MIDI device, so a note
-//! never waits for a frame of the UI. The UI only decides which track notes go to, and which
-//! tracks do not listen to the others.
+//! [`Live`] is shared by the UI and the thread of a MIDI device, so a note never waits for a
+//! frame of the UI. The UI only decides which track notes go to.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
@@ -13,15 +13,10 @@ use std::time::Duration;
 
 use mdaw_engine::midi::{self, MidiDevice, MidiMsg};
 use mdaw_engine::{LiveInput, clock};
-use mdaw_model::{ActorId, TrackId};
-use mdaw_proto::{Datagram, LiveAction, MidiIn, MidiOut, MidiPacket};
+use mdaw_model::TrackId;
 
 /// Engine keys of this player's notes: the pitch is added.
 const OWN_KEY: u64 = 1 << 40;
-/// Engine keys of others' notes: the actor, shifted by 8, and the pitch are added.
-const REMOTE_KEY: u64 = 1 << 41;
-/// How often the network thread lets [`Live::tick`] run.
-pub const TICK: Duration = Duration::from_millis(50);
 
 /// A note this player started or ended, with when, for recording.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -38,21 +33,12 @@ pub struct Played {
 pub struct Live {
     state: Arc<Mutex<State>>,
     engine: LiveInput,
-    /// Tells the UI that others started or ended notes, so it can show who plays.
-    waker: Option<crate::link::Waker>,
 }
 
 #[derive(Default)]
 struct State {
-    out: MidiOut,
-    inn: MidiIn,
-    connection: Option<quinn::Connection>,
     /// The track notes go to.
     target: Option<TrackId>,
-    /// Tracks that do not hear the others.
-    deaf: BTreeSet<TrackId>,
-    /// Who is there; others' notes are silenced when they leave.
-    present: BTreeSet<ActorId>,
     /// This player's notes that sound, by pitch.
     held: BTreeMap<u8, TrackId>,
     /// Kept for recording while `capturing`.
@@ -65,14 +51,7 @@ impl Live {
         Self {
             state: Arc::default(),
             engine,
-            waker: None,
         }
-    }
-
-    /// The UI is woken through `waker` when others start or end notes.
-    pub fn with_waker(mut self, waker: crate::link::Waker) -> Self {
-        self.waker = Some(waker);
-        self
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -102,8 +81,6 @@ impl Live {
         let vel = vel.clamp(1, 127);
         self.engine.note_on(track, OWN_KEY | pitch as u64, pitch, vel);
         state.held.insert(pitch, track);
-        let packet = state.out.play(track, pitch, vel, now);
-        state.send(packet);
         state.capture(now, track, pitch, vel);
     }
 
@@ -128,69 +105,7 @@ impl Live {
         };
         let now = clock::now_micros();
         self.engine.note_off(track, OWN_KEY | pitch as u64);
-        let packet = state.out.play(track, pitch, 0, now);
-        state.send(packet);
         state.capture(now, track, pitch, 0);
-    }
-
-    /// Plays what another player sent.
-    pub fn receive(&self, packet: &MidiPacket) {
-        let mut state = self.state();
-        if state.deaf.contains(&packet.track) || !state.present.contains(&packet.actor) {
-            return;
-        }
-        let actions = state.inn.receive(packet, clock::now_micros());
-        self.perform(actions);
-    }
-
-    /// Keeps the others' picture of this player's notes fresh and silences players not heard
-    /// from. Call every [`TICK`].
-    pub fn tick(&self) {
-        let now = clock::now_micros();
-        let mut state = self.state();
-        for packet in state.out.tick(now) {
-            state.send(packet);
-        }
-        let actions = state.inn.tick(now);
-        self.perform(actions);
-    }
-
-    /// The connection notes go out on. Without one, the others' notes end.
-    pub fn set_connection(&self, connection: Option<quinn::Connection>) {
-        let mut state = self.state();
-        if connection.is_none() {
-            let actions = state.inn.silence_all();
-            self.perform(actions);
-        }
-        state.connection = connection;
-    }
-
-    /// Who is there. The notes of anyone else end.
-    pub fn set_present(&self, actors: BTreeSet<ActorId>) {
-        let mut state = self.state();
-        if state.present == actors {
-            return;
-        }
-        let gone: Vec<ActorId> = state.present.difference(&actors).copied().collect();
-        for gone in gone {
-            let actions = state.inn.silence_actor(gone);
-            self.perform(actions);
-        }
-        state.present = actors;
-    }
-
-    /// The tracks that do not hear the others. What the others play there ends.
-    pub fn set_deaf(&self, tracks: BTreeSet<TrackId>) {
-        let mut state = self.state();
-        if state.deaf == tracks {
-            return;
-        }
-        let newly: Vec<TrackId> = tracks.difference(&state.deaf).copied().collect();
-        for track in newly {
-            let actions = state.inn.silence_track(track);
-            self.perform(actions);
-        }
-        state.deaf = tracks;
     }
 
     /// Starts or stops keeping this player's notes for [`Live::take_played`].
@@ -215,46 +130,9 @@ impl Live {
             .map(|(&pitch, &track)| (track, pitch))
             .collect()
     }
-
-    /// Who else plays on `track` right now.
-    pub fn players(&self, track: TrackId) -> Vec<ActorId> {
-        self.state().inn.players(track)
-    }
-
-    /// How many notes of others sound here.
-    pub fn others_sounding(&self) -> usize {
-        self.state().inn.sounding()
-    }
-
-    fn perform(&self, actions: Vec<LiveAction>) {
-        if let Some(waker) = self.waker.as_ref().filter(|_| !actions.is_empty()) {
-            waker();
-        }
-        for action in actions {
-            match action {
-                LiveAction::On {
-                    actor,
-                    track,
-                    pitch,
-                    vel,
-                } => {
-                    self.engine.note_on(track, remote_key(actor, pitch), pitch, vel);
-                }
-                LiveAction::Off { actor, track, pitch } => {
-                    self.engine.note_off(track, remote_key(actor, pitch));
-                }
-            }
-        }
-    }
 }
 
 impl State {
-    fn send(&self, packet: MidiPacket) {
-        if let Some(connection) = &self.connection {
-            mdaw_net::send_datagram(connection, &Datagram::Midi(packet));
-        }
-    }
-
     fn capture(&mut self, micros: i64, track: TrackId, pitch: u8, vel: u8) {
         if self.capturing {
             self.played.push(Played {
@@ -265,10 +143,6 @@ impl State {
             });
         }
     }
-}
-
-fn remote_key(actor: ActorId, pitch: u8) -> u64 {
-    REMOTE_KEY | (actor.0 as u64) << 8 | pitch as u64
 }
 
 /// Keeps a MIDI device open on a thread of its own: the one the user picked, whenever it is

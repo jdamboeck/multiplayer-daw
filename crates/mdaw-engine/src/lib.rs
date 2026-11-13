@@ -4,7 +4,6 @@
 pub mod alloc_guard;
 pub mod clock;
 pub(crate) mod engine;
-pub mod flac;
 mod rt;
 
 pub mod midi;

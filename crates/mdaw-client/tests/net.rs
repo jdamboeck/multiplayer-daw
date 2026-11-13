@@ -4,8 +4,8 @@
 use mdaw_client::{Session, Status, Who};
 use mdaw_engine::Engine;
 use mdaw_model::{
-    Clip, ClipId, ClipProp, EntityRef, MixProp, Note, NoteId, NoteProp, Op, Project, Tick, TrackContent,
-    TrackId, TrackShell,
+    BuiltinKind, Clip, ClipId, ClipProp, Device, DeviceKind, EntityRef, MixProp, Note, NoteId, NoteProp, Op,
+    PluginFormat, Project, ShellProp, Tick, TrackContent, TrackId, TrackShell,
 };
 use mdaw_server::{Config, Server};
 use std::net::SocketAddr;
@@ -245,13 +245,17 @@ fn a_refused_edit_is_taken_back_with_a_notice() {
     let bass = add_track(&mut ann, "Bass");
     settle(&mut [&mut ann, &mut ben]);
 
-    // Ben takes the bass out of live editing. Ann has not heard of that yet when she edits it,
-    // together with the lead: the server turns down the whole edit.
-    ben.check_out(bass.0);
-    until(&mut [&mut ben], "ben's checkout is in the log", |s| {
-        s[0].workspace(bass.0).is_some()
-    });
+    // Ann edits the lead and, in the same edit, gives the bass a plugin whose settings the
+    // server never got: the server turns down the whole edit.
     let (track, clip, id) = at;
+    let plugin = Device::new(
+        ann.ids().device(),
+        DeviceKind::Plugin {
+            format: PluginFormat::Clap,
+            id: "org.example.synth".into(),
+            state: Some(mdaw_proto::blob_hash(b"never uploaded")),
+        },
+    );
     assert!(ann.edit(vec![
         Op::NoteSet {
             track,
@@ -259,11 +263,10 @@ fn a_refused_edit_is_taken_back_with_a_notice() {
             id,
             prop: NoteProp::Pitch(90)
         },
-        Op::NoteSet {
+        Op::DeviceAdd {
             track: bass.0,
-            clip: bass.1,
-            id: bass.2,
-            prop: NoteProp::Pitch(90)
+            device: plugin,
+            after: None,
         },
     ]));
     assert_eq!(pitch(ann.project(), at), Some(90));
@@ -281,7 +284,7 @@ fn a_refused_edit_is_taken_back_with_a_notice() {
         Some(60),
         "nothing of the refused edit stays"
     );
-    assert_eq!(pitch(ann.project(), bass), Some(60));
+    assert!(ann.project().track(bass.0).unwrap().content.devices.is_empty());
     assert_eq!(
         ben.project().track(track).unwrap().content.clips[&clip].notes[&id].vel,
         33
@@ -578,4 +581,90 @@ fn a_huge_first_message_is_turned_away_before_the_token_is_checked() {
     // And the server goes on as before.
     let mut ann = join(&server, "ann");
     settle(&mut [&mut ann]);
+}
+
+#[test]
+fn an_edit_too_large_to_send_is_taken_back_and_the_connection_stays() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = serve(dir.path(), "127.0.0.1:0");
+    let (mut ann, mut ben) = (join(&server, "ann"), join(&server, "ben"));
+    // A track of 40 full clips: over 16 MiB once encoded, but within every limit of the model.
+    let ids = ann.ids();
+    let track = ids.track();
+    let mut content = TrackContent::default();
+    for c in 0..40 {
+        let notes = (0..50_000)
+            .map(|n| {
+                let note = Note {
+                    start: Tick(n),
+                    dur: Tick(1_000_000),
+                    pitch: 127,
+                    vel: 127,
+                };
+                (ids.note(), note)
+            })
+            .collect();
+        let clip = Clip {
+            start: Tick::bars(c),
+            length: Tick::bars(1),
+            name: String::new(),
+            notes,
+        };
+        content.clips.insert(ids.clip(), Arc::new(clip));
+    }
+    let shell = TrackShell {
+        name: "huge".into(),
+        color: 0,
+    };
+    assert!(ann.edit(vec![Op::TrackAdd {
+        id: track,
+        shell,
+        content,
+        after: None,
+    }]));
+    until(&mut [&mut ann, &mut ben], "the edit is taken back", |s| {
+        s[0].project().tracks.is_empty() && s[0].unconfirmed() == 0
+    });
+    assert!(ann.notices().iter().any(|n| n.contains("too large")));
+    assert_eq!(ann.status(), Status::Online, "the connection is still up");
+
+    // And it still works.
+    add_track(&mut ann, "Lead");
+    settle(&mut [&mut ann, &mut ben]);
+    assert_eq!(ben.project().tracks.len(), 1);
+}
+
+#[test]
+fn an_edit_past_the_limits_is_refused_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = serve(dir.path(), "127.0.0.1:0");
+    let (mut ann, mut ben) = (join(&server, "ann"), join(&server, "ben"));
+    let (track, _, _) = add_track(&mut ann, "Lead");
+    settle(&mut [&mut ann, &mut ben]);
+
+    // 32 devices fill the track, the next is one too many.
+    let device = |ann: &mut Session| {
+        let kind = DeviceKind::Builtin {
+            kind: BuiltinKind::Pocket,
+            dsp_version: mdaw_dsp::pocket::DSP_VERSION,
+        };
+        Op::DeviceAdd {
+            track,
+            device: Device::new(ann.ids().device(), kind),
+            after: None,
+        }
+    };
+    for _ in 0..32 {
+        let op = device(&mut ann);
+        assert!(ann.edit(vec![op]));
+    }
+    let op = device(&mut ann);
+    assert!(!ann.edit(vec![op]), "refused here, before the server");
+    assert!(ann.notices().iter().any(|n| n.contains("cannot be made")));
+    settle(&mut [&mut ann, &mut ben]);
+    assert_eq!(ben.project().track(track).unwrap().content.devices.len(), 32);
+
+    // An op out of range is refused with a word too, where a debug build used to stop.
+    let prop = ShellProp::Name("x".repeat(200));
+    assert!(!ann.edit(vec![Op::TrackSetShell { id: track, prop }]));
 }

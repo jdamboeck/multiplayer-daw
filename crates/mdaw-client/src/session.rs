@@ -1,31 +1,28 @@
 //! One editing session: the replica, the thing that orders its edits, and the audio engine.
+//!
+//! Playback is this client's own: play, stop, seek and loop act on the local engine and nothing
+//! about them goes over the network.
 
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::mpsc as std_mpsc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
-use mdaw_dsp::{OfflineRender, pocket};
-use mdaw_engine::{Engine, clock, flac};
+use mdaw_dsp::pocket;
+use mdaw_engine::{Engine, clock};
 use mdaw_model::{
-    ActorId, BlobHash, BuiltinKind, Device, DeviceKind, EntityRef, IdGen, Op, Project, Scope, TempoMap,
-    TempoPoint, Tick, TickRange, TrackContent, TrackId, TrackShell, UserId, apply, apply_all, fit_name,
+    ActorId, BlobHash, BuiltinKind, Device, DeviceId, DeviceKind, EntityRef, IdGen, Op, Project, TempoMap,
+    TempoPoint, Tick, TickRange, TrackContent, TrackId, TrackShell, UserId, apply, apply_all,
 };
-use mdaw_net::{ClockEstimate, JoinInfo};
-use mdaw_proto::{
-    ChangelogEntry, ClientMsg, CommitRequest, Event, EventBody, LEASE_RENEW_SECS, Peer, Presence,
-    ReleaseReason, Request, START_LEAD_MICROS, Sample, ServerMsg, Superseded, SyncData, TransportState, Txn,
-    Welcome,
-};
-use mdaw_sync::{Ended, Gesture, Loopback, Replica, Workspace};
+use mdaw_net::JoinInfo;
+use mdaw_proto::{ClientMsg, Event, Peer, Presence, ServerMsg, Superseded, SyncData, Txn, Welcome};
+use mdaw_sync::{Gesture, Loopback, Replica};
 
-use crate::checkout::{self, CommitPlan, Files, Fork, Rendered};
 use crate::link::{Link, LinkEvent, Waker, Who};
 use crate::live::Live;
-use crate::plugins::{self, Plugins, TrackSound, Want};
+use crate::plugins::{self, Plugins, TrackSound};
 use crate::record::{Take, take_ops};
 use crate::theme;
 
@@ -43,22 +40,12 @@ const PRESENCE_REFRESH: Duration = Duration::from_millis(500);
 /// A soft lock not refreshed for this long is gone.
 const PRESENCE_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_DISPLACED: usize = 500;
-const MAX_LOG: usize = 500;
 const MAX_NOTICES: usize = 4;
-/// How often the work of a checkout is written to disk while it changes.
-const JOURNAL_EVERY: Duration = Duration::from_millis(500);
-/// Longest sample played from the changelog, in seconds. Samples rendered here are at most 8 bars
-/// and a second.
-const SAMPLE_MAX_SECS: u32 = 300;
-/// The longest stem accepted from others. Decoded, a second takes about 400 KB.
-const STEM_MAX_SECS: u32 = 900;
 /// How often the main loop runs at least while a plugin's own window is open: plugins draw from
 /// their timers, which run only then.
 const PLUGIN_WINDOW_PACE: Duration = Duration::from_millis(10);
 /// How often it runs at least while plugins run without a window, for the callbacks they ask for.
 const PLUGIN_PACE: Duration = Duration::from_millis(50);
-/// How long the bounce of a stem may hold up one frame of the UI.
-const BOUNCE_SLICE: Duration = Duration::from_millis(12);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Status {
@@ -83,99 +70,6 @@ pub struct Displaced {
     pub lost: Superseded,
 }
 
-/// A checkout, commit or release, for the changelog.
-#[derive(Clone, Debug)]
-pub struct LogEntry {
-    pub seq: u64,
-    /// Who did it.
-    pub by: UserId,
-    /// Server wall clock, milliseconds since the Unix epoch.
-    pub wall_ts: u64,
-    pub what: Logged,
-}
-
-impl Logged {
-    pub fn track(&self) -> TrackId {
-        match self {
-            Logged::Checkout { track } | Logged::Commit { track, .. } | Logged::Release { track, .. } => {
-                *track
-            }
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub enum Logged {
-    Checkout {
-        track: TrackId,
-    },
-    Commit {
-        track: TrackId,
-        summary: String,
-        ranges: Vec<TickRange>,
-    },
-    Release {
-        track: TrackId,
-        reason: ReleaseReason,
-    },
-}
-
-/// Where a commit of this client stands.
-pub enum CommitState<'a> {
-    /// The samples are being rendered.
-    Rendering { track: TrackId },
-    /// Waiting for the user to decide.
-    Ready { plan: &'a CommitPlan },
-    /// On its way to the server.
-    Sending { track: TrackId },
-}
-
-struct Commit {
-    track: TrackId,
-    plan: Option<CommitPlan>,
-    /// The message, once the user has decided. Sent again on a new connection until the
-    /// commit is in the log or turned down.
-    sent: Option<ClientMsg>,
-}
-
-/// Results of work done on other threads.
-enum Job {
-    Plan(CommitPlan),
-    /// The commit could not be prepared; it is given up, and the user told why.
-    CommitFailed(String),
-    /// A downloaded stem, decoded at the engine's rate with its gain applied; `None` if it was
-    /// not one.
-    Stem {
-        hash: BlobHash,
-        audio: Option<Arc<[f32]>>,
-    },
-    Before {
-        entry_seq: u64,
-        rendered: Rendered,
-    },
-    /// A downloaded sample, ready to play; `None` if it was not one.
-    Decoded {
-        hash: BlobHash,
-        audio: Option<Arc<[f32]>>,
-    },
-    Nothing,
-}
-
-/// How well this client keeps time with the shared transport.
-#[derive(Clone, Copy, Debug)]
-pub struct Timing {
-    /// The server's clock now, as this client estimates it.
-    pub server_micros: i64,
-    /// Round trip of the ping the estimate rests on. The estimate is off by at most half of
-    /// it.
-    pub rtt_micros: i64,
-    /// How far the audio is ahead of where the shared transport puts it. `None` unless
-    /// playing.
-    pub drift_micros: Option<i64>,
-    /// How often the engine had to jump to get back in step.
-    pub resyncs: u64,
-}
-
 pub struct Session {
     replica: Replica,
     backend: Backend,
@@ -186,60 +80,28 @@ pub struct Session {
     editing: Option<EntityRef>,
     displaced: Vec<Displaced>,
     notices: Vec<String>,
-    /// The tempo map of the view when the transport was last looked at.
+    /// The tempo map of the view, as of the last frame.
     tempo: TempoMap,
-    /// The loop of the private transport.
-    private_loop: Option<TickRange>,
+    /// The loop of this client's transport.
+    loop_range: Option<TickRange>,
     waker: Option<Waker>,
-    /// Where checkouts and forks of this project are kept. `None`: nowhere.
-    files: Option<Files>,
-    /// `Workspace::changes` as last written, by track. A workspace missing here is new to the
-    /// session: a journal from before may wait for it on disk.
-    saved: HashMap<TrackId, u64>,
-    /// When journals were last written; they are written at most every `JOURNAL_EVERY`.
-    saved_at: Instant,
-    commit: Option<Commit>,
-    jobs: (std_mpsc::Sender<Job>, std_mpsc::Receiver<Job>),
-    /// Blobs not yet known to be on the server, with their bytes.
+    /// Blobs made here and not yet known to be on the server, with their bytes.
     uploads: HashMap<BlobHash, Arc<[u8]>>,
-    /// Messages that go out once none of their blobs is still uploading.
-    outgoing: Vec<(Vec<BlobHash>, ClientMsg)>,
-    log: Vec<LogEntry>,
-    /// Samples of changelog entries, by the entry's sequence number.
-    samples: HashMap<u64, Vec<Sample>>,
-    /// Decoded samples at the engine's rate.
-    audio: HashMap<BlobHash, Arc<[f32]>>,
-    /// A sample to play as soon as it has been downloaded.
-    wanted: Option<BlobHash>,
-    /// Samples being downloaded or decoded.
+    /// Transactions to send, in order, once none of the blobs they name is still uploading:
+    /// the server refuses an edit that names a blob it does not have.
+    outgoing: Vec<Txn>,
+    /// Blobs being downloaded.
     fetching: HashSet<BlobHash>,
-    /// The sample playing, with its preview id.
-    playing: Option<(BlobHash, u64)>,
-    forks: Vec<Fork>,
-    /// Forks being added back as a new track, by that track, until the server has it.
-    restoring: Vec<(TrackId, Fork)>,
-    lease_sent: Instant,
     live: Live,
     /// Recording is armed: notes this player plays while the transport runs are kept.
     recording: bool,
     /// The notes of the current run of the transport, while recording.
     take: Take,
     plugins: plugins::Shared,
-    /// A stem being rendered for the commit, a slice per frame.
-    bounce: Option<Bounce>,
-}
-
-/// The offline render of a track with plugins, for its commit.
-struct Bounce {
-    track: TrackId,
-    render: OfflineRender,
-    /// The fresh plugin instances it renders with.
-    instances: Vec<Box<dyn mdaw_plugin::Instance>>,
-    confirmed: Project,
-    workspace: Workspace,
-    tempo_hash: u64,
-    /// The track has notes: a stem of it that is all silence is a broken render.
-    has_notes: bool,
+    /// When the plugins' settings were last looked at for changes.
+    plugins_saved_at: Instant,
+    /// Saves of one plugin's settings, one after the other, are one undo step.
+    plugin_gestures: HashMap<(TrackId, DeviceId), Gesture>,
 }
 
 enum Backend {
@@ -261,25 +123,6 @@ struct Remote {
     presence: HashMap<ActorId, (Presence, Instant)>,
     presence_sent: Presence,
     presence_sent_at: Instant,
-    /// Whether this client takes part in the shared transport, as far as the user decides.
-    linked: bool,
-    /// The server's clock against the engine's, once the connection has measured it.
-    clock: Option<ClockEstimate>,
-    /// The shared transport: what the server said last, or what this client asked for since.
-    transport: TransportState,
-    /// The server spoke about the transport since it was last looked at.
-    transport_heard: bool,
-    /// The state the server gave last, with the tempo of the document at that point. While the
-    /// tempo is that again, the state holds as it is.
-    said: Option<(TransportState, TempoMap)>,
-    /// Requests for the shared transport the server has not answered yet. While there are
-    /// any, what it says is older than what this client asked for.
-    transport_asked: u32,
-    /// What the engine was last told to follow, and under which clock offset. `None` while
-    /// the engine runs the private transport.
-    applied: Option<(TransportState, i64)>,
-    /// Checkouts whose owner has not renewed the lease in time.
-    stale: Vec<TrackId>,
 }
 
 impl Session {
@@ -318,8 +161,7 @@ impl Session {
     ///
     /// `waker` is called from another thread whenever [`Session::frame`] has something to do.
     pub fn join(join: JoinInfo, who: Who, engine: Engine, waker: Waker) -> Result<Self> {
-        let live = Live::new(engine.live_input()).with_waker(waker.clone());
-        let link = Link::connect(join, who, waker.clone(), live.clone())?;
+        let link = Link::connect(join, who, waker.clone())?;
         let deadline = Instant::now() + JOIN_TIMEOUT;
         let (epoch, welcome) = loop {
             let left = deadline.saturating_duration_since(Instant::now());
@@ -331,7 +173,6 @@ impl Session {
                 Some(LinkEvent::Down(reason)) => bail!("could not join: {reason}"),
                 Some(
                     LinkEvent::Msg(_)
-                    | LinkEvent::Clock(_)
                     | LinkEvent::Stored { .. }
                     | LinkEvent::Fetched { .. }
                     | LinkEvent::TooLarge(_),
@@ -345,9 +186,7 @@ impl Session {
             head_seq,
             sync,
             peers,
-            transport,
             history,
-            stale,
             ..
         } = *welcome;
         let SyncData::Snapshot(project) = sync else {
@@ -363,14 +202,6 @@ impl Session {
             presence: HashMap::new(),
             presence_sent: Presence::default(),
             presence_sent_at: Instant::now(),
-            linked: true,
-            clock: None,
-            transport,
-            transport_heard: true,
-            said: Some((transport, project.tempo_map())),
-            transport_asked: 0,
-            applied: None,
-            stale,
         };
         remote.set_peers(peers);
         let mut session = Self::new(
@@ -379,7 +210,6 @@ impl Session {
             user,
             engine,
         );
-        session.live = live;
         session.waker = Some(waker);
         session.absorb_history(history);
         Ok(session)
@@ -399,31 +229,18 @@ impl Session {
             displaced: Vec::new(),
             notices: Vec::new(),
             tempo: TempoMap::default(),
-            private_loop: None,
+            loop_range: None,
             waker: None,
-            files: None,
-            saved: HashMap::new(),
-            saved_at: Instant::now(),
-            commit: None,
-            jobs: std_mpsc::channel(),
             uploads: HashMap::new(),
             outgoing: Vec::new(),
-            log: Vec::new(),
-            samples: HashMap::new(),
-            audio: HashMap::new(),
-            wanted: None,
             fetching: HashSet::new(),
-            playing: None,
-            forks: Vec::new(),
-            restoring: Vec::new(),
-            lease_sent: Instant::now(),
             live,
             recording: false,
             take: Take::default(),
             plugins,
-            bounce: None,
+            plugins_saved_at: Instant::now(),
+            plugin_gestures: HashMap::new(),
         };
-        session.replica.set_user(user);
         session.tempo = session.replica.view().tempo_map();
         session.engine.set_project(session.replica.view());
         session
@@ -450,9 +267,8 @@ impl Session {
         if !self.allowed(&ops) {
             return false;
         }
-        let before = self.replica.revision();
         let txn = self.replica.submit(ops);
-        self.after_edit(txn, before)
+        self.send(txn)
     }
 
     /// Like [`Self::edit`], but edits with the same gesture collapse into one undo step. Use it
@@ -461,28 +277,13 @@ impl Session {
         if !self.allowed(&ops) {
             return false;
         }
-        let before = self.replica.revision();
         let txn = self.replica.submit_gesture(ops, gesture);
-        self.after_edit(txn, before)
+        self.send(txn)
     }
 
-    /// An edit that only went into a checkout's journal sends nothing, but changed the view.
-    fn after_edit(&mut self, txn: Option<Txn>, before: u64) -> bool {
-        if txn.is_some() {
-            return self.send(txn);
-        }
-        let changed = self.replica.revision() != before;
-        if changed {
-            self.engine.set_project(self.replica.view());
-        }
-        changed
-    }
-
-    /// Edits the server would refuse, of a track someone else has checked out or past the limits
-    /// of the project, are refused here already, with a word why.
+    /// Edits the server would refuse as out of range or past the limits of the project are
+    /// refused here already, with a word why.
     fn allowed(&mut self, ops: &[Op]) -> bool {
-        // What the server would refuse as out of range or too large, inside a checkout as well,
-        // where it would otherwise only show at the commit.
         let mut doc = self.replica.view().clone();
         for op in ops {
             if let Err(why) = op.validate().and_then(|()| op.fits(&doc)) {
@@ -491,52 +292,7 @@ impl Session {
             }
             apply(&mut doc, op);
         }
-        for op in ops {
-            let track = match op.scope() {
-                Scope::Project => continue,
-                Scope::TrackContent(track) | Scope::TrackStructure(track) => track,
-            };
-            // With a server, plugins live in checkouts: everyone else hears a stem of them.
-            if let Backend::Remote(_) = &self.backend {
-                let mine = self.checkout_owner(track) == Some(self.user);
-                if op.adds_plugin() && !mine {
-                    notice(&mut self.notices, "Check out the track to add a plugin to it.");
-                    return false;
-                }
-                let has_plugin = self
-                    .replica
-                    .view()
-                    .track(track)
-                    .is_some_and(|t| t.content.has_plugin());
-                if matches!(op.scope(), Scope::TrackContent(_)) && has_plugin && !mine {
-                    notice(
-                        &mut self.notices,
-                        "A track with plugins is changed through a checkout: check it out first.",
-                    );
-                    return false;
-                }
-            }
-            if let Some(why) = self.locked(track) {
-                notice(&mut self.notices, &format!("This track is {why}."));
-                return false;
-            }
-            if matches!(op.scope(), Scope::TrackContent(_)) && !self.replica.can_edit_content(track) {
-                return false;
-            }
-        }
         true
-    }
-
-    /// Why this client cannot edit `track` right now, if it cannot.
-    pub fn locked(&self, track: TrackId) -> Option<String> {
-        let checkout = self.replica.confirmed().track(track)?.checkout?;
-        if checkout.user != self.user {
-            return Some(format!("checked out by {}", self.user_name(checkout.user)));
-        }
-        match self.replica.workspace(track) {
-            Some(w) if w.committing => Some("being committed".into()),
-            _ => None,
-        }
     }
 
     pub fn new_gesture(&mut self) -> Gesture {
@@ -553,34 +309,28 @@ impl Session {
     }
 
     pub fn undo(&mut self) -> bool {
-        let before = self.replica.revision();
         let txn = self.replica.undo();
-        self.after_edit(txn, before)
+        self.send(txn)
     }
 
     pub fn redo(&mut self) -> bool {
-        let before = self.replica.revision();
         let txn = self.replica.redo();
-        self.after_edit(txn, before)
+        self.send(txn)
     }
 
     /// Call once per UI frame.
     pub fn frame(&mut self) {
         self.receive();
-        self.poll_jobs();
-        self.keep_workspaces();
-        self.settle_restores();
         self.share_presence();
         self.engine.set_project(self.replica.view());
-        self.sync_transport();
+        self.tempo = self.replica.view().tempo_map();
         self.engine.tick();
         self.keep_plugins();
-        self.listen();
         self.record();
     }
 
-    /// Hosts plugins from now on: tracks with plugins installed here are heard live, the others
-    /// from their stems. Without this, every track with plugins plays its stem.
+    /// Hosts plugins from now on: tracks whose plugins are installed here are heard. Without
+    /// this, every track with plugins is silent.
     pub fn enable_plugins(&mut self, host: mdaw_plugin::Host) {
         let mut plugins = self.plugins.0.borrow_mut();
         plugins.set_host(Some(host));
@@ -605,7 +355,7 @@ impl Session {
         Some(self.plugins.0.borrow().installed(format, id)?.name.clone())
     }
 
-    /// How a track is heard here: from its devices, its plugins, or its stem.
+    /// How a track is heard here: from its devices or its plugins, or not at all.
     pub fn track_sound(&self, track: TrackId) -> TrackSound {
         self.plugins.0.borrow().sound(self.replica.view(), track)
     }
@@ -644,7 +394,7 @@ impl Session {
     }
 
     /// Puts a plugin on a track: an instrument in place of the track's instrument, an effect at
-    /// the end. Plugins go onto a track only while this user has it checked out.
+    /// the end.
     pub fn add_plugin(&mut self, track: TrackId, plugin: &mdaw_plugin::PluginInfo) -> bool {
         let device = mdaw_model::Device::new(
             self.replica.ids().device(),
@@ -693,10 +443,11 @@ impl Session {
     pub fn pump_plugins(&mut self) {
         let crashed = self.plugins.0.borrow_mut().idle();
         for ((track, device), what) in crashed {
-            // Its processor is dead: the next graph does without it, and plays the stem.
+            // Its processor is dead: the next graph does without it, and the track is silent.
             self.engine.forget(track, device);
-            let text =
-                format!("{what} Its track plays its stem, if it has one; Restart is in the Device tab.");
+            let text = format!(
+                "{what} Its track is silent here until it is restarted; Restart is in the Device tab."
+            );
             notice(&mut self.notices, &text);
         }
         if self.plugins.0.borrow_mut().take_dirty() {
@@ -716,12 +467,9 @@ impl Session {
         self.engine.refresh();
     }
 
-    /// Sets a parameter of a plugin running here. Only the plugin's state changes; it reaches
-    /// the document with the commit.
+    /// Sets a parameter of a plugin running here. The plugin's state changes, and reaches the
+    /// document with the next save of its settings.
     pub fn set_plugin_param(&mut self, track: TrackId, device: mdaw_model::DeviceId, param: u32, value: f64) {
-        if self.locked(track).is_some() {
-            return;
-        }
         self.plugins.0.borrow_mut().set_param(track, device, param, value);
     }
 
@@ -773,22 +521,9 @@ impl Session {
         self.plugins.0.borrow_mut().instance(track, device).is_some()
     }
 
-    /// Keeps the plugins in step with the document, fetches the state blobs and stems they need,
-    /// and renders a stem a slice at a time.
+    /// Keeps the plugins in step with the document, fetches the state blobs they need, and puts
+    /// the settings of plugins changed here into the document.
     fn keep_plugins(&mut self) {
-        // Without a server every track is this user's to change; with one, those checked out.
-        let editable = self
-            .replica
-            .confirmed()
-            .tracks
-            .iter()
-            .filter(|(_, t)| match &self.backend {
-                Backend::Local(_) => true,
-                Backend::Remote(_) => t.checkout.is_some_and(|c| c.user == self.user),
-            })
-            .map(|(&id, _)| id)
-            .collect();
-        self.plugins.0.borrow_mut().set_editable(editable);
         let renew = self.plugins.0.borrow_mut().follow(self.replica.view());
         for &(track, device) in &renew {
             self.engine.forget(track, device);
@@ -798,7 +533,7 @@ impl Session {
             && remote.status == Status::Online
         {
             let wanted = self.plugins.0.borrow_mut().take_wanted(&self.fetching);
-            for (hash, _) in wanted {
+            for hash in wanted {
                 self.fetching.insert(hash);
                 remote.link.get(hash);
             }
@@ -806,165 +541,50 @@ impl Session {
         if self.plugins.0.borrow_mut().take_dirty() || !renew.is_empty() {
             self.engine.refresh();
         }
-        self.step_bounce();
-    }
-
-    fn step_bounce(&mut self) {
-        let Some(bounce) = self.bounce.as_mut() else {
-            return;
-        };
-        let started = Instant::now();
-        let mut done = false;
-        while !done && started.elapsed() < BOUNCE_SLICE {
-            done = bounce.render.step(4096);
-        }
-        if !done {
-            if let Some(waker) = &self.waker {
-                waker();
-            }
-            return;
-        }
-        let bounce = self.bounce.take().expect("checked above");
-        let Bounce {
-            track,
-            render,
-            instances,
-            confirmed,
-            workspace,
-            tempo_hash,
-            has_notes,
-        } = bounce;
-        let audio: Arc<[f32]> = render.finish().into();
-        // The render's processors came back with the render; the instances can go, unless one
-        // crashed on the way, which would leave a hole in the stem.
-        let mut instances = instances;
-        for instance in &mut instances {
-            instance.idle();
-        }
-        let broken: Vec<String> = instances
-            .iter()
-            .filter(|i| i.crashed())
-            .map(|i| i.info().name.clone())
-            .collect();
-        drop(instances);
-        if !broken.is_empty() {
-            let text = format!(
-                "{} crashed while the commit was rendered. Nothing was committed; the track stays checked out.",
-                broken.join(", ")
-            );
-            notice(&mut self.notices, &text);
-            self.cancel_commit();
-            return;
-        }
-        if has_notes && audio.iter().all(|s| *s == 0.0) {
-            notice(
-                &mut self.notices,
-                "The track's notes rendered as silence, so its plugins did not play. Nothing was committed; the track stays checked out.",
-            );
-            self.cancel_commit();
-            return;
-        }
-        let rate = self.engine.sample_rate();
-        if self.commit.as_ref().is_some_and(|c| c.track == track) {
-            self.spawn(move || match checkout::make_stem(&audio, tempo_hash, rate) {
-                Ok(stem) => Job::Plan(checkout::plan_commit(&confirmed, &workspace, Some((stem, audio)))),
-                Err(why) => Job::CommitFailed(why),
-            });
+        if self.plugins_saved_at.elapsed() >= plugins::SAVE_EVERY {
+            self.plugins_saved_at = Instant::now();
+            self.save_plugin_states();
         }
     }
 
-    /// Saves the states of the plugins on `track` that changed, into the checkout's journal,
-    /// and starts the bounce of its stem. False if the track cannot be committed from here.
-    fn start_bounce(&mut self, track: TrackId) -> bool {
-        let view = self.replica.view().clone();
-        let Some(content) = view.track(track).map(|t| t.content.clone()) else {
-            return false;
-        };
-        let mut ops = Vec::new();
-        for device in content
-            .devices
-            .iter()
-            .filter(|d| matches!(d.kind, DeviceKind::Plugin { .. }))
-        {
-            if !self.plugin_running(track, device.id) {
-                notice(
-                    &mut self.notices,
-                    "A plugin of this track does not run here, so its sound cannot be rendered for the commit.",
-                );
-                return false;
-            }
-            let captured = self.plugins.0.borrow_mut().capture(track, device.id);
-            match captured {
-                Ok(Some((hash, bytes))) => {
-                    self.put_blob(hash, bytes);
-                    ops.push(Op::DeviceSetState {
-                        track,
-                        id: device.id,
-                        state: Some(hash),
-                    });
+    /// Saves the settings of plugins that changed here, uploads them and records them in the
+    /// document. The edit goes to the server once the upload has arrived.
+    pub fn save_plugin_states(&mut self) {
+        let saved = self.plugins.0.borrow_mut().save_changed();
+        for ((track, id), (hash, bytes)) in saved {
+            self.put_blob(hash, bytes);
+            let gesture = match self.plugin_gestures.get(&(track, id)) {
+                Some(gesture) => *gesture,
+                None => {
+                    let gesture = self.new_gesture();
+                    self.plugin_gestures.insert((track, id), gesture);
+                    gesture
                 }
-                Ok(None) => {}
-                Err(err) => {
-                    notice(
-                        &mut self.notices,
-                        &format!("The plugin's state could not be saved: {err}."),
-                    );
-                    return false;
-                }
-            }
+            };
+            let op = Op::DeviceSetState {
+                track,
+                id,
+                state: Some(hash),
+            };
+            self.edit_gesture(vec![op], gesture);
         }
-        if !ops.is_empty() && !self.edit(ops) {
-            return false;
-        }
-        true
     }
 
     /// Uploads a blob made here, once, now or on the next connection.
     fn put_blob(&mut self, hash: BlobHash, bytes: Arc<[u8]>) {
+        let Backend::Remote(remote) = &self.backend else {
+            return;
+        };
         if self.uploads.contains_key(&hash) {
             return;
         }
         self.uploads.insert(hash, bytes.clone());
-        if let Backend::Remote(remote) = &self.backend {
-            remote.link.put(hash, bytes);
-        }
+        remote.link.put(hash, bytes);
     }
 
-    /// Live notes: what this player plays, heard at once and sent to the others.
+    /// Live notes: what this player plays, heard at once.
     pub fn live(&self) -> &Live {
         &self.live
-    }
-
-    /// Tells the live notes who is there and which tracks listen to them.
-    fn listen(&mut self) {
-        let Backend::Remote(remote) = &self.backend else {
-            return;
-        };
-        self.live
-            .set_present(remote.peers.iter().map(|p| p.actor).collect());
-        // A track this user has checked out hears nobody else until the commit.
-        let deaf = self
-            .replica
-            .confirmed()
-            .tracks
-            .iter()
-            .filter(|(_, t)| t.checkout.is_some_and(|c| c.user == self.user))
-            .map(|(&id, _)| id)
-            .collect();
-        self.live.set_deaf(deaf);
-    }
-
-    /// The names of the others who play on `track` right now.
-    pub fn players(&self, track: TrackId) -> Vec<String> {
-        let Backend::Remote(remote) = &self.backend else {
-            return Vec::new();
-        };
-        self.live
-            .players(track)
-            .into_iter()
-            .filter_map(|actor| remote.peers.iter().find(|p| p.actor == actor))
-            .map(|p| p.name.clone())
-            .collect()
     }
 
     /// Whether recording is armed.
@@ -1022,81 +642,22 @@ impl Session {
         }
     }
 
-    /// Where the transport this client follows was, or is, at `micros` on
-    /// [`clock::now_micros`]. `None` unless it runs then.
+    /// Where the transport was, or is, at `micros` on [`clock::now_micros`]. `None` unless it
+    /// runs then.
     fn tick_at(&self, micros: i64) -> Option<f64> {
-        if let Backend::Remote(remote) = &self.backend
-            && let Some(offset) = remote.sharing()
-        {
-            let server = micros + offset;
-            let transport = remote.transport;
-            return transport
-                .running(server)
-                .then(|| transport.position(server, &self.tempo));
-        }
         if !self.engine.is_playing() {
             return None;
         }
-        // The private transport: from where the playhead was at the time it was heard.
+        // From where the playhead was at the time it was heard.
         let (tick, heard_at) = self.engine.position_heard();
         let since = (micros - heard_at) as f64 / 1e6;
         let then = self.tempo.tick_to_seconds(tick) + since;
         Some(self.tempo.seconds_to_tick(then.max(0.0)))
     }
 
-    /// Whether this client takes part in the shared transport. `None` without a server.
-    pub fn linked(&self) -> Option<bool> {
-        match &self.backend {
-            Backend::Local(_) => None,
-            Backend::Remote(remote) => Some(remote.linked),
-        }
-    }
-
-    /// Joins or leaves the shared transport. Leaving, playback goes on privately from where it
-    /// is; joining, it becomes what everyone else hears.
-    pub fn set_linked(&mut self, linked: bool) {
-        if let Backend::Remote(remote) = &mut self.backend {
-            remote.linked = linked;
-        }
-        self.sync_transport();
-    }
-
-    /// Whether play, pause, seek and loop currently act on the shared transport: linked,
-    /// connected, and the server's clock is known.
-    pub fn is_sharing_transport(&self) -> bool {
-        matches!(&self.backend, Backend::Remote(remote) if remote.sharing().is_some())
-    }
-
-    /// The shared transport as this client knows it, whether it takes part or not. `None`
-    /// without a server.
-    pub fn shared_transport(&self) -> Option<TransportState> {
-        match &self.backend {
-            Backend::Local(_) => None,
-            Backend::Remote(remote) => Some(remote.transport),
-        }
-    }
-
-    /// How well this client keeps time, while it shares the transport.
-    pub fn timing(&self) -> Option<Timing> {
-        let Backend::Remote(remote) = &self.backend else {
-            return None;
-        };
-        let offset = remote.sharing()?;
-        Some(Timing {
-            server_micros: clock::now_micros() + offset,
-            rtt_micros: remote.clock?.rtt_micros,
-            drift_micros: self.engine.drift_micros(),
-            resyncs: self.engine.stats().resyncs,
-        })
-    }
-
-    /// Whether the transport is playing, as far as the user is concerned: a start that is
-    /// scheduled counts.
+    /// Whether this client's transport is playing.
     pub fn is_playing(&self) -> bool {
-        match &self.backend {
-            Backend::Remote(remote) if remote.sharing().is_some() => remote.transport.playing,
-            _ => self.engine.is_playing(),
-        }
+        self.engine.is_playing()
     }
 
     /// The playhead in ticks.
@@ -1104,130 +665,29 @@ impl Session {
         self.engine.position()
     }
 
-    /// The loop region of the transport this client follows, if looping is on.
+    /// The loop region, if looping is on.
     pub fn loop_range(&self) -> Option<TickRange> {
-        match &self.backend {
-            Backend::Remote(remote) if remote.sharing().is_some() => remote.transport.loop_range,
-            _ => self.private_loop,
-        }
+        self.loop_range
     }
 
     pub fn play(&mut self) {
-        let Some((remote, now)) = shared(&mut self.backend) else {
-            self.engine.play();
-            return;
-        };
-        if !remote.transport.playing {
-            // Far enough ahead that everyone has heard of it when it is due.
-            remote.request(TransportState {
-                playing: true,
-                anchor_server_micros: now + START_LEAD_MICROS,
-                ..remote.transport
-            });
-            self.sync_transport();
-        }
+        self.engine.play();
     }
 
     /// Stops where the playhead is.
     pub fn pause(&mut self) {
-        let Some((remote, now)) = shared(&mut self.backend) else {
-            self.engine.stop();
-            return;
-        };
-        if remote.transport.playing {
-            remote.request(TransportState {
-                playing: false,
-                anchor_tick: remote.transport.position(now, &self.tempo).round(),
-                anchor_server_micros: now,
-                ..remote.transport
-            });
-            self.sync_transport();
-        }
+        self.engine.stop();
     }
 
     pub fn seek(&mut self, tick: Tick) {
-        let Some((remote, now)) = shared(&mut self.backend) else {
-            self.engine.seek(tick);
-            return;
-        };
-        remote.request(TransportState {
-            anchor_tick: tick.0.max(0) as f64,
-            anchor_server_micros: now + START_LEAD_MICROS,
-            ..remote.transport
-        });
-        self.sync_transport();
+        self.engine.seek(tick);
     }
 
     /// Sets the loop region, or turns looping off.
     pub fn set_loop(&mut self, range: Option<TickRange>) {
         let range = range.filter(|range| !range.is_empty());
-        let Some((remote, now)) = shared(&mut self.backend) else {
-            self.private_loop = range;
-            self.engine.set_loop(range);
-            return;
-        };
-        if remote.transport.loop_range != range {
-            // What the old loop did to the playhead so far stays done.
-            remote.request(TransportState {
-                loop_range: range,
-                ..remote.transport.reanchored(now, &self.tempo)
-            });
-            self.sync_transport();
-        }
-    }
-
-    /// Keeps the engine on the transport this client follows.
-    fn sync_transport(&mut self) {
-        let tempo = self.replica.view().tempo_map();
-        let before = std::mem::replace(&mut self.tempo, tempo);
-        let Backend::Remote(remote) = &mut self.backend else {
-            return;
-        };
-        let heard = std::mem::take(&mut remote.transport_heard);
-        let Some(offset) = remote.sharing() else {
-            if remote.applied.take().is_some() {
-                // On its own from here: the private transport starts as a copy.
-                self.private_loop = remote.transport.loop_range;
-                self.engine.unfollow();
-            }
-            return;
-        };
-        let now = clock::now_micros() + offset;
-        if before != self.tempo && !heard {
-            remote.transport = match &remote.said {
-                // Back to the tempo the server's last word was given under, as when an edit of
-                // the tempo is refused: that word holds again.
-                Some((state, tempo)) if *tempo == self.tempo && remote.transport_asked == 0 => *state,
-                // The tempo changed under a running transport. The server will say where that
-                // leaves the playhead; until then, and for an edit of our own that the server has
-                // yet to see, the answer is: where it is now.
-                _ => remote.transport.reanchored(now, &before),
-            };
-        }
-        let state = remote.transport;
-        let follow = |engine: &mut Engine, fresh| {
-            engine.follow(state.anchor_tick, state.anchor_server_micros - offset, fresh)
-        };
-        match remote.applied {
-            Some((applied, at)) if same_playback(&applied, &state) => {
-                if state.playing && at != offset {
-                    // The same playback, with a better idea of the server's clock.
-                    follow(&mut self.engine, false);
-                }
-            }
-            _ => {
-                self.engine.set_loop(state.loop_range);
-                if state.playing {
-                    follow(&mut self.engine, true);
-                } else {
-                    if self.engine.is_playing() {
-                        self.engine.stop();
-                    }
-                    self.engine.seek(Tick(state.anchor_tick.round() as i64));
-                }
-            }
-        }
-        remote.applied = Some((state, offset));
+        self.loop_range = range;
+        self.engine.set_loop(range);
     }
 
     pub fn status(&self) -> Status {
@@ -1347,558 +807,11 @@ impl Session {
             .presence
             .values()
             .any(|(presence, at)| presence.editing.is_some() && now.duration_since(*at) < PRESENCE_TIMEOUT);
-        // Progress to show: a sample playing or downloading, a commit on its way.
-        let busy = self.playing.is_some() || self.wanted.is_some() || self.commit.is_some();
-        if busy {
-            return Some(Duration::from_millis(100));
-        }
-        // Work of a checkout waits for its turn to be written, and is not left waiting longer.
-        if self.unsaved() {
-            return Some(JOURNAL_EVERY.saturating_sub(self.saved_at.elapsed()));
-        }
-        // Leases are renewed even while nothing moves.
-        let lease = (!self.saved.is_empty()).then_some(Duration::from_secs(LEASE_RENEW_SECS));
         (locks || self.editing.is_some() || remote.presence_sent.editing.is_some())
             .then_some(Duration::from_millis(250))
-            .or(lease)
     }
 
-    /// Where this project's checkouts and forks are kept. Journals found there are picked up
-    /// by the checkouts they belong to.
-    pub fn set_files(&mut self, files: Files) {
-        self.forks = files.forks();
-        let unreadable = files.set_aside_unreadable();
-        if unreadable > 0 {
-            notice(
-                &mut self.notices,
-                &format!(
-                    "{unreadable} saved checkout(s) from an older version could not be read; they are \
-                     kept beside the others as .unreadable."
-                ),
-            );
-        }
-        let journals = files.journals();
-        self.files = Some(files.clone());
-        // Work of checkouts that ended while this client was not running.
-        for saved in journals {
-            let current = self
-                .replica
-                .workspace(saved.track)
-                .is_some_and(|w| w.base_seq == saved.base_seq);
-            if current {
-                continue;
-            }
-            files.remove_journal(saved.track);
-            // Committed or dropped by this user, with the window closed before it heard back:
-            // nothing to keep.
-            let ended_here = self.log.iter().any(|entry| {
-                entry.seq > saved.base_seq
-                    && entry.by == self.user
-                    && match &entry.what {
-                        Logged::Commit { track, .. } => *track == saved.track,
-                        Logged::Release { track, reason } => {
-                            *track == saved.track
-                                && match reason {
-                                    ReleaseReason::Abandoned => true,
-                                    ReleaseReason::Forced { owner } => *owner == self.user,
-                                }
-                        }
-                        Logged::Checkout { .. } => false,
-                    }
-            });
-            if saved.journal.is_empty() || ended_here {
-                continue;
-            }
-            let shell = self
-                .replica
-                .confirmed()
-                .track(saved.track)
-                .map(|t| t.shell.clone());
-            let text = format!(
-                "Your checkout of \"{}\" was ended while you were away. Your changes are kept as a fork \
-                 in the changelog.",
-                shell.as_ref().unwrap_or(&saved.base.shell).name
-            );
-            notice(&mut self.notices, &text);
-            let fork = saved.fork(shell, now_millis());
-            self.keep_fork(fork);
-        }
-        self.saved.clear();
-        self.keep_workspaces();
-    }
-
-    /// Checkouts and commits are a matter between clients and a server.
-    pub fn can_check_out(&self, track: TrackId) -> bool {
-        self.online()
-            && self
-                .replica
-                .confirmed()
-                .track(track)
-                .is_some_and(|t| t.checkout.is_none())
-    }
-
-    /// Who has `track` checked out, if anyone.
-    pub fn checkout_owner(&self, track: TrackId) -> Option<UserId> {
-        Some(self.replica.confirmed().track(track)?.checkout?.user)
-    }
-
-    /// True when the owner of the checkout of `track` has not been heard from for a while.
-    pub fn is_stale(&self, track: TrackId) -> bool {
-        matches!(&self.backend, Backend::Remote(remote) if remote.stale.contains(&track))
-    }
-
-    /// This client's checkout of `track`.
-    pub fn workspace(&self, track: TrackId) -> Option<&Workspace> {
-        self.replica.workspace(track)
-    }
-
-    pub fn check_out(&mut self, track: TrackId) {
-        self.request(ClientMsg::Checkout { track });
-    }
-
-    /// Gives up this client's checkout of `track`, and the changes made in it.
-    pub fn release(&mut self, track: TrackId) {
-        if self.commit.as_ref().is_some_and(|c| c.track == track) {
-            return;
-        }
-        self.request(ClientMsg::Release { track });
-    }
-
-    /// Ends someone else's checkout of `track`. Their changes stay with them.
-    pub fn force_release(&mut self, track: TrackId) {
-        self.request(ClientMsg::ForceRelease { track });
-    }
-
-    fn online(&self) -> bool {
-        matches!(&self.backend, Backend::Remote(remote) if remote.status == Status::Online)
-    }
-
-    fn request(&mut self, msg: ClientMsg) {
-        match &self.backend {
-            Backend::Remote(remote) if remote.status == Status::Online => remote.link.send(remote.epoch, msg),
-            _ => notice(&mut self.notices, "Not connected to the server."),
-        }
-    }
-
-    /// Starts committing this client's checkout of `track`: no more edits go in, and the
-    /// samples are rendered. The decision follows with [`Session::finish_commit`].
-    pub fn start_commit(&mut self, track: TrackId) -> bool {
-        if self.commit.is_some() || !self.online() {
-            return false;
-        }
-        let with_plugins = self
-            .replica
-            .view()
-            .track(track)
-            .is_some_and(|t| t.content.has_plugin());
-        if with_plugins {
-            if self.locked(track).is_some() {
-                return false;
-            }
-            // A stem runs from the start of the timeline to the end of the last clip: one that
-            // others would not even take is not rendered.
-            let view = self.replica.view();
-            let range = view.track(track).map(|t| checkout::stem_range(&t.content));
-            let seconds = range.map_or(0.0, |r| view.tempo_map().tick_to_seconds(r.end.0 as f64));
-            if seconds + 1.0 > STEM_MAX_SECS as f64 {
-                let text = format!(
-                    "This track runs for {} minutes from the start of the song; a track with plugins can be committed up to {} minutes.",
-                    (seconds / 60.0).ceil(),
-                    STEM_MAX_SECS / 60
-                );
-                notice(&mut self.notices, &text);
-                return false;
-            }
-            if !self.start_bounce(track) {
-                return false;
-            }
-        }
-        let Some(workspace) = self.replica.begin_commit(track) else {
-            return false;
-        };
-        let confirmed = self.replica.confirmed().clone();
-        self.commit = Some(Commit {
-            track,
-            plan: None,
-            sent: None,
-        });
-        if !with_plugins {
-            self.spawn(move || Job::Plan(checkout::plan_commit(&confirmed, &workspace, None)));
-            return true;
-        }
-        // The track with plugins as everyone without them will hear it: rendered here, from new
-        // instances, a slice per frame, since plugins want to run on this thread.
-        let mut doc = confirmed.clone();
-        apply_all(&mut doc, &workspace.journal);
-        let Some(content) = doc.track(track).map(|t| t.content.clone()) else {
-            return true;
-        };
-        let range = checkout::stem_range(&content);
-        // The stem is the track before its fader, pan and mute, and before the master: those
-        // apply where it plays, as they do to the plugins themselves.
-        let mut dry = doc.clone();
-        apply_all(
-            &mut dry,
-            &[
-                Op::MasterSetGain { gain: 1.0 },
-                Op::TrackSetMix {
-                    track,
-                    prop: mdaw_model::MixProp::Gain(1.0),
-                },
-                Op::TrackSetMix {
-                    track,
-                    prop: mdaw_model::MixProp::Pan(0.0),
-                },
-                Op::TrackSetMix {
-                    track,
-                    prop: mdaw_model::MixProp::Mute(false),
-                },
-            ],
-        );
-        let mut plugins = self.plugins.0.borrow_mut();
-        let mut source = plugins.offline(checkout::SAMPLE_RATE);
-        let render = OfflineRender::new(
-            &dry,
-            Some(&[track]),
-            range,
-            checkout::SAMPLE_RATE,
-            256,
-            &mut source,
-        );
-        let (instances, failures) = source.finish();
-        drop(plugins);
-        if !failures.is_empty() {
-            // Rendered without one of its plugins, the stem would be wrong for everyone.
-            let text = format!(
-                "The commit cannot be rendered: {}. The track stays checked out.",
-                failures.join("; ")
-            );
-            notice(&mut self.notices, &text);
-            drop(instances);
-            self.cancel_commit();
-            return false;
-        }
-        let has_notes = content.clips.values().any(|c| !c.notes.is_empty());
-        self.bounce = Some(Bounce {
-            track,
-            render,
-            instances,
-            confirmed,
-            workspace,
-            tempo_hash: doc.tempo_map().hash(),
-            has_notes,
-        });
-        true
-    }
-
-    pub fn commit_state(&self) -> Option<CommitState<'_>> {
-        let commit = self.commit.as_ref()?;
-        Some(match (&commit.plan, &commit.sent) {
-            (_, Some(_)) => CommitState::Sending { track: commit.track },
-            (Some(plan), None) => CommitState::Ready { plan },
-            (None, None) => CommitState::Rendering { track: commit.track },
-        })
-    }
-
-    /// Sends the commit once its samples are uploaded. With `restore_tempo` the tempo goes
-    /// back to what it was when the checkout began, in the same step.
-    pub fn finish_commit(&mut self, summary: &str, restore_tempo: bool) {
-        let Some(commit) = self.commit.as_mut().filter(|c| c.sent.is_none()) else {
-            return;
-        };
-        let Some(plan) = commit.plan.take() else {
-            return;
-        };
-        let restore = restore_tempo && plan.conflict;
-        let rendered = if restore { &plan.restored } else { &plan.as_is };
-        // Worked out from the tempo as it is now, not as it was when the dialog opened: someone
-        // may have changed it again while the samples were listened to.
-        let project_fix = match self.replica.workspace(plan.track) {
-            Some(workspace) if restore => {
-                checkout::tempo_fix(&self.replica.confirmed().tempo, &workspace.base_tempo)
-            }
-            _ => Vec::new(),
-        };
-        let request = CommitRequest {
-            track: plan.track,
-            ops: plan.ops.clone(),
-            project_fix,
-            stem: plan.stem.as_ref().map(|s| s.stem),
-            entry: ChangelogEntry {
-                summary: summary.trim().to_string(),
-                ranges: plan.ranges.clone(),
-                samples: rendered.iter().map(|r| r.sample).collect(),
-            },
-        };
-        let msg = ClientMsg::Commit(Box::new(request));
-        commit.sent = Some(msg.clone());
-        let mut blobs: Vec<BlobHash> = rendered.iter().map(|r| r.sample.blob).collect();
-        for r in rendered.clone() {
-            self.upload(&r);
-        }
-        if let Some(stem) = &plan.stem {
-            self.put_blob(stem.stem.blob, stem.flac.clone());
-            blobs.push(stem.stem.blob);
-        }
-        // The states of the track's plugins, saved here.
-        for op in &plan.ops {
-            let bytes = match op {
-                Op::DeviceSetState {
-                    state: Some(hash), ..
-                } => self.plugins.0.borrow().state(hash),
-                _ => None,
-            };
-            if let (
-                Op::DeviceSetState {
-                    state: Some(hash), ..
-                },
-                Some(bytes),
-            ) = (op, bytes)
-            {
-                self.put_blob(*hash, bytes);
-                blobs.push(*hash);
-            }
-        }
-        self.send_after_uploads(blobs, msg);
-    }
-
-    /// Goes back to editing without committing. Too late once the commit is on its way.
-    pub fn cancel_commit(&mut self) {
-        if let Some(commit) = self.commit.take_if(|c| c.sent.is_none()) {
-            self.replica.cancel_commit(commit.track);
-            self.bounce = None;
-        }
-    }
-
-    /// Checkouts, commits and releases, oldest first.
-    pub fn log(&self) -> &[LogEntry] {
-        &self.log
-    }
-
-    /// The samples of the changelog entry of event `seq`.
-    pub fn samples(&self, seq: u64) -> &[Sample] {
-        self.samples.get(&seq).map(Vec::as_slice).unwrap_or(&[])
-    }
-
-    /// Plays a sample, fetching it first if need be. Playing it again stops it.
-    pub fn play_sample(&mut self, sample: &Sample) {
-        let blob = sample.blob;
-        if self.playing.is_some_and(|(b, _)| b == blob) || self.wanted == Some(blob) {
-            self.stop_sample();
-            return;
-        }
-        self.engine.stop_preview();
-        self.playing = None;
-        match self.audio.get(&blob) {
-            Some(audio) => {
-                let id = self.engine.preview(audio.clone());
-                self.playing = Some((blob, id));
-            }
-            None => {
-                let Backend::Remote(remote) = &self.backend else {
-                    return;
-                };
-                self.wanted = Some(blob);
-                // Pressed again while it is on its way: one download, one decode.
-                if self.fetching.insert(blob) {
-                    remote.link.get(blob);
-                }
-            }
-        }
-    }
-
-    /// Plays a sample rendered here, before it is uploaded.
-    pub fn play_rendered(&mut self, rendered: &Rendered) {
-        self.remember(rendered);
-        self.play_sample(&rendered.sample);
-    }
-
-    pub fn stop_sample(&mut self) {
-        self.wanted = None;
-        if self.playing.take().is_some() {
-            self.engine.stop_preview();
-        }
-    }
-
-    /// How far the sample with `blob` has played, in seconds; `Some(0.0)` while it downloads.
-    pub fn sample_position(&self, blob: BlobHash) -> Option<f64> {
-        if self.wanted == Some(blob) {
-            return Some(0.0);
-        }
-        let (playing, id) = self.playing?;
-        (playing == blob).then(|| self.engine.preview_position(id))?
-    }
-
-    /// The work of checkouts someone else ended, kept on this machine.
-    pub fn forks(&self) -> &[Fork] {
-        &self.forks
-    }
-
-    /// Adds a fork to the project as a new track, and forgets it once the server has the track.
-    pub fn restore_fork(&mut self, index: usize) -> bool {
-        let Some(fork) = self.forks.get(index).cloned() else {
-            return false;
-        };
-        let id = self.replica.ids().track();
-        // Right below the track it came from, while that is still there.
-        let view = self.replica.view();
-        let after = match view.track(fork.track) {
-            Some(_) => Some(fork.track),
-            None => view.track_order.last().copied(),
-        };
-        let shell = TrackShell {
-            name: fit_name(&fork.shell.name, " (fork)"),
-            color: fork.shell.color,
-        };
-        let op = Op::TrackAdd {
-            id,
-            shell,
-            content: fork.content.clone(),
-            after,
-        };
-        if !self.edit(vec![op]) {
-            return false;
-        }
-        // Kept, out of sight, until the server has the track: it could still refuse it.
-        let fork = self.forks.remove(index);
-        self.restoring.push((id, fork));
-        true
-    }
-
-    /// Forgets forks whose track the server has accepted, and offers again those it refused.
-    fn settle_restores(&mut self) {
-        let (confirmed, view) = (self.replica.confirmed(), self.replica.view());
-        let mut back = Vec::new();
-        self.restoring.retain(|(id, fork)| {
-            if confirmed.track(*id).is_some() {
-                let _ = std::fs::remove_file(&fork.path);
-                false
-            } else if view.track(*id).is_none() {
-                back.push(fork.clone());
-                false
-            } else {
-                true
-            }
-        });
-        for fork in back {
-            notice(
-                &mut self.notices,
-                "The fork could not be added; it is still in the changelog.",
-            );
-            self.forks.push(fork);
-        }
-    }
-
-    pub fn discard_fork(&mut self, index: usize) {
-        if index < self.forks.len() {
-            let fork = self.forks.remove(index);
-            let _ = std::fs::remove_file(&fork.path);
-        }
-    }
-
-    fn spawn(&self, work: impl FnOnce() -> Job + Send + 'static) {
-        let (jobs, waker) = (self.jobs.0.clone(), self.waker.clone());
-        std::thread::Builder::new()
-            .name("mdaw-render".into())
-            .spawn(move || {
-                let _ = jobs.send(work());
-                if let Some(waker) = waker {
-                    waker();
-                }
-            })
-            .expect("starting a render thread");
-    }
-
-    fn poll_jobs(&mut self) {
-        while let Ok(job) = self.jobs.1.try_recv() {
-            match job {
-                Job::Plan(plan) => {
-                    for r in plan.as_is.iter().chain(&plan.restored) {
-                        let r = r.clone();
-                        self.remember(&r);
-                    }
-                    if let Some(stem) = &plan.stem {
-                        self.plugins
-                            .0
-                            .borrow_mut()
-                            .add_stem(stem.stem.blob, stem.audio.clone());
-                    }
-                    if let Some(commit) = self.commit.as_mut().filter(|c| c.track == plan.track) {
-                        commit.plan = Some(plan);
-                    }
-                }
-                Job::Before { entry_seq, rendered } => {
-                    self.upload(&rendered);
-                    let attach = ClientMsg::Attach {
-                        entry_seq,
-                        sample: rendered.sample,
-                    };
-                    self.send_after_uploads(vec![rendered.sample.blob], attach);
-                }
-                Job::Stem { hash, audio } => {
-                    self.fetching.remove(&hash);
-                    let mut plugins = self.plugins.0.borrow_mut();
-                    match audio {
-                        Some(audio) => plugins.add_stem(hash, audio),
-                        None => plugins.give_up(&hash),
-                    }
-                }
-                Job::Decoded { hash, audio } => {
-                    self.fetching.remove(&hash);
-                    let Some(audio) = audio else {
-                        if self.wanted.take() == Some(hash) {
-                            notice(&mut self.notices, "Could not get the sample from the server.");
-                        }
-                        continue;
-                    };
-                    self.audio.insert(hash, audio.clone());
-                    if self.wanted == Some(hash) {
-                        self.wanted = None;
-                        let id = self.engine.preview(audio);
-                        self.playing = Some((hash, id));
-                    }
-                }
-                Job::CommitFailed(why) => {
-                    let text = format!("The commit was not made: {why}. The track stays checked out.");
-                    notice(&mut self.notices, &text);
-                    self.cancel_commit();
-                }
-                Job::Nothing => {}
-            }
-        }
-    }
-
-    /// Keeps a sample rendered here for playing.
-    fn remember(&mut self, rendered: &Rendered) {
-        let blob = rendered.sample.blob;
-        if !self.audio.contains_key(&blob) {
-            let audio = flac::Audio {
-                samples: rendered.audio.to_vec(),
-                sample_rate: checkout::SAMPLE_RATE,
-            };
-            let resampled = flac::resample(&audio, self.engine.sample_rate());
-            self.audio.insert(blob, resampled.into());
-        }
-    }
-
-    fn upload(&mut self, rendered: &Rendered) {
-        self.remember(rendered);
-        let blob = rendered.sample.blob;
-        if self.uploads.contains_key(&blob) {
-            return;
-        }
-        self.uploads.insert(blob, rendered.flac.clone());
-        if let Backend::Remote(remote) = &self.backend {
-            remote.link.put(blob, rendered.flac.clone());
-        }
-    }
-
-    fn send_after_uploads(&mut self, blobs: Vec<BlobHash>, msg: ClientMsg) {
-        self.outgoing.push((blobs, msg));
-        self.flush_outgoing();
-    }
-
-    /// Sends the messages whose blobs have all arrived at the server.
+    /// Sends what waits in `outgoing`, in order, as long as the blobs each names have arrived.
     fn flush_outgoing(&mut self) {
         let Backend::Remote(remote) = &self.backend else {
             return;
@@ -1907,227 +820,24 @@ impl Session {
             return;
         }
         let uploads = &self.uploads;
-        self.outgoing.retain(|(blobs, msg)| {
-            let ready = blobs.iter().all(|b| !uploads.contains_key(b));
-            if ready {
-                remote.link.send(remote.epoch, msg.clone());
-            }
-            !ready
-        });
-    }
-
-    /// Writes journals that changed, renews leases, and deals with checkouts that ended.
-    fn keep_workspaces(&mut self) {
-        let tracks: Vec<TrackId> = self.replica.workspaces().map(|w| w.track).collect();
-        for track in tracks {
-            if !self.saved.contains_key(&track) {
-                // New to this session: the work may have been saved by an earlier run of this
-                // same checkout. Work of an earlier checkout became a fork in `set_files`.
-                let earlier = self.files.as_ref().and_then(|f| f.load_journal(track));
-                let workspace = self.replica.workspace(track).expect("listed above");
-                if let Some(earlier) = earlier
-                    && earlier.base_seq == workspace.base_seq
-                    && workspace.journal.is_empty()
-                    && !earlier.journal.is_empty()
-                {
-                    let base_tempo = earlier.base_tempo();
-                    self.replica.restore_journal(track, earlier.journal, base_tempo);
-                    notice(
-                        &mut self.notices,
-                        "Picked up the changes of your checkout from before.",
-                    );
-                }
-                self.saved.insert(track, 0);
-            }
-        }
-        if self.saved_at.elapsed() >= JOURNAL_EVERY {
-            self.save_journals();
-        }
-
-        for (workspace, how) in self.replica.take_ended() {
-            let track = workspace.track;
-            self.saved.remove(&track);
-            if self.commit.as_ref().is_some_and(|c| c.track == track) {
-                self.commit = None;
-            }
-            let keep = match how {
-                Ended::Committed | Ended::Abandoned => false,
-                Ended::Forced { by } => {
-                    let text = format!(
-                        "{} ended your checkout. Your changes are kept as a fork in the changelog.",
-                        self.user_name(by)
-                    );
-                    notice(&mut self.notices, &text);
-                    true
-                }
-                Ended::Lost => true,
-            };
-            if keep && !workspace.journal.is_empty() {
-                self.save_fork(&workspace);
-            }
-            if let Some(files) = &self.files {
-                files.remove_journal(track);
-            }
-        }
-
-        if self.online() && self.lease_sent.elapsed() >= Duration::from_secs(LEASE_RENEW_SECS) {
-            let tracks: Vec<TrackId> = self.replica.workspaces().map(|w| w.track).collect();
-            if let Backend::Remote(remote) = &self.backend {
-                for track in tracks {
-                    remote.link.send(remote.epoch, ClientMsg::LeaseRenew { track });
-                }
-            }
-            self.lease_sent = Instant::now();
+        let ready = self
+            .outgoing
+            .iter()
+            .take_while(|txn| {
+                let blobs = txn.ops.iter().flat_map(Op::blobs);
+                !blobs.into_iter().any(|b| uploads.contains_key(&b))
+            })
+            .count();
+        for txn in self.outgoing.drain(..ready) {
+            remote.link.send(remote.epoch, ClientMsg::Submit(txn));
         }
     }
 
-    /// Writes the journals that changed since they were last written.
-    fn save_journals(&mut self) {
-        self.saved_at = Instant::now();
-        for workspace in self.replica.workspaces() {
-            let changes = workspace.changes;
-            if self.saved.get(&workspace.track) == Some(&changes) {
-                continue;
-            }
-            match self.files.as_ref().map(|files| files.save_journal(workspace)) {
-                // Tried again with the next write.
-                Some(Err(err)) => notice(
-                    &mut self.notices,
-                    &format!("Could not save the checkout: {err:#}."),
-                ),
-                Some(Ok(())) | None => {
-                    self.saved.insert(workspace.track, changes);
-                }
-            }
-        }
-    }
-
-    /// Whether a checkout has changes that are not on disk yet.
-    fn unsaved(&self) -> bool {
-        self.files.is_some()
-            && self
-                .replica
-                .workspaces()
-                .any(|w| self.saved.get(&w.track) != Some(&w.changes))
-    }
-
-    /// Keeps the work of a checkout that ended without a commit. It is rebuilt from the track
-    /// as it was when the checkout began, so it does not matter what became of the track.
-    fn save_fork(&mut self, workspace: &Workspace) {
-        let shell = self
-            .replica
-            .confirmed()
-            .track(workspace.track)
-            .map(|t| t.shell.clone());
-        let fork = checkout::fork_of(
-            workspace.track,
-            &workspace.base,
-            &workspace.journal,
-            shell,
-            now_millis(),
-        );
-        self.keep_fork(fork);
-    }
-
-    fn keep_fork(&mut self, mut fork: Fork) {
-        if let Some(files) = &self.files {
-            match files.save_fork(&fork) {
-                Ok(path) => fork.path = path,
-                Err(err) => notice(&mut self.notices, &format!("Could not save the fork: {err:#}.")),
-            }
-        }
-        self.forks.push(fork);
-    }
-
-    /// A commit message that may have gone down with a connection goes again, unless the
-    /// commit made it into the log meanwhile.
-    fn resend_commit(&mut self) {
-        let Some(commit) = &self.commit else { return };
-        let Some(msg) = commit.sent.clone() else { return };
-        if !self.replica.workspace(commit.track).is_some_and(|w| w.committing) {
-            return;
-        }
-        let pending = self.outgoing.iter().any(|(_, m)| *m == msg);
-        if !pending {
-            self.outgoing.push((Vec::new(), msg));
-        }
-    }
-
-    /// Takes in the changelog a fresh copy of the project comes with.
+    /// Takes in the history a fresh copy of the project comes with.
     fn absorb_history(&mut self, history: Vec<Event>) {
-        self.log.clear();
-        self.samples.clear();
         self.displaced.clear();
         for event in history {
-            self.note_event(&event, false);
             record_displaced(&mut self.displaced, event);
-        }
-    }
-
-    /// Notes what the changelog shows of an event. With `fresh`, the event has just happened,
-    /// and edits of this user it displaced get a sample of how they sounded.
-    fn note_event(&mut self, event: &Event, fresh: bool) {
-        let (seq, by, wall_ts) = (event.seq, event.user, event.wall_ts);
-        let what = match &event.body {
-            EventBody::Txn { superseded, .. } => {
-                if fresh && matches!(self.backend, Backend::Remote(_)) {
-                    self.render_before(seq, superseded);
-                }
-                None
-            }
-            EventBody::Checkout { track } => Some(Logged::Checkout { track: *track }),
-            EventBody::Commit { track, entry, .. } => {
-                self.samples
-                    .entry(seq)
-                    .or_default()
-                    .extend(entry.samples.iter().copied());
-                Some(Logged::Commit {
-                    track: *track,
-                    summary: entry.summary.clone(),
-                    ranges: entry.ranges.clone(),
-                })
-            }
-            EventBody::Release { track, reason } => Some(Logged::Release {
-                track: *track,
-                reason: *reason,
-            }),
-            EventBody::Attach { entry_seq, sample } => {
-                self.samples.entry(*entry_seq).or_default().push(*sample);
-                None
-            }
-        };
-        if let Some(what) = what {
-            self.log.push(LogEntry {
-                seq,
-                by,
-                wall_ts,
-                what,
-            });
-            if self.log.len() > MAX_LOG {
-                let old = self.log.remove(0);
-                self.samples.remove(&old.seq);
-            }
-        }
-    }
-
-    /// Renders how this user's displaced edits sounded, one sample per track.
-    fn render_before(&mut self, seq: u64, superseded: &[Superseded]) {
-        let mut tracks = BTreeSet::new();
-        for lost in superseded.iter().filter(|l| l.lost_user == self.user) {
-            let Some(track) = lost.entity.track() else {
-                continue;
-            };
-            if !tracks.insert(track) {
-                continue;
-            }
-            let (doc, lost) = (self.replica.confirmed().clone(), lost.clone());
-            self.spawn(move || match checkout::render_before(&doc, &lost) {
-                Some(rendered) => Job::Before {
-                    entry_seq: seq,
-                    rendered,
-                },
-                None => Job::Nothing,
-            });
         }
     }
 
@@ -2144,12 +854,12 @@ impl Session {
             // everything else pending once the server welcomes us back.
             Backend::Remote(remote) => {
                 if remote.status == Status::Online {
-                    remote.link.send(remote.epoch, ClientMsg::Submit(txn));
+                    self.outgoing.push(txn);
+                    self.flush_outgoing();
                 }
             }
         }
         self.engine.set_project(self.replica.view());
-        self.sync_transport();
         true
     }
 
@@ -2171,35 +881,21 @@ impl Session {
                         sync,
                         acked,
                         peers,
-                        transport,
                         history,
-                        stale,
                         ..
                     } = *welcome;
-                    remote.stale = stale;
                     let caught_up = match &sync {
                         SyncData::Events(events) => Some(events.clone()),
                         SyncData::Snapshot(_) => None,
                     };
                     remote.epoch = epoch;
-                    // A new connection measures the clock anew; the transport is shared again
-                    // once it has.
-                    remote.clock = None;
-                    // Requests that went down with the old connection get no answer.
-                    remote.transport_asked = 0;
-                    remote.transport = transport;
-                    remote.transport_heard = true;
                     remote.set_peers(peers);
                     remote.presence_sent = Presence::default();
                     self.user = user;
                     match self.replica.resync(actor, head_seq, sync, acked) {
                         Ok(resend) => {
                             remote.status = Status::Online;
-                            remote.said = Some((transport, self.replica.confirmed().tempo_map()));
                             let reloaded = std::mem::take(&mut remote.desynced);
-                            for txn in resend {
-                                remote.link.send(epoch, ClientMsg::Submit(txn));
-                            }
                             // Uploads that went down with the old connection start over.
                             for (hash, bytes) in &self.uploads {
                                 remote.link.put(*hash, bytes.clone());
@@ -2211,57 +907,23 @@ impl Session {
                             match caught_up {
                                 Some(events) => {
                                     for event in events {
-                                        self.note_event(&event, false);
                                         record_displaced(&mut self.displaced, event);
                                     }
                                 }
                                 None => self.absorb_history(history),
                             }
-                            self.resend_commit();
+                            // Everything pending goes again, renumbered, behind its blobs.
+                            self.outgoing = resend;
                             self.flush_outgoing();
                         }
                         Err(_) => remote.lose_track(),
                     }
                 }
-                LinkEvent::Clock(estimate) => remote.clock = Some(estimate),
-                // The transport is not part of the document: it holds even while the replica
-                // waits for a fresh copy.
-                LinkEvent::Msg(ServerMsg::Transport { state, by }) => {
-                    if by == Some(self.replica.actor()) {
-                        remote.transport_asked = remote.transport_asked.saturating_sub(1);
-                    }
-                    // The server takes requests in order: as long as one of ours is on its
-                    // way, it will replace this state, and showing it would only be a flicker.
-                    if remote.transport_asked == 0 {
-                        remote.transport = state;
-                        remote.transport_heard = true;
-                        remote.said = Some((state, self.replica.confirmed().tempo_map()));
-                    }
-                }
                 LinkEvent::Msg(_) if remote.desynced => {}
                 LinkEvent::Msg(ServerMsg::Event(event)) => match self.replica.on_event(&event) {
-                    Ok(()) => {
-                        self.note_event(&event, true);
-                        record_displaced(&mut self.displaced, event);
-                    }
+                    Ok(()) => record_displaced(&mut self.displaced, event),
                     Err(_) => remote.lose_track(),
                 },
-                LinkEvent::Msg(ServerMsg::Denied { request, reason }) => {
-                    if let Request::Commit(track) = request
-                        && self.commit.as_ref().is_some_and(|c| c.track == track)
-                    {
-                        self.commit = None;
-                        self.replica.cancel_commit(track);
-                    }
-                    let what = match request {
-                        Request::Checkout(_) => "The checkout",
-                        Request::Release(_) | Request::ForceRelease(_) => "The release",
-                        Request::Commit(_) => "The commit",
-                        Request::Attach(_) => "A sample",
-                    };
-                    notice(&mut self.notices, &format!("{what} was not accepted: {reason}."));
-                }
-                LinkEvent::Msg(ServerMsg::Stale(stale)) => remote.stale = stale,
                 LinkEvent::Stored { hash, ok } => {
                     if ok {
                         self.uploads.remove(&hash);
@@ -2270,48 +932,12 @@ impl Session {
                     // Otherwise it goes again with the next connection.
                 }
                 LinkEvent::Fetched { hash, bytes } => {
-                    let want = self.plugins.0.borrow().wanted(&hash);
-                    match (want, bytes) {
-                        (Some(Want::State), Some(bytes)) => {
-                            self.fetching.remove(&hash);
-                            self.plugins.0.borrow_mut().add_state(hash, bytes);
-                            continue;
-                        }
-                        (Some(Want::Stem(stem)), bytes) => {
-                            let rate = self.engine.sample_rate();
-                            self.spawn(move || {
-                                let audio = bytes.and_then(|b| flac::decode(&b, STEM_MAX_SECS).ok());
-                                let audio = audio.map(|a| {
-                                    let mut samples = flac::resample(&a, rate);
-                                    let gain = if stem.gain.is_finite() {
-                                        stem.gain.clamp(0.0, 64.0)
-                                    } else {
-                                        1.0
-                                    };
-                                    for s in &mut samples {
-                                        *s *= gain;
-                                    }
-                                    Arc::from(samples)
-                                });
-                                Job::Stem { hash, audio }
-                            });
-                            continue;
-                        }
-                        (Some(Want::State), None) => {
-                            self.fetching.remove(&hash);
-                            self.plugins.0.borrow_mut().give_up(&hash);
-                            continue;
-                        }
-                        (None, bytes) => {
-                            // Decoding takes a while for a long sample: not on the UI thread.
-                            let rate = self.engine.sample_rate();
-                            self.spawn(move || {
-                                let audio = bytes.and_then(|b| flac::decode(&b, SAMPLE_MAX_SECS).ok());
-                                let audio = audio.map(|a| Arc::from(flac::resample(&a, rate)));
-                                Job::Decoded { hash, audio }
-                            });
-                            continue;
-                        }
+                    self.fetching.remove(&hash);
+                    let mut plugins = self.plugins.0.borrow_mut();
+                    match bytes {
+                        Some(bytes) if plugins.wanted(&hash) => plugins.add_state(hash, bytes),
+                        Some(_) => {}
+                        None => plugins.give_up(&hash),
                     }
                 }
                 LinkEvent::Msg(ServerMsg::Rejected {
@@ -2328,17 +954,6 @@ impl Session {
                         "An edit was too large to send and has been taken back.",
                     );
                 }
-                LinkEvent::TooLarge(ClientMsg::Commit(request)) => {
-                    if self.commit.as_ref().is_some_and(|c| c.track == request.track) {
-                        self.commit = None;
-                    }
-                    self.replica.cancel_commit(request.track);
-                    let mb = mdaw_proto::MAX_FRAME >> 20;
-                    let text = format!(
-                        "The commit is larger than the {mb} MiB the server takes. The track stays checked out."
-                    );
-                    notice(&mut self.notices, &text);
-                }
                 LinkEvent::TooLarge(_) => {
                     notice(&mut self.notices, "A message was too large to send.");
                 }
@@ -2352,7 +967,6 @@ impl Session {
                     if remote.status == Status::Online {
                         remote.status = Status::Reconnecting;
                     }
-                    remote.clock = None;
                     remote.presence.clear();
                 }
                 LinkEvent::Refused(reason) => {
@@ -2373,7 +987,6 @@ impl Session {
         }
         let presence = Presence {
             editing: self.editing,
-            playhead: None,
         };
         let since = remote.presence_sent_at.elapsed();
         let due = if presence != remote.presence_sent {
@@ -2399,58 +1012,11 @@ impl Remote {
         self.peers = peers;
     }
 
-    /// The offset of the server's clock from the engine's, if this client shares the
-    /// transport right now.
-    fn sharing(&self) -> Option<i64> {
-        let clock = self
-            .clock
-            .filter(|_| self.linked && self.status == Status::Online)?;
-        Some(clock.offset_micros)
-    }
-
-    /// Asks the server for a new state of the shared transport, and acts as if it had agreed:
-    /// whatever it answers replaces this.
-    fn request(&mut self, state: TransportState) {
-        self.transport = state;
-        self.transport_asked += 1;
-        self.link.send(self.epoch, ClientMsg::SetTransport(state));
-    }
-
     /// The replica and the server's log no longer fit together: start over with a snapshot.
     fn lose_track(&mut self) {
         self.desynced = true;
         self.status = Status::Reconnecting;
         self.link.rejoin();
-    }
-}
-
-/// The shared transport and the server's time now, if this client shares it.
-fn shared(backend: &mut Backend) -> Option<(&mut Remote, i64)> {
-    let Backend::Remote(remote) = backend else {
-        return None;
-    };
-    let offset = remote.sharing()?;
-    Some((remote, clock::now_micros() + offset))
-}
-
-/// Whether two states put the playhead in the same place at all times. The epoch only counts
-/// the server's answers, and a playhead at rest is nowhere else at another time.
-fn same_playback(a: &TransportState, b: &TransportState) -> bool {
-    let place = |s: &TransportState| (s.playing, s.anchor_tick, s.loop_range);
-    place(a) == place(b) && (!a.playing || a.anchor_server_micros == b.anchor_server_micros)
-}
-
-fn now_millis() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
-impl Drop for Session {
-    /// The last edits of a checkout may not be on disk yet.
-    fn drop(&mut self) {
-        self.save_journals();
     }
 }
 
@@ -2466,10 +1032,7 @@ fn notice(notices: &mut Vec<String>, text: &str) {
 
 fn record_displaced(displaced: &mut Vec<Displaced>, event: Event) {
     let (seq, by, wall_ts) = (event.seq, event.user, event.wall_ts);
-    let EventBody::Txn { superseded, .. } = event.body else {
-        return;
-    };
-    displaced.extend(superseded.into_iter().map(|lost| Displaced {
+    displaced.extend(event.superseded.into_iter().map(|lost| Displaced {
         seq,
         by,
         wall_ts,

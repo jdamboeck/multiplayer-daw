@@ -1,8 +1,7 @@
 //! Devices the graph runs without knowing what they are: plugins, hosted elsewhere. The graph
 //! sees only [`ExternalDevice`]; where one comes from is the business of a [`PluginSource`].
 
-use mdaw_model::{BlobHash, DeviceId, PluginFormat, Stem, TrackId};
-use std::sync::Arc;
+use mdaw_model::{BlobHash, DeviceId, PluginFormat, TrackId};
 
 /// Where a block of audio sits on the timeline, for devices that follow the transport.
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
@@ -57,20 +56,13 @@ pub trait PluginSource {
         device: DeviceId,
         plugin: PluginRef<'_>,
     ) -> Option<Box<dyn ExternalDevice>>;
-    /// A stem as interleaved stereo at the graph's rate, its gain applied, or `None` if it is not
-    /// at hand yet.
-    fn stem(&mut self, stem: &Stem) -> Option<Arc<[f32]>>;
 }
 
-/// No plugins and no stems: tracks with plugins are silent.
+/// No plugins: tracks with plugins are silent.
 pub struct NoPlugins;
 
 impl PluginSource for NoPlugins {
     fn device(&mut self, _: TrackId, _: DeviceId, _: PluginRef<'_>) -> Option<Box<dyn ExternalDevice>> {
-        None
-    }
-
-    fn stem(&mut self, _: &Stem) -> Option<Arc<[f32]>> {
         None
     }
 }

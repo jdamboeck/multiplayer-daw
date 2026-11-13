@@ -25,9 +25,7 @@ pub enum DeviceState {
 pub(crate) enum Source {
     /// Its devices play its notes.
     Devices,
-    /// A recording of it plays instead: interleaved stereo at the graph's rate, from the start
-    /// of the timeline. For a track this client cannot render.
-    Stem(Arc<[f32]>),
+    /// A plugin of the track cannot run here: the track gives no sound.
     Silent,
 }
 
@@ -155,21 +153,6 @@ impl TrackRuntime {
             }
             if !device.bypass {
                 external.process(out.left, out.right, time);
-            }
-        }
-    }
-
-    /// Plays the stem for one block.
-    fn play_stem(stem: &[f32], pos: Option<i64>, left: &mut [f32], right: &mut [f32]) {
-        let Some(pos) = pos else {
-            return;
-        };
-        let frames = (stem.len() / 2) as i64;
-        for (i, (l, r)) in left.iter_mut().zip(right.iter_mut()).enumerate() {
-            let at = pos + i as i64;
-            if (0..frames).contains(&at) {
-                *l = stem[at as usize * 2];
-                *r = stem[at as usize * 2 + 1];
             }
         }
     }
@@ -324,11 +307,6 @@ impl Graph {
             scratch.left.fill(0.0);
             let stereo = match &track.source {
                 Source::Silent => continue,
-                Source::Stem(stem) => {
-                    scratch.right.fill(0.0);
-                    TrackRuntime::play_stem(stem, pos, scratch.left, scratch.right);
-                    true
-                }
                 Source::Devices if track.devices.is_empty() => continue,
                 Source::Devices => {
                     track.process(pos, &mut scratch, &time);

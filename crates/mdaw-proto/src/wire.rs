@@ -5,8 +5,8 @@
 //! [`Hello`]. Every further stream it opens carries one blob: a [`BlobRequest`] frame, answered
 //! with [`BlobAnswer`] frames and raw bytes.
 
-use crate::{ChangelogEntry, Event, Sample, TransportState, Txn};
-use mdaw_model::{ActorId, BlobHash, EntityRef, Op, Project, Stem, Tick, TrackId, UserId};
+use crate::{Event, Txn};
+use mdaw_model::{ActorId, BlobHash, EntityRef, Project, UserId};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -41,55 +41,10 @@ pub const MAX_BLOB: u64 = 256 << 20;
 pub enum ClientMsg {
     /// First message on the stream.
     Hello(Hello),
+    /// An edit. Every blob its ops name must have been uploaded before.
     Submit(Txn),
     /// Relayed to the other clients, never stored. At most 10 per second.
     Presence(Presence),
-    /// Asks for a new state of the shared transport. Any client may, and each request is
-    /// answered with exactly one [`ServerMsg::Transport`] that names the asker.
-    SetTransport(TransportState),
-    /// Takes the track's contents out of live editing, for the sender alone to work on.
-    Checkout {
-        track: TrackId,
-    },
-    /// "I am still working on it." Sent every [`crate::LEASE_RENEW_SECS`] by the owner of a
-    /// checkout; without it the checkout is shown as stale to everyone.
-    LeaseRenew {
-        track: TrackId,
-    },
-    /// Gives the sender's checkout up. The track keeps the contents it had.
-    Release {
-        track: TrackId,
-    },
-    /// Ends someone else's checkout. Anyone may.
-    ForceRelease {
-        track: TrackId,
-    },
-    /// Hands in the work of a checkout. Every blob it names must have been uploaded before.
-    Commit(Box<CommitRequest>),
-    /// Adds a sample to an entry of the log that exists already.
-    Attach {
-        entry_seq: u64,
-        sample: Sample,
-    },
-}
-
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
-pub struct CommitRequest {
-    pub track: TrackId,
-    pub ops: Vec<Op>,
-    pub project_fix: Vec<Op>,
-    pub stem: Option<Stem>,
-    pub entry: ChangelogEntry,
-}
-
-/// What a client asked for outside of a transaction. Names the request in a refusal.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
-pub enum Request {
-    Checkout(TrackId),
-    Release(TrackId),
-    ForceRelease(TrackId),
-    Commit(TrackId),
-    Attach(u64),
 }
 
 /// The first frame of a blob stream.
@@ -156,20 +111,6 @@ pub enum ServerMsg {
     Peers(Vec<Peer>),
     /// Another client's presence.
     Presence { actor: ActorId, presence: Presence },
-    /// The state of the shared transport. Sent to everyone when it changes, the client that
-    /// asked included.
-    Transport {
-        state: TransportState,
-        /// The client whose request this answers; `None` when the server moved the transport
-        /// itself. A client that counts its unanswered requests knows from this when its own
-        /// idea of the transport is the older one.
-        by: Option<ActorId>,
-    },
-    /// A request other than a transaction was turned down. Nothing changed.
-    Denied { request: Request, reason: RejectReason },
-    /// The checkouts whose owners have not renewed their lease in time. Sent whenever the set
-    /// changes.
-    Stale(Vec<TrackId>),
 }
 
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
@@ -186,13 +127,9 @@ pub struct Welcome {
     /// with. Pending transactions up to it must not be sent again.
     pub acked: Option<u64>,
     pub peers: Vec<Peer>,
-    /// The shared transport as it is now.
-    pub transport: TransportState,
-    /// With a snapshot: the latest events the changelog shows, oldest first. Their effect on
-    /// the document is in the snapshot already.
+    /// With a snapshot: the latest events the history shows, oldest first. Their effect on the
+    /// document is in the snapshot already.
     pub history: Vec<Event>,
-    /// The checkouts without a fresh lease.
-    pub stale: Vec<TrackId>,
 }
 
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
@@ -216,7 +153,6 @@ pub struct Peer {
 pub struct Presence {
     /// The entity being dragged or edited, which others should leave alone.
     pub editing: Option<EntityRef>,
-    pub playhead: Option<Tick>,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -248,34 +184,8 @@ pub enum RejectReason {
     Invalid(String),
     /// `base_seq` is ahead of the log.
     FutureBase,
-    /// The track's contents are locked by a checkout.
-    CheckedOut {
-        track: TrackId,
-        by: UserId,
-    },
-    /// Tracks with plugins are edited only through checkout.
-    PluginTrack {
-        track: TrackId,
-    },
-    /// Plugins are added only by a commit.
-    PluginOutsideCommit,
-    NoSuchTrack,
-    /// The request needs the sender to own the track's checkout.
-    NotOwner {
-        track: TrackId,
-    },
-    /// There is no checkout to release.
-    NotCheckedOut {
-        track: TrackId,
-    },
-    /// A commit may only carry content ops of its track and project-scope fixes.
-    OutOfScope,
-    /// A blob the request names was not uploaded.
+    /// A blob an op names, such as a plugin's state, was not uploaded.
     MissingBlob(BlobHash),
-    /// A track with plugins must be committed with a stem.
-    StemRequired,
-    /// The entry to attach to is not in the log.
-    NoSuchEntry,
 }
 
 impl fmt::Display for RejectReason {
@@ -283,16 +193,7 @@ impl fmt::Display for RejectReason {
         match self {
             RejectReason::Invalid(why) => write!(f, "invalid edit: {why}"),
             RejectReason::FutureBase => write!(f, "the edit refers to events the server does not have"),
-            RejectReason::CheckedOut { .. } => write!(f, "the track is checked out"),
-            RejectReason::PluginTrack { .. } => write!(f, "tracks with plugins are edited through checkout"),
-            RejectReason::PluginOutsideCommit => write!(f, "plugins are added through checkout"),
-            RejectReason::NoSuchTrack => write!(f, "the track does not exist any more"),
-            RejectReason::NotOwner { .. } => write!(f, "the track is not checked out by you"),
-            RejectReason::NotCheckedOut { .. } => write!(f, "the track is not checked out"),
-            RejectReason::OutOfScope => write!(f, "the commit reaches outside of its track"),
-            RejectReason::MissingBlob(_) => write!(f, "the server did not get all the audio"),
-            RejectReason::StemRequired => write!(f, "a track with plugins is committed with its audio"),
-            RejectReason::NoSuchEntry => write!(f, "the changelog entry does not exist"),
+            RejectReason::MissingBlob(_) => write!(f, "the server did not get all the data the edit needs"),
         }
     }
 }
@@ -382,15 +283,7 @@ mod tests {
                 user: UserId(1),
                 name: "ada".into(),
             }],
-            transport: TransportState {
-                playing: true,
-                anchor_tick: 960.5,
-                anchor_server_micros: 1_234_567,
-                loop_range: Some(mdaw_model::TickRange::new(Tick(0), Tick(3840))),
-                epoch: 3,
-            },
             history: Vec::new(),
-            stale: Vec::new(),
         }));
         let frame = encode(&welcome).unwrap();
         assert_eq!(decode::<ServerMsg>(&frame[4..]).unwrap(), welcome);

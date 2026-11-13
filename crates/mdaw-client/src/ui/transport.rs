@@ -1,4 +1,4 @@
-//! The bar at the top: transport, position, tempo, undo and the master output.
+//! The bar at the top: this client's own transport, position, tempo, undo and the output.
 
 use egui::{Align, Button, DragValue, Layout, Rect, RichText, Sense, Ui, pos2, vec2};
 use mdaw_model::{Op, TempoPoint, Tick};
@@ -47,13 +47,6 @@ pub fn show(app: &mut DawApp, ui: &mut Ui) {
             .changed()
         {
             app.apply_loop();
-        }
-        if let Some(mut linked) = app.session.linked() {
-            let hint = "Play, stop, seek and loop together with everyone else. \
-                        Switched off, this client plays on its own.";
-            if ui.toggle_value(&mut linked, "Link").on_hover_text(hint).changed() {
-                app.session.set_linked(linked);
-            }
         }
 
         ui.separator();
@@ -126,7 +119,7 @@ pub fn show(app: &mut DawApp, ui: &mut Ui) {
                 )
                 .on_hover_text(
                     "Your listening volume. It is yours alone: it changes nothing in the project, \
-                     nobody else hears it, and it is not part of stems or samples.",
+                     and nobody else hears it.",
                 );
             if response.changed() {
                 app.session.engine_mut().set_output_gain(db_to_gain(db));
@@ -138,41 +131,11 @@ pub fn show(app: &mut DawApp, ui: &mut Ui) {
                     .small(),
             );
             connection(app, ui);
-            timing(app, ui);
         });
     });
     ui.add_space(2.0);
     super::live::show(app, ui);
     ui.add_space(3.0);
-}
-
-/// How well this client keeps time with the shared transport.
-fn timing(app: &DawApp, ui: &mut Ui) {
-    let session = &app.session;
-    if session.linked() != Some(true) || session.status() != Status::Online {
-        return;
-    }
-    let Some(timing) = session.timing() else {
-        ui.label(RichText::new("syncing").color(theme::WARN).small())
-            .on_hover_text("Measuring the server's clock. Until that is done, this client plays on its own.");
-        ui.separator();
-        return;
-    };
-    let ms = |micros: i64| micros as f64 / 1000.0;
-    let text = match timing.drift_micros {
-        Some(drift) => format!("in sync {:+.1} ms", ms(drift)),
-        None => format!("clock ±{:.1} ms", ms(timing.rtt_micros) / 2.0),
-    };
-    ui.label(RichText::new(text).color(theme::TEXT_DIM).small())
-        .on_hover_text(format!(
-            "Shared transport\n\
-             Round trip to the server: {:.1} ms; its clock is known to half of that.\n\
-             While playing: how far this client's audio is ahead of the shared playhead.\n\
-             Jumps made to get back in step: {}",
-            ms(timing.rtt_micros),
-            timing.resyncs
-        ));
-    ui.separator();
 }
 
 /// Who is here, or what is wrong with the connection.

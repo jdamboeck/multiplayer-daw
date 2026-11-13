@@ -51,6 +51,8 @@ fn sink(queue: &Queue) -> Sink {
 impl World {
     fn new(clients: u8) -> Self {
         let mut hub = Hub::open(Store::in_memory().unwrap(), Blobs::in_memory()).unwrap();
+        // The one plugin state every client has uploaded.
+        assert!(hub.blobs().put(&stored(), STORED).unwrap());
         let history = vec![hub.doc().clone()];
         let observer = Queue::default();
         let hello = Hello {
@@ -145,11 +147,7 @@ impl World {
             }
             ServerMsg::Event(event) => c.replica.on_event(&event).expect("events arrive in order"),
             ServerMsg::Rejected { client_txn_id, .. } => c.replica.on_rejected(client_txn_id),
-            ServerMsg::Peers(_)
-            | ServerMsg::Presence { .. }
-            | ServerMsg::Transport { .. }
-            | ServerMsg::Stale(_) => {}
-            ServerMsg::Denied { request, reason } => panic!("{request:?} denied: {reason}"),
+            ServerMsg::Peers(_) | ServerMsg::Presence { .. } => {}
             ServerMsg::Refused(reason) => panic!("refused: {reason}"),
         }
         assert_eq!(
@@ -280,7 +278,7 @@ impl World {
             events += 1;
             assert_eq!(event.seq, events);
             apply_event(&mut doc, event);
-            let first = seen.insert((event.user, event.client_txn_id()));
+            let first = seen.insert((event.user, event.client_txn_id));
             assert!(
                 first || self.resent_blindly,
                 "event {} repeats an edit already in the log",
@@ -320,6 +318,36 @@ fn notes(project: &Project) -> Vec<(TrackId, ClipId, NoteId)> {
     found
 }
 
+fn plugins(project: &Project) -> Vec<(TrackId, DeviceId)> {
+    let mut found = Vec::new();
+    for (track, t) in project.ordered_tracks() {
+        let plugins = t.content.devices.iter();
+        let plugins = plugins.filter(|d| matches!(d.kind, DeviceKind::Plugin { .. }));
+        found.extend(plugins.map(|d| (track, d.id)));
+    }
+    found
+}
+
+/// Bytes of a plugin state that is on the server, and the hash of one that is not.
+const STORED: &[u8] = b"plugin state";
+fn stored() -> BlobHash {
+    blob_hash(STORED)
+}
+fn missing() -> BlobHash {
+    blob_hash(b"never uploaded")
+}
+
+fn plugin(ids: &mut IdGen, state: Option<BlobHash>) -> Device {
+    Device::new(
+        ids.device(),
+        DeviceKind::Plugin {
+            format: PluginFormat::Clap,
+            id: "com.example".into(),
+            state,
+        },
+    )
+}
+
 fn pick<T: Copy>(from: &[T], a: usize) -> Option<T> {
     (!from.is_empty()).then(|| from[a % from.len()])
 }
@@ -329,7 +357,8 @@ fn edit(view: &Project, ids: &mut IdGen, kind: u8, a: usize, b: u8) -> Vec<Op> {
     let track = pick(&tracks(view), a);
     let clip = pick(&clips(view), a);
     let note = pick(&notes(view), a);
-    let op = match kind % 14 {
+    let device = pick(&plugins(view), a);
+    let op = match kind % 17 {
         0 => Some(Op::TrackAdd {
             id: ids.track(),
             shell: TrackShell {
@@ -393,16 +422,27 @@ fn edit(view: &Project, ids: &mut IdGen, kind: u8, a: usize, b: u8) -> Vec<Op> {
         12 => Some(Op::ProjectSetName {
             name: format!("song {b}"),
         }),
-        // The server refuses plugin devices outside a commit, and with them the whole edit.
+        // A plugin, with or without settings, is an ordinary edit.
+        14 => track.map(|track| Op::DeviceAdd {
+            track,
+            device: plugin(ids, b.is_multiple_of(2).then(stored)),
+            after: None,
+        }),
+        15 => device.map(|(track, id)| Op::DeviceSetState {
+            track,
+            id,
+            state: (!b.is_multiple_of(3)).then(stored),
+        }),
+        16 => device.map(|(track, id)| Op::DeviceSetParam {
+            track,
+            id,
+            param: u32::from(b % 4),
+            value: Some(f64::from(b)),
+        }),
+        // A plugin whose settings never reached the server is refused, and with it the whole
+        // edit.
         _ => {
-            let device = Device::new(
-                ids.device(),
-                DeviceKind::Plugin {
-                    format: PluginFormat::Clap,
-                    id: "com.example".into(),
-                    state: None,
-                },
-            );
+            let device = plugin(ids, Some(missing()));
             let add = track.map(|track| Op::DeviceAdd {
                 track,
                 device,
@@ -516,6 +556,39 @@ fn an_edit_confirmed_while_the_client_was_away_is_not_made_twice() {
     world.settle();
     world.assert_converged();
     assert_eq!(world.hub.head(), before + 1);
+}
+
+/// Two clients change the same track, which has a plugin, at the same time: its notes, its
+/// mix and the plugin's settings. Nobody holds a lock; everyone ends with the server's document.
+#[test]
+fn concurrent_edits_of_a_track_with_a_plugin_converge() {
+    let mut world = seeded();
+    // With its settings.
+    world.edit(0, 14, 0, 0);
+    world.settle();
+    world.assert_converged();
+    let (track, device) = plugins(world.hub.doc())[0];
+    assert_eq!(Some(track), world.hub.doc().track_order.front().copied());
+    // Clients 1 and 2 edit without seeing each other's edits.
+    for (client, b) in [(1, 5), (2, 9)] {
+        world.edit(client, 16, 0, b);
+        world.edit(client, 6, 0, b);
+        world.edit(client, 9, 0, b);
+        // Client 1 keeps the settings as they are, which sends nothing; client 2 clears them.
+        world.edit(client, 15, 0, b);
+    }
+    world.settle();
+    world.assert_converged();
+    let doc = world.hub.doc();
+    let content = &doc.track(track).unwrap().content;
+    let plugin = content.device(device).unwrap();
+    // Each pair of edits writes the same property; the later one (client 2's) wins each.
+    assert!(matches!(&plugin.kind, DeviceKind::Plugin { .. }));
+    assert_eq!(plugin.params.get(&1), Some(&9.0));
+    assert!(matches!(plugin.kind, DeviceKind::Plugin { state: None, .. }));
+    assert_eq!(content.gain, 1.0 / 8.0);
+    let (_, clip, note) = notes(doc)[0];
+    assert_eq!(content.clips[&clip].notes[&note].pitch, 36 + 9);
 }
 
 #[test]

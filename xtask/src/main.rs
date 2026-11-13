@@ -19,7 +19,7 @@ Options:
   --fresh           Forget the demo project and all profiles first (demo, server).
   --listen <addr>   Where the server listens (default: 127.0.0.1:7464).
   --release         Use optimised builds.
-  --no-plugins      Clients load no plugins and play tracks with plugins from their stems.
+  --no-plugins      Clients load no plugins; tracks with plugins are silent in them.
   --test-synth      Clients also offer the built-in test synth.
 
 The pieces can be mixed: `cargo xtask server` in one terminal and `cargo xtask client Ann` in

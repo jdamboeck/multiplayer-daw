@@ -1,7 +1,7 @@
 //! What the server lets into the log, and what it records as displaced.
 
 use mdaw_model::*;
-use mdaw_proto::{EventBody, RejectReason, Superseded, Txn};
+use mdaw_proto::{RejectReason, Superseded, Txn, blob_hash};
 use mdaw_server::Sequencer;
 
 const TRACK: TrackId = TrackId(EntityId(1));
@@ -70,15 +70,26 @@ fn vel(vel: u8) -> Op {
     }
 }
 
-fn clap_device() -> Device {
+fn clap_device(state: Option<BlobHash>) -> Device {
     Device::new(
         DeviceId(EntityId(9)),
         DeviceKind::Plugin {
             format: PluginFormat::Clap,
             id: "com.example.synth".into(),
-            state: None,
+            state,
         },
     )
+}
+
+/// A plugin state the server holds, and one it does not.
+fn stored() -> BlobHash {
+    blob_hash(b"uploaded")
+}
+fn missing() -> BlobHash {
+    blob_hash(b"never uploaded")
+}
+fn has_blob(blob: &BlobHash) -> bool {
+    *blob == stored()
 }
 
 fn txn(id: u64, base_seq: u64, ops: Vec<Op>) -> Txn {
@@ -90,10 +101,7 @@ fn txn(id: u64, base_seq: u64, ops: Vec<Op>) -> Txn {
 }
 
 fn superseded(seq: &mut Sequencer, who: (ActorId, UserId), t: Txn) -> Vec<Superseded> {
-    let EventBody::Txn { superseded, .. } = seq.sequence(who.0, who.1, 0, t).unwrap().body else {
-        unreachable!()
-    };
-    superseded
+    seq.sequence(who.0, who.1, 0, t, has_blob).unwrap().superseded
 }
 
 fn note(seq: &Sequencer) -> Note {
@@ -104,18 +112,18 @@ fn note(seq: &Sequencer) -> Note {
 fn events_get_consecutive_numbers_and_carry_the_transaction() {
     let mut seq = Sequencer::new(base(), 7, vec![]);
     let event = seq
-        .sequence(ANN.0, ANN.1, 42, txn(5, 7, vec![pitch(62)]))
+        .sequence(ANN.0, ANN.1, 42, txn(5, 7, vec![pitch(62)]), has_blob)
         .unwrap();
     assert_eq!(
         (event.seq, event.actor, event.user, event.wall_ts),
         (8, ANN.0, ANN.1, 42)
     );
-    assert_eq!(event.client_txn_id(), Some(5));
-    assert_eq!(event.ops().cloned().collect::<Vec<_>>(), [pitch(62)]);
+    assert_eq!(event.client_txn_id, 5);
+    assert_eq!(event.ops, [pitch(62)]);
     assert_eq!(seq.head(), 8);
     assert_eq!(note(&seq).pitch, 62);
     assert_eq!(
-        seq.sequence(BEN.0, BEN.1, 0, txn(1, 8, vec![vel(1)]))
+        seq.sequence(BEN.0, BEN.1, 0, txn(1, 8, vec![vel(1)]), has_blob)
             .unwrap()
             .seq,
         9
@@ -138,97 +146,76 @@ fn a_refused_transaction_changes_nothing() {
                     pitch(61),
                     Op::DeviceAdd {
                         track: TRACK,
-                        device: clap_device(),
+                        device: clap_device(Some(missing())),
                         after: None,
                     },
                 ],
             ),
-            "clap",
+            "plugin state not uploaded",
         ),
     ];
     for (t, what) in cases {
-        assert!(seq.sequence(ANN.0, ANN.1, 0, t).is_err(), "{what}");
+        assert!(seq.sequence(ANN.0, ANN.1, 0, t, has_blob).is_err(), "{what}");
         assert_eq!(seq.head(), 0, "{what}");
         assert_eq!(seq.doc(), &before, "{what}");
     }
     assert_eq!(
-        seq.check(ANN.1, &txn(1, 1, vec![pitch(61)])),
+        seq.check(&txn(1, 1, vec![pitch(61)]), has_blob),
         Err(RejectReason::FutureBase)
     );
-    assert_eq!(
-        seq.check(
-            ANN.1,
-            &txn(
-                1,
-                0,
-                vec![Op::DeviceAdd {
-                    track: TRACK,
-                    device: clap_device(),
-                    after: None
-                }]
-            )
-        ),
-        Err(RejectReason::PluginOutsideCommit)
-    );
-}
-
-#[test]
-fn a_checked_out_track_takes_no_live_content_edits() {
-    let mut doc = base();
-    doc.set_checkout(
-        TRACK,
-        Some(Checkout {
-            user: ANN.1,
-            base_seq: 0,
-        }),
-    );
-    let mut seq = Sequencer::new(doc, 0, vec![]);
-    let locked = Err(RejectReason::CheckedOut {
-        track: TRACK,
-        by: ANN.1,
-    });
-
-    // Not even from the owner: their edits stay local until the commit.
-    assert_eq!(seq.check(ANN.1, &txn(1, 0, vec![pitch(61)])), locked);
-    assert_eq!(seq.check(BEN.1, &txn(1, 0, vec![pitch(61)])), locked);
-    // Removing the track is the owner's to do.
-    assert_eq!(
-        seq.check(BEN.1, &txn(1, 0, vec![Op::TrackRemove { id: TRACK }])),
-        locked
-    );
-    assert_eq!(
-        seq.check(ANN.1, &txn(1, 0, vec![Op::TrackRemove { id: TRACK }])),
-        Ok(())
-    );
-    // The shell stays live for everyone.
-    let rename = Op::TrackSetShell {
-        id: TRACK,
-        prop: ShellProp::Name("lead".into()),
+    let add = |state| {
+        txn(
+            1,
+            0,
+            vec![Op::DeviceAdd {
+                track: TRACK,
+                device: clap_device(state),
+                after: None,
+            }],
+        )
     };
-    assert!(seq.sequence(BEN.0, BEN.1, 0, txn(1, 0, vec![rename])).is_ok());
+    assert_eq!(
+        seq.check(&add(Some(missing())), has_blob),
+        Err(RejectReason::MissingBlob(missing()))
+    );
+    assert_eq!(seq.check(&add(Some(stored())), has_blob), Ok(()));
+    assert_eq!(seq.check(&add(None), has_blob), Ok(()));
 }
 
+/// A track with a plugin is edited like any other: nothing is locked.
 #[test]
-fn a_track_with_a_clap_device_takes_no_live_content_edits() {
+fn a_track_with_a_plugin_takes_ordinary_edits() {
     let mut doc = base();
     apply(
         &mut doc,
         &Op::DeviceAdd {
             track: TRACK,
-            device: clap_device(),
+            device: clap_device(None),
             after: None,
         },
     )
     .unwrap();
-    let seq = Sequencer::new(doc, 0, vec![]);
+    let mut seq = Sequencer::new(doc, 0, vec![]);
+    let device = DeviceId(EntityId(9));
+    let state = |state| Op::DeviceSetState {
+        track: TRACK,
+        id: device,
+        state: Some(state),
+    };
+    seq.sequence(ANN.0, ANN.1, 0, txn(1, 0, vec![pitch(61)]), has_blob)
+        .unwrap();
     assert_eq!(
-        seq.check(ANN.1, &txn(1, 0, vec![pitch(61)])),
-        Err(RejectReason::PluginTrack { track: TRACK })
+        seq.sequence(BEN.0, BEN.1, 0, txn(1, 1, vec![state(missing())]), has_blob),
+        Err(RejectReason::MissingBlob(missing()))
     );
-    assert_eq!(
-        seq.check(ANN.1, &txn(1, 0, vec![Op::TrackRemove { id: TRACK }])),
-        Ok(())
-    );
+    seq.sequence(BEN.0, BEN.1, 0, txn(2, 1, vec![state(stored())]), has_blob)
+        .unwrap();
+    let content = &seq.doc().track(TRACK).unwrap().content;
+    assert_eq!(note(&seq).pitch, 61);
+    assert!(matches!(
+        content.device(device).unwrap().kind,
+        DeviceKind::Plugin { state: Some(s), .. } if s == stored()
+    ));
 }
 
 #[test]
@@ -250,7 +237,7 @@ fn a_track_and_its_content_can_arrive_in_one_transaction() {
             prop: MixProp::Gain(0.5),
         },
     ];
-    seq.sequence(ANN.0, ANN.1, 0, txn(1, 0, ops)).unwrap();
+    seq.sequence(ANN.0, ANN.1, 0, txn(1, 0, ops), has_blob).unwrap();
     assert_eq!(seq.doc().track(track).unwrap().content.gain, 0.5);
 }
 
@@ -353,8 +340,14 @@ fn an_edit_inside_something_removed_unseen_is_itself_what_got_lost() {
 fn recent_events_can_be_read_back() {
     let mut seq = Sequencer::new(base(), 0, vec![]);
     for n in 1..=5 {
-        seq.sequence(ANN.0, ANN.1, 0, txn(n, n - 1, vec![pitch(60 + n as u8)]))
-            .unwrap();
+        seq.sequence(
+            ANN.0,
+            ANN.1,
+            0,
+            txn(n, n - 1, vec![pitch(60 + n as u8)]),
+            has_blob,
+        )
+        .unwrap();
     }
     let seqs = |after| {
         seq.events_after(after)

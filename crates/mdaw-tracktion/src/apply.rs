@@ -6,7 +6,7 @@
 //! model is. The engine addresses everything by the model's own ids.
 //!
 //! What the engine cannot take does not fail the call: it is left out and reported as a
-//! [`Problem`]. Model data the engine has no use for (project name, track colour, checkouts,
+//! [`Problem`]. Model data the engine has no use for (project name, track colour,
 //! stems) is ignored without a report.
 //!
 //! A plugin device's settings are its state blob and its parameter values; the state is applied

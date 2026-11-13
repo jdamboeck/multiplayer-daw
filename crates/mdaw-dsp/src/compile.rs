@@ -217,8 +217,8 @@ impl Compiler {
         self.build_with(project, only, &mut NoPlugins)
     }
 
-    /// As [`Compiler::build`], with plugins and stems from `source`. A track with a plugin that
-    /// `source` cannot provide plays its stem, if `source` has that, and is silent otherwise.
+    /// As [`Compiler::build`], with plugins from `source`. A track with a plugin that `source`
+    /// cannot provide is silent.
     pub fn build_with(
         &mut self,
         project: &Project,
@@ -286,12 +286,9 @@ impl Compiler {
                     state
                 })
                 .collect();
-            // A plugin that cannot be heard here: the stem stands in for the whole track.
-            let sound = match track.stem.as_ref().filter(|_| missing) {
-                Some(stem) => source.stem(stem).map_or(Source::Silent, Source::Stem),
-                None if missing => Source::Silent,
-                None => Source::Devices,
-            };
+            // A plugin that cannot be heard here: the rest of the track would sound wrong without
+            // it, so the track is silent.
+            let sound = if missing { Source::Silent } else { Source::Devices };
             cache.insert(
                 id,
                 Cached {

@@ -320,8 +320,8 @@ fn the_test_synth_misbehaves_only_when_told_and_a_failure_is_reported() {
     device.retire();
 }
 
-/// What the start of an offline render of an installed plugin looks like, as a commit renders
-/// it: notes from the very first frame. Run by hand with
+/// What the start of an offline render of an installed plugin looks like: notes from the very
+/// first frame. Run by hand with
 /// `MDAW_PROBE=<plugin id> cargo test -p mdaw-plugin --test host -- --ignored probe --nocapture`.
 #[test]
 #[ignore = "depends on the plugins installed here"]

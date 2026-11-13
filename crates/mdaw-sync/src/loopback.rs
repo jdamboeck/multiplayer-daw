@@ -1,5 +1,5 @@
 use mdaw_model::{ActorId, UserId};
-use mdaw_proto::{Event, EventBody, Txn};
+use mdaw_proto::{Event, Txn};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Stands in for the server when working alone: gives every transaction the next sequence
@@ -29,11 +29,9 @@ impl Loopback {
             actor,
             user: self.user,
             wall_ts,
-            body: EventBody::Txn {
-                client_txn_id: txn.client_txn_id,
-                ops: txn.ops,
-                superseded: Vec::new(),
-            },
+            client_txn_id: txn.client_txn_id,
+            ops: txn.ops,
+            superseded: Vec::new(),
         }
     }
 }

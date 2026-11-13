@@ -7,10 +7,10 @@ use std::fmt;
 /// One property-level edit addressed to stable IDs.
 ///
 /// Ops never fail: an op whose target is missing, or an add whose ID already exists, does nothing
-/// on every replica. Locks and permissions are checked by the server before it sequences an op.
+/// on every replica. The server checks ranges, limits and blobs before it sequences an op.
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub enum Op {
-    // Project scope: always live.
+    // Project.
     ProjectSetName {
         name: String,
     },
@@ -40,13 +40,11 @@ pub enum Op {
         id: TrackId,
         prop: ShellProp,
     },
-
-    // Track structure: needs the track live or checked out by the sender.
     TrackRemove {
         id: TrackId,
     },
 
-    // Track content: locked by a checkout.
+    // Track content.
     TrackSetMix {
         track: TrackId,
         prop: MixProp,
@@ -144,14 +142,6 @@ pub enum NoteProp {
     Vel(u8),
 }
 
-/// What the server has to check before sequencing an op.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Scope {
-    Project,
-    TrackStructure(TrackId),
-    TrackContent(TrackId),
-}
-
 /// Addresses one entity. Also used for presence ("X is editing this clip").
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 pub enum EntityRef {
@@ -214,32 +204,6 @@ pub enum PropKey {
 }
 
 impl Op {
-    pub fn scope(&self) -> Scope {
-        match self {
-            Op::ProjectSetName { .. }
-            | Op::MasterSetGain { .. }
-            | Op::TempoPut { .. }
-            | Op::TempoRemove { .. }
-            | Op::TrackAdd { .. }
-            | Op::TrackMove { .. }
-            | Op::TrackSetShell { .. } => Scope::Project,
-            Op::TrackRemove { id } => Scope::TrackStructure(*id),
-            Op::TrackSetMix { track, .. }
-            | Op::ClipAdd { track, .. }
-            | Op::ClipRemove { track, .. }
-            | Op::ClipSet { track, .. }
-            | Op::NoteAdd { track, .. }
-            | Op::NoteRemove { track, .. }
-            | Op::NoteSet { track, .. }
-            | Op::DeviceAdd { track, .. }
-            | Op::DeviceRemove { track, .. }
-            | Op::DeviceMove { track, .. }
-            | Op::DeviceSetParam { track, .. }
-            | Op::DeviceSetBypass { track, .. }
-            | Op::DeviceSetState { track, .. } => Scope::TrackContent(*track),
-        }
-    }
-
     /// The entity this op writes to.
     pub fn entity(&self) -> EntityRef {
         match self {
@@ -317,15 +281,6 @@ impl Op {
                 | Op::NoteRemove { .. }
                 | Op::DeviceRemove { .. }
         )
-    }
-
-    /// True when the op would put a plugin on a track. Only commits may do that.
-    pub fn adds_plugin(&self) -> bool {
-        match self {
-            Op::DeviceAdd { device, .. } => matches!(device.kind, DeviceKind::Plugin { .. }),
-            Op::TrackAdd { content, .. } => content.has_plugin(),
-            _ => false,
-        }
     }
 
     /// Blobs the op refers to. The server requires them to be stored before it accepts the op.
