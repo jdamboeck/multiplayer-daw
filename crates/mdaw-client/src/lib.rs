@@ -17,6 +17,7 @@ pub mod profile;
 mod record;
 mod session;
 mod theme;
+pub mod trace;
 pub mod ui;
 
 pub use app::{DawApp, Focus, Selection, Tab};

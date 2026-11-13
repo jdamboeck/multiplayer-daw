@@ -145,6 +145,7 @@ fn main() -> ExitCode {
                 }
             };
             title = format!("mdaw - {} @ {}:{}", who.name, join.host, join.port);
+            mdaw_client::trace::set_name(&who.name);
             let waker: Waker = {
                 let ctx = ctx.clone();
                 Arc::new(move || {

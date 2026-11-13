@@ -47,6 +47,9 @@ const CAPTURE_LATEST: Duration = Duration::from_secs(2);
 const RENDER_RATE: f64 = 48_000.0;
 /// Parameter values shown in the device tab are read again this often.
 const PARAMS_FRESH: Duration = Duration::from_millis(150);
+/// How often the settings of a plugin whose window is open are read, to see changes the plugin
+/// does not report (some pick a preset without a word to the host).
+const LOOK_EVERY: Duration = Duration::from_millis(500);
 
 /// How to start the engine.
 #[derive(Clone, Debug)]
@@ -126,6 +129,8 @@ enum Job {
         track: TrackId,
         device: DeviceId,
     },
+    /// Reads the settings of plugins whose windows are open, for changes not reported.
+    Look(Vec<(TrackId, DeviceId)>),
     Blob(BlobHash, Arc<[u8]>),
     Retry {
         track: TrackId,
@@ -164,6 +169,9 @@ pub struct TracktionAudio {
     pending: HashMap<DeviceId, Pending>,
     editors: HashSet<DeviceId>,
     params_asked: HashMap<DeviceId, Instant>,
+    looked_at: Instant,
+    /// Devices looked at as if their windows were open (for tests; see [`TracktionAudio::watch`]).
+    watched: HashSet<DeviceId>,
 }
 
 fn lock(shared: &Mutex<Shared>) -> MutexGuard<'_, Shared> {
@@ -262,6 +270,7 @@ impl TracktionAudio {
             blobs: HashMap::new(),
             output_gain: 1.0,
             flush_path: options.settings_dir.join("flush.wav"),
+            looks: HashMap::new(),
         };
         let worker = std::thread::Builder::new()
             .name("mdaw-engine-worker".into())
@@ -284,12 +293,21 @@ impl TracktionAudio {
             given: None,
             pending: HashMap::new(),
             editors: HashSet::new(),
+            looked_at: Instant::now(),
+            watched: HashSet::new(),
             params_asked: HashMap::new(),
         })
     }
 
     /// The engine, for what this type does not offer (tests, diagnostics). Calls on it wait
     /// for the engine's thread.
+    /// Looks at a device's settings as if its window were open, for tests of plugins that
+    /// change without a report (the test synth has no window).
+    #[doc(hidden)]
+    pub fn watch(&mut self, device: DeviceId) {
+        self.watched.insert(device);
+    }
+
     pub fn engine(&self) -> &Engine {
         &self.engine
     }
@@ -342,6 +360,13 @@ impl TracktionAudio {
             .collect();
         for device in due {
             if let Some(p) = self.pending.remove(&device) {
+                crate::trace::step(|| {
+                    format!(
+                        "reads the settings, {} ms after the first change and {} ms after the last",
+                        p.first.elapsed().as_millis(),
+                        p.last.elapsed().as_millis()
+                    )
+                });
                 self.send(Job::Capture {
                     track: p.track,
                     device,
@@ -466,6 +491,14 @@ impl Audio for TracktionAudio {
                 Event::ParamChanged { device, .. } | Event::StateChanged { device } => {
                     let device = DeviceId(mdaw_model::EntityId(device));
                     if let Some(track) = track_of(project, device) {
+                        if !self.pending.contains_key(&device) {
+                            crate::trace::step(|| match &event {
+                                Event::ParamChanged { param_id, .. } => {
+                                    format!("plugin reports a change of parameter {param_id}")
+                                }
+                                _ => "plugin reports its settings changed".into(),
+                            });
+                        }
                         self.changed(track, device);
                     }
                 }
@@ -477,6 +510,18 @@ impl Audio for TracktionAudio {
             }
         }
         self.capture_due(false);
+        if !(self.editors.is_empty() && self.watched.is_empty()) && self.looked_at.elapsed() >= LOOK_EVERY {
+            self.looked_at = Instant::now();
+            let open: Vec<(TrackId, DeviceId)> = self
+                .editors
+                .union(&self.watched)
+                .filter(|d| !self.pending.contains_key(d))
+                .filter_map(|d| Some((track_of(project, *d)?, *d)))
+                .collect();
+            if !open.is_empty() {
+                self.send(Job::Look(open));
+            }
+        }
         notices.append(&mut lock(&self.shared).notices);
         notices
     }
@@ -488,8 +533,8 @@ impl Audio for TracktionAudio {
         };
         if !self.pending.is_empty() || busy {
             Some(Duration::from_millis(100))
-        } else if !self.editors.is_empty() {
-            // Changes made in a plugin's window come as events: look for them.
+        } else if !self.editors.is_empty() || !self.watched.is_empty() {
+            // Changes made in a plugin's window come as events, or are found by looking.
             Some(Duration::from_millis(50))
         } else {
             None
@@ -768,6 +813,10 @@ struct Worker {
     output_gain: f32,
     /// Where the short render goes that lets the plugins take parameters without a device.
     flush_path: PathBuf,
+    /// What reading the settings of a plugin with an open window last gave, and a different
+    /// reading seen once since: a change counts when two readings in a row agree on it, so a
+    /// plugin that writes its settings a little differently each time sends nothing.
+    looks: HashMap<DeviceId, (BlobHash, Option<BlobHash>)>,
 }
 
 impl Worker {
@@ -818,6 +867,7 @@ impl Worker {
                 );
             }
             Job::Capture { track, device } => self.capture(track, device),
+            Job::Look(open) => self.look(&open),
             Job::Blob(hash, bytes) => self.blob(hash, bytes),
             Job::Retry { track, device } => {
                 self.retry(track, device);
@@ -967,6 +1017,12 @@ impl Worker {
             .synced
             .as_ref()
             .is_none_or(|p| p.master_gain != view.master_gain);
+        if !restated.is_empty() {
+            crate::trace::step(|| format!("engine took new settings for {} plugins", restated.len()));
+        }
+        for device in &restated {
+            self.looks.remove(device);
+        }
         self.synced = Some(view);
         self.reread_params(&restated);
         if gain_changed || self.output_gain != 1.0 {
@@ -1097,6 +1153,43 @@ impl Worker {
         }
     }
 
+    /// Reads the settings of plugins whose windows are open; one that changed without a report
+    /// is read as if it had reported.
+    fn look(&mut self, open: &[(TrackId, DeviceId)]) {
+        for &(track, device) in open {
+            let raw = raw_device(device);
+            if !self.engine.has(EntityKind::Device, raw) {
+                continue;
+            }
+            let bytes = self.engine.device_get_state(raw);
+            if bytes.is_empty() {
+                continue;
+            }
+            let hash = mdaw_proto::blob_hash(&bytes);
+            match self.looks.get(&device).copied() {
+                None => {
+                    self.looks.insert(device, (hash, None));
+                }
+                Some((last, _)) if last == hash => {
+                    self.looks.insert(device, (last, None));
+                }
+                Some((last, Some(seen))) if seen == hash => {
+                    crate::trace::step(|| {
+                        format!(
+                            "found the settings changed without a report: {} -> {}",
+                            crate::trace::short(&last),
+                            crate::trace::short(&hash)
+                        )
+                    });
+                    self.capture(track, device);
+                }
+                Some((last, _)) => {
+                    self.looks.insert(device, (last, Some(hash)));
+                }
+            }
+        }
+    }
+
     fn capture(&mut self, track: TrackId, device: DeviceId) {
         let Some(project) = &self.synced else { return };
         let is_plugin = project
@@ -1119,6 +1212,14 @@ impl Worker {
             return;
         }
         let hash = mdaw_proto::blob_hash(&bytes);
+        crate::trace::step(|| {
+            format!(
+                "settings read: {} ({} bytes)",
+                crate::trace::short(&hash),
+                bytes.len()
+            )
+        });
+        self.looks.insert(device, (hash, None));
         self.blobs.insert(hash, bytes.clone());
         // The engine holds this state now: the edit that brings it into the document changes
         // nothing here when it comes back through the view, and until then a view showing the
@@ -1170,6 +1271,16 @@ impl Worker {
         }
         drop(blobs);
         let applied: Vec<DeviceId> = waiting.iter().map(|(_, id)| *id).collect();
+        crate::trace::step(|| {
+            format!(
+                "engine took downloaded settings {} for {} plugins",
+                crate::trace::short(&hash),
+                applied.len()
+            )
+        });
+        for device in &applied {
+            self.looks.remove(device);
+        }
         self.reread_params(&applied);
         self.publish_statuses(&problems);
     }

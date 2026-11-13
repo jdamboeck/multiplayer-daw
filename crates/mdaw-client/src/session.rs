@@ -588,6 +588,7 @@ impl Session {
             let wanted = self.audio.wanted_blobs(&self.fetching);
             for hash in wanted {
                 self.fetching.insert(hash);
+                crate::trace::step(|| format!("asks for settings {}", crate::trace::short(&hash)));
                 remote.link.get(hash);
             }
         }
@@ -612,8 +613,21 @@ impl Session {
                 .and_then(|t| t.content.device(id))
                 .is_some_and(|d| matches!(d.kind, DeviceKind::Plugin { state: Some(s), .. } if s == hash));
             if held {
+                crate::trace::step(|| {
+                    format!(
+                        "settings {} read, the document has them already",
+                        crate::trace::short(&hash)
+                    )
+                });
                 continue;
             }
+            crate::trace::step(|| {
+                format!(
+                    "settings {} read, uploading {} bytes",
+                    crate::trace::short(&hash),
+                    bytes.len()
+                )
+            });
             self.put_blob(hash, bytes);
             let gesture = match self.plugin_gestures.get(&(track, id)) {
                 Some(gesture) => *gesture,
@@ -941,6 +955,7 @@ impl Session {
             })
             .count();
         for txn in self.outgoing.drain(..ready) {
+            crate::trace::step(|| format!("sends edit {} ({} ops)", txn.id, txn.ops.len()));
             remote.link.send(remote.epoch, ClientMsg::Submit(txn));
         }
     }
@@ -994,6 +1009,17 @@ impl Session {
             let Some(event) = remote.link.poll() else {
                 return;
             };
+            if let LinkEvent::Msg(ServerMsg::Event(e)) = &event {
+                crate::trace::step(|| {
+                    let blobs: Vec<String> = e
+                        .ops
+                        .iter()
+                        .flat_map(|op| op.blobs())
+                        .map(|h| crate::trace::short(&h))
+                        .collect();
+                    format!("receives event {} from {:?}, settings {blobs:?}", e.seq, e.actor)
+                });
+            }
             match event {
                 LinkEvent::Welcome { epoch, welcome } => {
                     let Welcome {
@@ -1047,6 +1073,9 @@ impl Session {
                 },
                 LinkEvent::Stored { hash, outcome } => match outcome {
                     Upload::Stored => {
+                        crate::trace::step(|| {
+                            format!("upload {} stored by the server", crate::trace::short(&hash))
+                        });
                         self.uploads.remove(&hash);
                         self.flush_outgoing();
                     }
@@ -1056,6 +1085,7 @@ impl Session {
                 },
                 LinkEvent::Fetched { hash, bytes } => {
                     self.fetching.remove(&hash);
+                    crate::trace::step(|| format!("download {} arrived", crate::trace::short(&hash)));
                     self.audio.blob_arrived(hash, bytes);
                 }
                 LinkEvent::Msg(ServerMsg::Rejected { txn, reason }) => {

@@ -15,6 +15,7 @@
 //! `add-notes <track> <clip> <beat>:<pitch>[,...]`, `set-note <track> <clip> <index> pitch|vel <value>`,
 //! `note-pitch <track> <clip> <index>`, `add-plugin <track> clap:<id>`,
 //! `plugin-param <track> <param id> <value>`, `shown-param <track> <param id>`,
+//! `watch <track>`, `quiet-param <track> <param id> <normalised value>`,
 //! `plugin-state <track>`, `save-states`,
 //! `device-status <track>`, `render <file> <from tick> <to tick>`, `play`, `stop`, `seek <tick>`,
 //! `state`, `sleep <ms>`, `notices`, `crash`, `quit`.
@@ -442,6 +443,35 @@ impl Driver {
                     std::thread::sleep(Duration::from_millis(5));
                 }
                 self.session.set_plugin_param(track, device, &param, value);
+                Ok(())
+            }
+            "watch" => {
+                // Looks at the plugin's settings as its open window would make the client do.
+                let track = self.track(arg(1)?)?;
+                let device = self.plugin_device(track)?;
+                let audio = self.session.audio_mut();
+                let te = audio
+                    .as_any_mut()
+                    .downcast_mut::<TracktionAudio>()
+                    .ok_or("not on Tracktion")?;
+                te.watch(device);
+                Ok(())
+            }
+            "quiet-param" => {
+                // Changes a parameter in the engine without the plugin reporting it, as a plugin
+                // that loads a preset without a word to the host.
+                let track = self.track(arg(1)?)?;
+                let param = arg(2)?.to_string();
+                let value: f32 = num(words.get(3), "value")?;
+                let device = self.plugin_device(track)?;
+                let audio = self.session.audio_mut();
+                let te = audio
+                    .as_any_mut()
+                    .downcast_mut::<TracktionAudio>()
+                    .ok_or("not on Tracktion")?;
+                te.engine()
+                    .device_set_param(device.0.0, &param, value)
+                    .map_err(|e| e.message)?;
                 Ok(())
             }
             "shown-param" => {

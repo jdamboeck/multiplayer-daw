@@ -428,6 +428,25 @@ fn two_clients_build_play_and_tweak_one_song() {
     assert_eq!(ben.seq(), seq4, "4: no bounce on ben's side");
     assert_eq!(ann.hash(), ben.hash(), "4: same document");
 
+    // 4b. A plugin that changes without telling the host (some load presets so): while its
+    //     window is open the client looks at its settings, and the change travels all the same.
+    ann.cmd("watch Synth");
+    ann.cmd("sleep 1200");
+    assert_eq!(ann.seq(), seq4, "4b: looking alone changes nothing");
+    ann.cmd("quiet-param Synth 0 0.6");
+    let looked = Instant::now();
+    ben.wait_seq(seq4 + 1);
+    let took = looked.elapsed().as_millis();
+    ben.cmd("sleep 300");
+    let ben_now = shown(&mut ben);
+    println!("RESULT 4b: found_and_arrived_ms={took} ben_shows_level={ben_now:.3}");
+    assert!(
+        (ben_now - 0.6).abs() < 1e-3,
+        "4b: ben has the unreported change, not {ben_now}"
+    );
+    ann.cmd("sleep 1500");
+    assert_eq!(ann.seq(), seq4 + 1, "4b: found once, not again and again");
+
     ann.quit();
     ben.quit();
     server.stop();
