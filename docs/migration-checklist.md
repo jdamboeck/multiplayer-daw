@@ -16,7 +16,7 @@ the mission: bridge (4), collaborative slice (5), reliability (6), retire the Ru
 | `mdaw-proto`: framing, hello/welcome, submit, events, snapshots, blobs | unchanged in shape |
 | Blob store (content-addressed) | becomes the asset store for audio files and large plugin state |
 | `mdaw-client`: egui app, arrange, piano roll, device strip, undo | the UI |
-| `mdaw-test-plugin` | the misbehaving-plugin tests use it against Tracktion too |
+| `mdaw-test-plugin` | the CLAP synth the Tracktion tests play and send settings to; its misbehave switch was removed 2026-11-15 (the failure tests are the bridge's C fixtures in `bad_clap.c`: a plugin that crashes or hangs while it is scanned) |
 | `xtask` demo and release tooling | gains the native build step |
 
 ## Replace

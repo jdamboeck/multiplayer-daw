@@ -123,20 +123,17 @@ MDAW_SHOTS=/some/dir cargo test -p mdaw-client --test ui_net -- --ignored screen
 
 ## License
 
-Copyright (C) 2026 the mdaw authors.
+Copyright (C) 2026 the mdaw authors. Two licences apply, by component:
 
-This program is free software: you can redistribute it and/or modify it under the terms of the GNU
-General Public License, version 3, as published by the Free Software Foundation. It is distributed
-in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
-
-Which licence applies to what:
-
-- The server (`mdaw-server`) and the libraries (`mdaw-model`, `mdaw-proto`, `mdaw-sync`,
-  `mdaw-net`, `mdaw-test-plugin`, `xtask`): GPL-3.0-only, [LICENSE](LICENSE).
 - The client (`mdaw-client`, the `mdaw` executable and `mdaw-plugin-scan`) and the bridge crates
-  (`mdaw-tracktion`, `mdaw-tracktion-sys`, with `native/`): AGPL-3.0-only,
-  [LICENSE-AGPL](LICENSE-AGPL). They link JUCE 8, which is AGPLv3 (or commercial), and Tracktion
-  Engine, which is GPLv3 (or commercial).
+  (`mdaw-tracktion`, `mdaw-tracktion-sys`, with `native/`): the GNU Affero General Public
+  License, version 3 only (AGPL-3.0-only), [LICENSE-AGPL](LICENSE-AGPL). They link JUCE 8,
+  which is AGPLv3 (or commercial), and Tracktion Engine, which is GPLv3 (or commercial).
+- Everything else: the server (`mdaw-server`) and the libraries (`mdaw-model`, `mdaw-proto`,
+  `mdaw-sync`, `mdaw-net`, `mdaw-test-plugin`, `xtask`): the GNU General Public License,
+  version 3 only (GPL-3.0-only), [LICENSE](LICENSE).
 
-The release archives carry both texts.
+Each is free software: you can redistribute it and/or modify it under the terms of its licence,
+as published by the Free Software Foundation. It is distributed in the hope that it will be
+useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+FITNESS FOR A PARTICULAR PURPOSE. The release archives carry both texts.

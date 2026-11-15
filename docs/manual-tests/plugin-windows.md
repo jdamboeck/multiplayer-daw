@@ -26,7 +26,8 @@ around a slow moment into Findings.
 
 ## 0. Preparation
 
-- [ ] **0.1** `cmake --build target/native` — Expect: finishes without errors.
+- [ ] **0.1** `cargo build` (it configures and builds the native part in `target/native`) —
+      Expect: finishes without errors.
 - [ ] **0.2** `MDAW_TRACE=1 cargo xtask demo --fresh`
       Expect: two windows, Ann and Ben. "Scanning plugins…" shows for a few seconds (a cold scan
       of everything installed; about 4 s on the development machine) and goes away. Both

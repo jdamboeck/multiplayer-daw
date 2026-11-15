@@ -24,7 +24,7 @@ Things under [Known gaps](#known-gaps-not-failures) are not failures.
 
 ## 0. Preparation
 
-- [ ] **0.1** `cmake --build target/native --target mdaw_tracktion_bridge mdaw-plugin-scan`
+- [ ] **0.1** `cargo build` (it configures and builds the native part in `target/native`)
       Expect: finishes without errors (quick if the native part was built before).
 - [ ] **0.2** `cargo xtask demo --fresh`
       Expect: after the build, a server line in the terminal and two windows, Ann and Ben.

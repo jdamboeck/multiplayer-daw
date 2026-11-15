@@ -141,6 +141,38 @@ The bridge builds on Linux only (`mdaw-tracktion-sys/build.rs` refuses other tar
 No release is tagged before step 8: steps 5 and 6 together make the first release that
 links JUCE, and it has to carry the AGPLv3 text.
 
+## Deviations
+
+What was done differently from the steps above, found after the fact or by two reviews.
+
+- *SilentAudio stays in tests.* Step 3 meant to port `ui.rs`, `ui_net.rs`, `playback.rs` and
+  `net.rs` to Tracktion. Two kinds of tests stay on `SilentAudio` (no sound, a transport moved
+  by the clock or by hand): those with two clients in one process (`ui_net.rs`, `net.rs`;
+  Tracktion allows one engine per process), and those that need the playhead to move
+  (`playback.rs`, and in `ui.rs` playing, the loop and recording): without an audio device
+  Tracktion's transport does not move. The other single-window tests of `ui.rs` moved to
+  Tracktion in the cleanup below.
+- *Work moved between steps.* Dropping `alloc_guard` and the global allocator went from step 2
+  to step 3 (they guarded the old engine's real-time thread, which `--old-engine` ran until
+  then). The old Pocket panel in `ui/devices.rs` went from step 4 to step 3: step 3 stopped playing
+  the old Pocket and showed it as "Pocket (old engine)" with a button for the built-in
+  instrument; step 4 removed the variant. The release
+  stopped building `mdaw-plugin-host` in step 4 (with the crate) instead of 5. Copying the
+  scanner into the release went from step 1 to step 5 (step 1 did it for xtask only).
+- *`TrackSound::Crashed` was renamed `Failed`* instead of going away: Tracktion reports a plugin
+  that failed to load through it ("plugin failed" in the track header, "Try again" in the device
+  tab).
+- *The outbox format file.* Step 4 renumbered the wire and store formats; the client's outbox
+  now records the protocol its unsent edits are encoded in (`format` in the outbox folder) and
+  refuses one of another protocol that still holds edits, instead of misreading them.
+- *Cleanup after the reviews* (2026-11-15): the Tracktion crate's tests copy the test synth
+  themselves (9353161); a plugin state the plugin refuses is reported by the bridge and tested
+  again (7b9c33f); the test synth's misbehave switch is gone (12c9405); the single-window UI
+  tests run on Tracktion (5a5396a); dead code from the old engine's paths goes, among it the
+  UI thread's blob downloads (the engine's fetcher is the only way) and unused dependencies
+  (ec2ed7d); `--no-clap` and `xtask demo --tracktion` go, and the bridge's build script says
+  that only Linux is supported (23f0419); the docs are corrected (this commit).
+
 ## Not part of this phase
 
 Failure-policy items 2 (a marker file for a plugin that crashes the app while loading) and 3

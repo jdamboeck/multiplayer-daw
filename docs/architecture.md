@@ -63,7 +63,7 @@ link JUCE 8 (README, "License").
 | `mdaw-client` | 10.2k | egui app: arrange, piano roll, devices, changelog; the outbox; the engine worker and its scheduler; MIDI input (midir) and the clock for recording |
 | `mdaw-tracktion-sys` | 0.4k | Declarations of the bridge's C header; its build script runs the CMake build in `target/native` |
 | `mdaw-tracktion` | 2.6k | Safe `Engine`; brings the canonical project into the engine whole or by difference (`sync_project`) |
-| `mdaw-test-plugin` | 0.5k | CLAP synth that can fail, stall, hang or crash on request |
+| `mdaw-test-plugin` | 0.5k | A small, deterministic CLAP synth for the tests (the failure tests use the bridge's C fixtures, `native/tracktion-bridge/test/bad_clap.c`) |
 | `native/tracktion-bridge` | 6.6k | The C ABI (`include/mdaw_engine.h`) over Tracktion Engine and JUCE; the plugin scanner `mdaw-plugin-scan` |
 | `native/clap-format` | 1.1k | CLAP hosting as a JUCE `AudioPluginFormat` (ADR 0002) |
 
