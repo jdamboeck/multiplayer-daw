@@ -447,95 +447,6 @@ int cmdLatency (const juce::StringArray& args)
     return ok ? 0 : 1;
 }
 
-/// What a misbehaving plugin does to a host that runs it in its own process, which is how
-/// Tracktion runs every plugin. The repo's CLAP test synth misbehaves on request when it is
-/// sent note 0: --mode fail (its processing reports an error), slow (every block takes 50 ms),
-/// hang (processing never returns) or crash (it aborts the process).
-int cmdMisbehave (const juce::StringArray& args)
-{
-    auto engine = makeEngine (false);
-    if (auto error = openDevice (*engine, args); error.isNotEmpty()) { say ("could not open the device: " + error); return 1; }
-    auto& adm = engine->getDeviceManager().deviceManager;
-    auto* device = adm.getCurrentAudioDevice();
-    auto types = typesForFile (*engine, arg (args, "--file"), "CLAP");
-    if (types.isEmpty()) { say ("no plugin found"); return 1; }
-    const auto mode = arg (args, "--mode", "none");
-    const float value = mode == "fail" ? 1.0f : mode == "crash" ? 2.0f : mode == "slow" ? 3.0f : mode == "hang" ? 4.0f : 0.0f;
-    result ("mode", mode);
-
-    auto file = juce::File::createTempFile (".tracktionedit");
-    auto edit = makeEdit (*engine, file);
-    auto ext = addExternal (*edit, types[0], {});
-    if (ext == nullptr || ext->getAudioPluginInstance() == nullptr) { say ("could not load"); return 1; }
-    // The switch is not automatable, so Tracktion does not list it: set it on the instance.
-    bool armed = value == 0.0f;
-    for (auto* p : ext->getAudioPluginInstance()->getParameters())
-        if (p->getName (64).containsIgnoreCase ("misbehave"))
-        {
-            p->setValue (value / 4.0f);
-            armed = true;
-        }
-    result ("armed", armed ? 1 : 0);
-    if (! armed) { say ("the plugin has no misbehave switch"); return 1; }
-    // The trigger: note 0, two seconds in.
-    auto track = te::getAudioTracks (*edit)[0];
-    dynamic_cast<te::MidiClip*> (track->getClips()[0])->getSequence()
-        .addNote (0, te::BeatPosition::fromBeats (4.0), te::BeatDuration::fromBeats (1.0), 100, 0, nullptr);
-    // A second track with a built-in synth, to see what becomes of the rest of the project.
-    edit->ensureNumberOfAudioTracks (2);
-    auto other = te::getAudioTracks (*edit)[1];
-    other->pluginList.insertPlugin (edit->getPluginCache().createNewPlugin (te::FourOscPlugin::xmlTypeName, {}), 0, nullptr);
-    other->insertMIDIClip ("Drone", { te::TimePosition::fromSeconds (0.0), te::TimePosition::fromSeconds (8.0) }, nullptr)
-        ->getSequence().addNote (45, te::BeatPosition::fromBeats (0.0), te::BeatDuration::fromBeats (16.0), 100, 0, nullptr);
-
-    // If the message thread gets stuck behind the audio thread, say so and leave.
-    std::atomic<int> stage { 0 };
-    std::thread watchdog ([&stage]
-    {
-        for (int i = 0; i < 150 && stage.load() < 3; ++i) juce::Thread::sleep (100);
-        if (stage.load() < 3)
-        {
-            std::cout << "RESULT message_thread_stuck_at_stage=" << stage.load() << std::endl << "RESULT ok=0" << std::endl;
-            std::_Exit (3);
-        }
-    });
-
-    auto& transport = edit->getTransport();
-    const int xrunsBefore = device->getXRunCount();
-    transport.ensureContextAllocated();
-    transport.setPosition (te::TimePosition::fromSeconds (0.0));
-    transport.play (false);
-    const auto before = keepPlaying (*edit, adm, 1700);
-    result ("position_before_trigger", transport.getPosition().inSeconds());
-    result ("peak_before_trigger", before.peak);
-    pump (800);   // the trigger is at 2.0 s
-    stage = 1;
-    auto level = adm.getOutputLevelGetter();
-    const double posA = transport.getPosition().inSeconds();
-    double peakAfter = 0, cpu = 0;
-    for (int i = 0; i < 100; ++i) { pump (20); peakAfter = juce::jmax (peakAfter, level->getCurrentLevel()); cpu = juce::jmax (cpu, adm.getCpuUsage()); }
-    const double posB = transport.getPosition().inSeconds();
-    result ("position_after_trigger", posA);
-    result ("position_2s_later", posB);
-    result ("position_advanced_seconds", posB - posA);
-    result ("still_playing", transport.isPlaying() ? 1 : 0);
-    result ("peak_after_trigger", peakAfter);
-    result ("max_cpu_after_trigger", cpu);
-    result ("xruns", device->getXRunCount() - xrunsBefore);
-    result ("clap_blocks_skipped", mdaw::clapHostCounters().blocksSkipped.load());
-    stage = 2;
-    transport.stop (false, false);
-    pump (300);
-    result ("stop_returned", 1);
-    stage = 3;
-    watchdog.join();
-    if (mode == "hang") { result ("ok", 1); std::cout.flush(); std::_Exit (0); }   // tearing down would wait for the audio thread
-    pump (300); edit.reset(); pump (300);
-    file.deleteFile();
-    result ("ok", 1);
-    return 0;
-}
-
 /// Opens the plugin's own editor in a native window next to nothing at all, twice, and checks
 /// that a change made the way an editor makes it reaches Tracktion's parameter.
 int cmdEditor (const juce::StringArray& args)
@@ -635,7 +546,6 @@ int pluginCommands (const juce::String& cmd, const juce::StringArray& args)
 {
     if (cmd == "scan")   return cmdScan (args);
     if (cmd == "latency") return cmdLatency (args);
-    if (cmd == "misbehave") return cmdMisbehave (args);
     if (cmd == "plugin") return cmdPlugin (args);
     if (cmd == "editor") return cmdEditor (args);
     return -1;

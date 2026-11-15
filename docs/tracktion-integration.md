@@ -99,7 +99,6 @@ $S scan --format VST3|CLAP|LV2 [--oop]            # --oop: scan in a child proce
 $S plugin  --file <path> --format <fmt> [--param <name>] [--list-params]
 $S latency --file <path> --format <fmt> [--set Name=value]   # e.g. Mix=0, so the plugin passes its input through
 $S editor  --file <path> --format <fmt> [--hold <ms>]
-$S misbehave --file <test-synth.clap> --mode none|fail|slow|hang|crash
 ```
 
 The demo for "MIDI playback and offline render": `play` plays an eight-second MIDI clip through
@@ -156,7 +155,9 @@ changed from the host side while the editor is open reaches the engine. Screensh
 CLAP editors of ChowKick, Vital, RF-76 and Odin2 show their full interfaces. Turning a knob
 with the mouse is in the manual test.
 
-Misbehaving plugin, during live playback, using the repo's CLAP test synth:
+Misbehaving plugin, during live playback, using the repo's CLAP test synth (measured with the
+spike's `misbehave` command and a switch the test synth had then; both were removed on
+2026-11-15, so this cannot be run again as it stands):
 
 | Mode | What happened |
 |---|---|

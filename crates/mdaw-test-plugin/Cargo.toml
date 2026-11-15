@@ -10,8 +10,8 @@ publish.workspace = true
 [lints]
 workspace = true
 
-# A library for loading it in-process in tests, and a `.clap` file (rename the built library)
-# for trying it in any host.
+# A library for the tests' `clap_folder`, and a `.clap` file (the built cdylib, renamed) for
+# the tests and for trying it in any host.
 [lib]
 crate-type = ["rlib", "cdylib"]
 

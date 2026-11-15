@@ -67,6 +67,10 @@ close button ends that round early.
 
 ## C. A plugin that misbehaves
 
+History: the test synth's misbehave switch and the spike's `misbehave` command were removed on
+2026-11-15; this section can no longer be run. The results are in
+`docs/tracktion-integration.md`, "Results: plugins".
+
 These use the project's test synth, built as a CLAP plugin:
 
 ```sh

@@ -21,7 +21,7 @@ Options:
   --release         Use optimised builds.
   --no-plugins      Clients load no plugins; tracks with plugins are silent in them.
   --test-synth      Clients also offer the test synth (mdaw-test-plugin as a CLAP file, put
-                    first on the clients' CLAP_PATH), a plugin that can be told to fail.
+                    first on the clients' CLAP_PATH).
   --tracktion       Accepted and ignored: clients always play through Tracktion Engine (the
                     build needs the native part, see docs/tracktion-integration.md).
 
