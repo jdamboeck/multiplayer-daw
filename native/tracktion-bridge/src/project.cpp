@@ -1,5 +1,6 @@
 #include "project.h"
 #include "clap_format.h"
+#include "trace.h"
 
 #include <algorithm>
 #include <cmath>
@@ -283,6 +284,7 @@ struct Project::Editor : juce::DocumentWindow
     }
 
     bool closedByUser = false;
+    uint64_t token = 0;   // of the last mdaw_device_show_editor that showed it
 };
 
 //==============================================================================
@@ -369,7 +371,7 @@ void Project::forgetProject()
     offlinePosition = 0;
     seekPending = false;
     shared.playing = 0;
-    closeAllEditors();
+    closeAllEditors (true);
     for (auto& [id, d] : devices)
         d->detach();
     devices.clear();
@@ -739,6 +741,7 @@ void Project::deviceAdd (uint64_t trackId, uint64_t id, uint64_t after, const ju
     if (t == nullptr)
         return;
 
+    const auto started = nowMs();
     te::Plugin::Ptr plugin;
     if (format == "builtin")
     {
@@ -779,6 +782,9 @@ void Project::deviceAdd (uint64_t trackId, uint64_t id, uint64_t after, const ju
         plugin->deleteFromParent();
         fail (MDAW_ERR_PLUGIN, "could not load " + identifier + ": " + error);
     }
+    if (traceOn())
+        trace ("device add " + juce::String ((juce::int64) id) + " " + format + " " + identifier + " ("
+               + plugin->getName() + "): plugin made in " + ms (nowMs() - started) + " ms");
     auto d = std::make_unique<Device> (*this, id, trackId, plugin);
     // Taken before anything is applied: what mdaw_device_reset_state returns to.
     if (auto* pi = d->instance())
@@ -793,7 +799,7 @@ void Project::removeDevice (uint64_t id)
     auto it = devices.find (id);
     if (it == devices.end())
         return;
-    closeEditor (id);
+    closeEditor (id, true);
     auto plugin = it->second->plugin;
     devices.erase (it);
     plugin->deleteFromParent();
@@ -921,16 +927,23 @@ juce::MemoryBlock Project::deviceGetState (uint64_t id)
     auto* d = device (id);
     if (d == nullptr)
         return block;
+    const auto started = nowMs();
     d->plugin->flushPluginStateToValueTree();
-    if (auto* pi = d->instance())
+    if (d->instance() != nullptr)
     {
-        pi->getStateInformation (block);
+        // The flush has just asked the plugin for its state (getStateInformation) and put it
+        // into Tracktion's tree; taken from there, so the plugin saves once per read, not twice.
+        if (auto chunk = d->plugin->state[te::IDs::state].toString(); chunk.isNotEmpty())
+            block.fromBase64Encoding (chunk);
     }
     else
     {
         juce::MemoryOutputStream out (block, false);
         d->plugin->state.writeToStream (out);
     }
+    if (traceOn())
+        trace ("device get state " + juce::String ((juce::int64) id) + ": " + juce::String ((juce::int64) block.getSize())
+               + " bytes in " + ms (nowMs() - started) + " ms");
     return block;
 }
 
@@ -1025,60 +1038,220 @@ void Project::parameterMoved (Device& d, te::AutomatableParameter& p)
 }
 
 //==============================================================================
-void Project::deviceShowEditor (uint64_t id, bool show)
+void Project::deviceShowEditor (uint64_t id, bool show, uint64_t token)
 {
-    auto* d = device (id);
-    if (d == nullptr)
-        return;
     if (! show)
     {
-        closeEditor (id);
+        closeEditor (id, false);
         return;
     }
+    auto* d = device (id);
+    if (d == nullptr)
+        fail (MDAW_ERR_NOT_FOUND, "no such device");
     if (auto it = editors.find (id); it != editors.end())
     {
-        it->second->setVisible (true);
-        it->second->toFront (true);
+        // Also a window the user has just closed: it stays, the timer does not delete it.
+        auto& window = *it->second;
+        window.closedByUser = false;
+        window.token = token;
+        window.setVisible (true);
+        window.toFront (true);
+        if (traceOn())
+            trace ("show editor " + juce::String ((juce::int64) id) + ": window was there, brought to the front");
         return;
     }
+
+    const auto t0 = nowMs();
     auto* pi = d->instance();
-    if (pi == nullptr || ! pi->hasEditor())
+    const bool has = pi != nullptr && pi->hasEditor();
+    const auto t1 = nowMs();
+    const auto describe = [&]
+    {
+        return "show editor " + juce::String ((juce::int64) id) + " " + d->plugin->getName()
+               + (pi != nullptr ? " (" + pi->getPluginDescription().pluginFormatName + ")" : juce::String (" (built-in)"));
+    };
+    if (! has)
         fail (MDAW_ERR_NOT_FOUND, "the device has no editor of its own");
     auto* editor = pi->createEditorIfNeeded();
+    const auto t2 = nowMs();
     if (editor == nullptr)
+    {
+        if (traceOn())
+            trace (describe() + ": hasEditor " + ms (t1 - t0) + " ms, createEditorIfNeeded " + ms (t2 - t1) + " ms, made no editor");
         fail (MDAW_ERR_PLUGIN, "the plugin made no editor");
-    editors[id] = std::make_unique<Editor> (d->plugin->getName() + " - " + config.appName, editor);
+    }
+    auto window = std::make_unique<Editor> (d->plugin->getName() + " - " + config.appName, editor);
+    window->token = token;
+    editors[id] = std::move (window);
+    const auto t3 = nowMs();
+    if (traceOn())
+    {
+        trace (describe() + ": hasEditor " + ms (t1 - t0) + " ms, createEditorIfNeeded " + ms (t2 - t1)
+               + " ms, window and setVisible " + ms (t3 - t2) + " ms; open editors " + juce::String ((int) editors.size())
+               + ", scan running " + juce::String (shared.scanning.load() ? "yes" : "no"));
+        // The closest JUCE lets us come to "first paint" of a native plugin window: the next
+        // turn the message loop gets after the window was shown.
+        juce::MessageManager::callAsync ([id, t3]
+        {
+            trace ("show editor " + juce::String ((juce::int64) id) + ": first loop turn after show " + ms (nowMs() - t3) + " ms");
+        });
+    }
 }
 
-void Project::closeEditor (uint64_t id)
+void Project::editorClosedEvent (uint64_t device, uint64_t token)
 {
-    editors.erase (id);
+    mdaw_event e {};
+    e.kind = MDAW_EVENT_EDITOR_CLOSED;
+    e.device = device;
+    e.token = token;
+    shared.push (e);
 }
 
-void Project::closeAllEditors()
+void Project::closeEditor (uint64_t id, bool notify)
 {
-    editors.clear();
+    auto it = editors.find (id);
+    if (it == editors.end())
+        return;
+    const auto token = it->second->token;
+    editors.erase (it);
+    if (notify)
+        editorClosedEvent (id, token);
+}
+
+void Project::closeAllEditors (bool notify)
+{
+    while (! editors.empty())
+        closeEditor (editors.begin()->first, notify);
+}
+
+bool Project::testEditorPressClose (uint64_t id)
+{
+    auto it = editors.find (id);
+    if (it == editors.end())
+        return false;
+    it->second->closeButtonPressed();
+    return true;
+}
+
+bool Project::testEditorState (uint64_t id, bool& visible, uint64_t& token) const
+{
+    auto it = editors.find (id);
+    if (it == editors.end())
+        return false;
+    visible = it->second->isVisible();
+    token = it->second->token;
+    return true;
 }
 
 //==============================================================================
-void Project::pluginsScan (const juce::String& format)
+juce::AudioPluginFormat* Project::formatNamed (const juce::String& name) const
+{
+    for (auto* fmt : engine->getPluginManager().pluginFormatManager.getFormats())
+        if (fmt->getName() == name)
+            return fmt;
+    return nullptr;
+}
+
+Project::ScanPlan Project::scanStart (const juce::String& format)
 {
     if (! config.enablePlugins)
         fail (MDAW_ERR_NOT_FOUND, "plugins are switched off in this engine");
-    for (auto* fmt : engine->getPluginManager().pluginFormatManager.getFormats())
+    auto* fmt = formatNamed (format);
+    if (fmt == nullptr)
+        fail (MDAW_ERR_NOT_FOUND, "no plugin format '" + format + "'");
+
+    ScanPlan plan;
+    plan.format = format;
+    if (! usesScanner())
     {
-        if (fmt->getName() != format)
-            continue;
-        if (usesScanner())
-            scanWithScanner (*fmt);
-        else
-            scanInProcess (*fmt);
-        engine->getPropertyStorage().flushSettingsToDisk();
-        pluginIds->save();
-        scanRecords->save();
-        return;
+        scanInProcess (*fmt);
+        scanFinish (plan);
+        return plan;
     }
-    fail (MDAW_ERR_NOT_FOUND, "no plugin format '" + format + "'");
+    if (! config.scanner.existsAsFile())
+        fail (MDAW_ERR_NOT_FOUND, "the plugin scanner " + config.scanner.getFullPathName() + " does not exist");
+
+    // Lists the candidates without loading any: the VST3 and CLAP formats list files by name;
+    // the LV2 format reads the bundles' RDF data with lilv, which runs no plugin code (except
+    // an LV2 dynamic manifest, a deprecated extension: JUCE's LV2 format loads those already
+    // when the engine is created, scanner or not).
+    plan.staged = true;
+    plan.candidates = fmt->searchPathsForPlugins (fmt->getDefaultLocationsToSearch(), true, false);
+    scanRecords->keepOnly (format, plan.candidates);
+    plan.scanner = config.scanner;
+    plan.timeoutMs = scanTimeoutMs();
+    const auto tag = juce::Uuid().toString();
+    plan.result = config.settingsDir.getChildFile ("scan-result-" + tag + ".xml");
+    plan.log = config.settingsDir.getChildFile ("scan-log-" + tag + ".txt");
+    return plan;
+}
+
+std::vector<Project::ScanDecision> Project::scanDecide (const ScanPlan& plan, int from, int to)
+{
+    std::vector<ScanDecision> out;
+    auto* fmt = formatNamed (plan.format);
+    if (fmt == nullptr)
+        fail (MDAW_ERR_NOT_FOUND, "no plugin format '" + plan.format + "'");
+    auto& known = engine->getPluginManager().knownPluginList;
+    for (int i = from; i < to && i < plan.candidates.size(); ++i)
+    {
+        ScanDecision decision;
+        decision.file = plan.candidates[i];
+        decision.stamp = candidateStamp (*fmt, decision.file);
+        decision.examine = true;
+        if (auto* record = scanRecords->find (plan.format, decision.file); record != nullptr && record->stamp == decision.stamp)
+        {
+            if (! record->ok)
+            {
+                decision.examine = false;   // crashed, hung or empty, and not changed since
+            }
+            else
+            {
+                // Examined before: still known, with an id for every plugin in it?
+                bool complete = false;
+                for (auto& d : known.getTypes())
+                    if (d.pluginFormatName == plan.format && d.fileOrIdentifier == decision.file)
+                    {
+                        complete = pluginIds->knows (d);
+                        if (! complete)
+                            break;
+                    }
+                decision.examine = ! complete;
+            }
+        }
+        out.push_back (decision);
+    }
+    return out;
+}
+
+void Project::scanMerge (const juce::String& format, const ScanDecision& decision, const Examined& examined)
+{
+    if (examined.cancelled || examined.startError.isNotEmpty())
+        return;
+    auto& known = engine->getPluginManager().knownPluginList;
+    // Whatever was known of the file before goes; what the scanner found now takes its place.
+    for (auto& d : known.getTypes())
+        if (d.pluginFormatName == format && d.fileOrIdentifier == decision.file)
+            known.removeType (d);
+    for (auto& [d, id] : examined.found)
+    {
+        known.addType (d);
+        pluginIds->remember (d, id);
+    }
+    scanRecords->put (format, decision.file, examined.entry);
+}
+
+void Project::scanFinish (const ScanPlan& plan)
+{
+    engine->getPropertyStorage().flushSettingsToDisk();
+    pluginIds->save();
+    scanRecords->save();
+    if (plan.staged)
+    {
+        plan.result.deleteFile();
+        plan.result.getSiblingFile (plan.result.getFileName() + ".part").deleteFile();
+        plan.log.deleteFile();
+    }
 }
 
 void Project::scanInProcess (juce::AudioPluginFormat& fmt)
@@ -1116,121 +1289,6 @@ juce::int64 Project::candidateStamp (juce::AudioPluginFormat& fmt, const juce::S
         return found.isEmpty() ? 0 : found[0]->lastFileModTime.toMilliseconds();
     }
     return juce::File::isAbsolutePath (file) ? stampOf (juce::File (file)) : 0;
-}
-
-/// Every candidate file is examined by mdaw-plugin-scan in a child process, one after the
-/// other, unless it was examined before and has not changed since. This thread waits for each
-/// child with plain blocking waits and runs no message loop meanwhile (doc point 14).
-void Project::scanWithScanner (juce::AudioPluginFormat& fmt)
-{
-    if (! config.scanner.existsAsFile())
-        fail (MDAW_ERR_NOT_FOUND, "the plugin scanner " + config.scanner.getFullPathName() + " does not exist");
-    const auto format = fmt.getName();
-    auto& known = engine->getPluginManager().knownPluginList;
-
-    // Lists the candidates without loading any: the VST3 and CLAP formats list files by name;
-    // the LV2 format reads the bundles' RDF data with lilv, which runs no plugin code (except
-    // an LV2 dynamic manifest, a deprecated extension: JUCE's LV2 format loads those already
-    // when the engine is created, scanner or not).
-    const auto candidates = fmt.searchPathsForPlugins (fmt.getDefaultLocationsToSearch(), true, false);
-    scanRecords->keepOnly (format, candidates);
-
-    const auto timeout = scanTimeoutMs();
-    const auto tag = juce::Uuid().toString();
-    const auto result = config.settingsDir.getChildFile ("scan-result-" + tag + ".xml");
-    const auto log = config.settingsDir.getChildFile ("scan-log-" + tag + ".txt");
-    for (auto& file : candidates)
-    {
-        const auto stamp = candidateStamp (fmt, file);
-        if (auto* record = scanRecords->find (format, file); record != nullptr && record->stamp == stamp)
-        {
-            if (! record->ok)
-                continue;   // crashed, hung or empty, and not changed since
-            // Examined before: still known, with an id for every plugin in it?
-            bool complete = false;
-            for (auto& d : known.getTypes())
-                if (d.pluginFormatName == format && d.fileOrIdentifier == file)
-                {
-                    complete = pluginIds->knows (d);
-                    if (! complete)
-                        break;
-                }
-            if (complete)
-                continue;
-        }
-        examineInChild (fmt, file, stamp, result, log, timeout);
-    }
-    result.deleteFile();
-    result.getSiblingFile (result.getFileName() + ".part").deleteFile();
-    log.deleteFile();
-}
-
-namespace
-{
-/// The last line the scanner wrote to stderr (it says why it gave up), shortened.
-juce::String lastLineOf (const juce::File& log)
-{
-    auto lines = juce::StringArray::fromLines (log.loadFileAsString());
-    lines.removeEmptyStrings();
-    auto last = lines.isEmpty() ? juce::String ("(nothing)") : lines[lines.size() - 1].trim();
-    return last.length() > 300 ? last.substring (0, 300) + "..." : last;
-}
-
-juce::String signalName (int signal)
-{
-   #if JUCE_LINUX || JUCE_MAC || JUCE_BSD
-    if (const char* name = strsignal (signal))
-        return juce::String (signal) + ", " + name;
-   #endif
-    return juce::String (signal);
-}
-} // namespace
-
-void Project::examineInChild (juce::AudioPluginFormat& fmt, const juce::String& file, juce::int64 stamp,
-                              const juce::File& result, const juce::File& log, int timeoutMs)
-{
-    const auto format = fmt.getName();
-    auto& known = engine->getPluginManager().knownPluginList;
-    result.deleteFile();
-    const auto outcome = runChild (config.scanner, { format, file, result.getFullPathName() }, log, timeoutMs);
-    if (! outcome.started)
-        fail (MDAW_ERR_INTERNAL, "the plugin scanner could not be started: " + outcome.error);
-
-    // Whatever was known of the file before goes; what the scanner found now takes its place.
-    for (auto& d : known.getTypes())
-        if (d.pluginFormatName == format && d.fileOrIdentifier == file)
-            known.removeType (d);
-
-    ScanRecords::Entry entry { stamp, false, {} };
-    if (outcome.timedOut)
-        entry.reason = "hung: no result within " + juce::String (timeoutMs) + " ms, so the scanner was stopped";
-    else if (outcome.signalled)
-        entry.reason = "crashed while being examined (signal " + signalName (outcome.signal) + ")";
-    else if (outcome.exited && outcome.code != 0)
-        entry.reason = "the scanner could not examine it (exit status " + juce::String (outcome.code) + "): " + lastLineOf (log);
-    else if (! outcome.exited && ! result.existsAsFile())
-        entry.reason = "the scanner ended without a result; " + outcome.error;
-    else if (auto xml = juce::XmlDocument::parse (result); xml == nullptr || ! xml->hasTagName ("MDAW_PLUGIN_SCAN"))
-        entry.reason = "the scanner gave no readable result";
-    else
-    {
-        // Only plugins whose own id could be read are of use: they are named by it.
-        for (auto* found : xml->getChildWithTagNameIterator ("FOUND"))
-        {
-            juce::PluginDescription d;
-            const auto id = found->getStringAttribute ("id");
-            if (auto* p = found->getChildByName ("PLUGIN"); p != nullptr && d.loadFromXml (*p) && id.isNotEmpty()
-                                                            && d.pluginFormatName == format && d.fileOrIdentifier == file)
-            {
-                known.addType (d);
-                pluginIds->remember (d, id);
-                entry.ok = true;
-            }
-        }
-        if (! entry.ok)
-            entry.reason = "no plugin found in it (not a plugin, or it failed to load)";
-    }
-    scanRecords->put (format, file, entry);
 }
 
 std::vector<std::pair<juce::PluginDescription, juce::String>> Project::loadablePlugins()
@@ -1545,11 +1603,9 @@ void Project::timerCallback()
     {
         if (it->second->closedByUser)
         {
-            mdaw_event e {};
-            e.kind = MDAW_EVENT_EDITOR_CLOSED;
-            e.device = it->first;
-            shared.push (e);
+            const auto device = it->first, token = it->second->token;
             it = editors.erase (it);
+            editorClosedEvent (device, token);
         }
         else
         {

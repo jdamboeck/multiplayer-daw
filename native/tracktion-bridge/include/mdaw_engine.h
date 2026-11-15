@@ -5,6 +5,9 @@
  *  - Threads. Every function may be called from any thread except a real-time audio thread.
  *    The engine runs its own message thread; a call is carried out there and returns when it is
  *    done. Calls are therefore serialised and may take milliseconds (loading a plugin: longer).
+ *    A plugin scan with a scanner is the exception: it blocks its caller until it is done, but
+ *    holds the engine's thread only for short steps, so other calls are carried out meanwhile
+ *    (see mdaw_plugins_scan).
  *  - No callbacks. The engine never calls into the application, from any thread. What the
  *    engine has to say is read with mdaw_engine_state() and mdaw_engine_poll_event().
  *  - No exceptions cross this interface. Functions return MDAW_OK or an error code;
@@ -33,7 +36,7 @@
 extern "C" {
 #endif
 
-#define MDAW_ABI_VERSION 4
+#define MDAW_ABI_VERSION 5
 #define MDAW_TICKS_PER_QUARTER 960
 
 typedef struct mdaw_engine mdaw_engine;
@@ -45,7 +48,8 @@ typedef enum mdaw_status {
     MDAW_ERR_DEVICE = 3,     /* the audio device could not be opened or changed */
     MDAW_ERR_PLUGIN = 4,     /* the plugin could not be loaded */
     MDAW_ERR_IO = 5,         /* a file could not be read or written */
-    MDAW_ERR_INTERNAL = 6    /* anything else, including a C++ exception caught at the boundary */
+    MDAW_ERR_INTERNAL = 6,   /* anything else, including a C++ exception caught at the boundary */
+    MDAW_ERR_CANCELLED = 7   /* ABI 5. Plugin scans were cancelled (mdaw_plugins_scan_cancel) */
 } mdaw_status;
 
 /* ---- life cycle ------------------------------------------------------------------------- */
@@ -169,14 +173,25 @@ size_t mdaw_device_params(mdaw_engine* engine, uint64_t device, char* buffer, si
 size_t mdaw_device_param_text(mdaw_engine* engine, uint64_t device, const char* param_id, float value,
                               char* buffer, size_t capacity);
 /* The plugin's opaque state. Reading flushes it from the plugin first. Returns the length
- * needed; 0 if the device does not exist or has no state. */
+ * needed; 0 if the device does not exist or has no state. A call that did not fit keeps the
+ * state it read for the calling thread's next call for the same device, so the second call
+ * returns the same bytes without asking the plugin again. Any other call from that thread in
+ * between (another device, a buffer that is still too small, any other function) drops what
+ * was kept. */
 size_t mdaw_device_get_state(mdaw_engine* engine, uint64_t device, uint8_t* buffer, size_t capacity);
 mdaw_status mdaw_device_set_state(mdaw_engine* engine, uint64_t device, const uint8_t* bytes, size_t length);
 /* Back to the state the plugin had when the device was made. The device keeps its id and
  * place. For a plugin that saves no state, every parameter goes back to its default. */
 mdaw_status mdaw_device_reset_state(mdaw_engine* engine, uint64_t device);
-/* The plugin's own window. Opening one that is open brings it to the front. */
-mdaw_status mdaw_device_show_editor(mdaw_engine* engine, uint64_t device, int32_t show);
+/* The plugin's own window; one per device at most.
+ * show != 0 opens it, or brings an open one to the front (also one the user has just closed,
+ * which then stays). `token` is the application's own number for this opening: the window
+ * keeps the token of the last call that showed it, and MDAW_EVENT_EDITOR_CLOSED carries it.
+ * A device that does not exist, or a plugin without a window of its own: MDAW_ERR_NOT_FOUND.
+ * The plugin failing to make its window: MDAW_ERR_PLUGIN. After a failure there is no window.
+ * show == 0 closes the window if there is one; closing one that is not open does nothing. It
+ * sends no event. token is not used then. */
+mdaw_status mdaw_device_show_editor(mdaw_engine* engine, uint64_t device, int32_t show, uint64_t token);
 
 /* ---- plugins on this machine -------------------------------------------------------------- */
 
@@ -186,8 +201,23 @@ mdaw_status mdaw_device_show_editor(mdaw_engine* engine, uint64_t device, int32_
  * until the file changes. Everything the engine needs to know about a plugin before loading it
  * — its description and its own id — is found out during the scan, so listing plugins and
  * adding a device never load a library just to look at it. Without a scanner all of this
- * happens in this process, and a plugin that crashes takes the application with it. */
+ * happens in this process, and a plugin that crashes takes the application with it.
+ * With a scanner the scan blocks the calling thread, not the engine: the engine's thread is
+ * held only for short steps (listing the files, deciding which to examine, taking in each
+ * file's result), and other calls are carried out in between, from other threads. Plugins
+ * known from earlier scans stay listed and loadable throughout; what a file turns out to hold
+ * replaces what was known of it as soon as that file is done. One scan at a time: a second
+ * one, from another thread, waits for the first. Without a scanner the whole scan holds the
+ * engine's thread, as every other call does.
+ * After mdaw_plugins_scan_cancel: MDAW_ERR_CANCELLED. */
 mdaw_status mdaw_plugins_scan(mdaw_engine* engine, const char* format);
+/* ABI 5. Cancels plugin scans, for shutting down: a scan in progress stops examining (its child
+ * process is killed at once and not recorded as failed), keeps what it had taken in and
+ * returns MDAW_ERR_CANCELLED; every later mdaw_plugins_scan returns MDAW_ERR_CANCELLED at once,
+ * for the rest of the engine's life. May be called from any thread; returns at once, without
+ * waiting for the engine's thread or for the scan. A scan without a scanner cannot be stopped
+ * in the middle. */
+mdaw_status mdaw_plugins_scan_cancel(mdaw_engine* engine);
 /* JSON array of {"format","identifier","name","vendor","instrument"}; returns the length needed.
  * identifier is as described at mdaw_device_add. The engine remembers scan results between
  * runs (in settings_dir), but lists only plugins it can load now: the format is enabled and
@@ -245,7 +275,10 @@ typedef enum mdaw_event_kind {
     MDAW_EVENT_NONE = 0,
     MDAW_EVENT_PARAM_CHANGED = 1,   /* in the plugin's own window; device, param_id, value */
     MDAW_EVENT_STATE_CHANGED = 2,   /* the plugin's state changed otherwise (preset loaded); device */
-    MDAW_EVENT_EDITOR_CLOSED = 3,   /* the user closed the plugin's window; device */
+    MDAW_EVENT_EDITOR_CLOSED = 3,   /* the plugin's window is gone, other than by
+                                       mdaw_device_show_editor(show 0): the user or the window
+                                       manager closed it, or its device was removed (also with
+                                       its track, or by mdaw_project_clear); device, token */
     MDAW_EVENT_DEVICE_CHANGED = 4,  /* the audio device or the device list changed */
     MDAW_EVENT_AUDIO_STALLED = 5    /* the audio callback has not returned for over a second */
 } mdaw_event_kind;
@@ -255,6 +288,7 @@ typedef struct mdaw_event {
     uint64_t device;
     float value;
     char param_id[64];
+    uint64_t token;      /* ABI 5. EDITOR_CLOSED: the token the window was last shown with */
 } mdaw_event;
 /* Returns 1 and fills *out if there was an event, 0 if not. Events caused by the application's
  * own calls (mdaw_device_set_param ...) are not reported. Call until it returns 0, every frame. */

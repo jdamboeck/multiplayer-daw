@@ -51,6 +51,17 @@ pub enum DeviceStatus {
     Failed(String),
 }
 
+/// Where a plugin's own window is, as far as this client knows.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EditorState {
+    Closed,
+    /// Asked to open; the engine has not answered yet.
+    Opening,
+    Open,
+    /// Asked to close; the engine has not answered yet.
+    Closing,
+}
+
 /// A plugin installed on this machine.
 #[derive(Clone, PartialEq, Debug)]
 pub struct PluginEntry {
@@ -166,7 +177,17 @@ pub trait Audio: Any {
     fn set_plugin_param(&mut self, track: TrackId, device: DeviceId, param: &str, value: f64);
     fn has_editor(&self, track: TrackId, device: DeviceId) -> bool;
     fn editor_open(&self, track: TrackId, device: DeviceId) -> bool;
-    /// Opens or closes the plugin's own window.
+    /// Where the plugin's window is, the moments between asking and the engine's answer
+    /// included. An engine that opens windows at once has only `Open` and `Closed`.
+    fn editor_state(&self, track: TrackId, device: DeviceId) -> EditorState {
+        if self.editor_open(track, device) {
+            EditorState::Open
+        } else {
+            EditorState::Closed
+        }
+    }
+    /// Opens or closes the plugin's own window (an engine may do it later; see
+    /// [`Audio::editor_state`]).
     fn toggle_editor(&mut self, track: TrackId, device: DeviceId, title: &str) -> Result<(), String>;
     /// Starts a crashed or failed plugin again, with the settings the document has.
     fn restart_plugin(&mut self, track: TrackId, device: DeviceId);

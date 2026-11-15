@@ -2,10 +2,12 @@
 // child per plugin file with a time limit, and remembering what became of each file.
 #pragma once
 
-#include <juce_core/juce_core.h>
+#include <juce_audio_processors/juce_audio_processors.h>
 
+#include <atomic>
 #include <map>
 #include <utility>
+#include <vector>
 
 namespace mdaw::bridge
 {
@@ -16,6 +18,7 @@ struct ChildOutcome
     bool exited = false;     // returned or called exit: `code`
     bool signalled = false;  // killed by a signal it did not catch (a crash): `signal`
     bool timedOut = false;   // still running at the deadline: killed
+    bool cancelled = false;  // the cancel flag was set while it ran: killed
     int code = 0;
     int signal = 0;
     juce::String error;
@@ -26,7 +29,10 @@ struct ChildOutcome
 /// (doc point 14). A child still running at the deadline is killed with SIGKILL together with
 /// everything in its process group (it is started as a group of its own), and always reaped:
 /// no zombie and no stray grandchild is left behind. Inherits no file descriptor but 0, 1, 2.
-ChildOutcome runChild (const juce::File& exe, const juce::StringArray& args, const juce::File& log, int timeoutMs);
+/// `cancel`, if given, is looked at while waiting (every few milliseconds): once it is true the
+/// child is killed and reaped the same way, and the outcome says `cancelled`.
+ChildOutcome runChild (const juce::File& exe, const juce::StringArray& args, const juce::File& log, int timeoutMs,
+                       const std::atomic<bool>* cancel = nullptr);
 
 /// What the scanner's limit is: MDAW_SCAN_TIMEOUT_MS if set to a positive number (tests),
 /// otherwise 30 s.
@@ -67,4 +73,24 @@ private:
     std::map<Key, Entry> entries;
     bool dirty = false;
 };
+
+/// What the scanner made of one candidate file. Plain data, made on the thread that ran the
+/// scanner; the message thread merges it into the known-plugin list, the ids and the records.
+struct Examined
+{
+    juce::String startError;     // not empty: the scanner could not be started
+    bool cancelled = false;      // killed because the scan was cancelled: nothing to merge
+    ScanRecords::Entry entry;    // what the records get for the file
+    /// What was found: JUCE's description and the plugin's own id, only those whose format and
+    /// file are the ones asked for and whose id could be read.
+    std::vector<std::pair<juce::PluginDescription, juce::String>> found;
+    double childMs = 0;          // how long the scanner ran
+};
+
+/// Runs the scanner on one candidate (format, file) with `result` and `log` as its files, and
+/// reads what it wrote. Touches nothing but those files: safe on any thread. `stamp` goes into
+/// the entry.
+Examined examineInChild (const juce::File& scanner, const juce::String& format, const juce::String& file,
+                         juce::int64 stamp, const juce::File& result, const juce::File& log, int timeoutMs,
+                         const std::atomic<bool>* cancel);
 } // namespace mdaw::bridge

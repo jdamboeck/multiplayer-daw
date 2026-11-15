@@ -63,3 +63,18 @@ required-features = ["tracktion"]
 [[test]]
 name = "ui_tracktion"
 required-features = ["tracktion"]
+
+# A benchmark of the engine worker behind plugin windows; ignored, run by hand (see the file).
+[[test]]
+name = "editor_latency"
+required-features = ["tracktion"]
+
+# How the engine worker schedules its jobs: scan, slow state reads, windows that fail, shutdown.
+[[test]]
+name = "engine_scheduling"
+required-features = ["tracktion"]
+
+# Plugin windows with a display; ignored, run by hand on a virtual one (see the file).
+[[test]]
+name = "editor_gui"
+required-features = ["tracktion"]

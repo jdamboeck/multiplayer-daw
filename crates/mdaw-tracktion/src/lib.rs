@@ -58,6 +58,8 @@ pub enum Status {
     /// Anything else, including a C++ exception caught at the boundary (and a second engine in
     /// one process). Also used for JSON the engine sent that did not parse.
     Internal,
+    /// Plugin scans were cancelled ([`Engine::plugins_scan_cancel`]).
+    Cancelled,
     /// A status this crate does not know (a newer library).
     Unknown(i32),
 }
@@ -71,6 +73,7 @@ impl Status {
             sys::MDAW_ERR_PLUGIN => Status::Plugin,
             sys::MDAW_ERR_IO => Status::Io,
             sys::MDAW_ERR_INTERNAL => Status::Internal,
+            sys::MDAW_ERR_CANCELLED => Status::Cancelled,
             other => Status::Unknown(other),
         }
     }
@@ -357,8 +360,10 @@ pub enum Event {
     },
     /// The plugin's state changed otherwise (a preset loaded).
     StateChanged { device: u64 },
-    /// The user closed the plugin's window.
-    EditorClosed { device: u64 },
+    /// The plugin's window is gone, other than by [`Engine::device_show_editor`] with `show`
+    /// false: the user or the window manager closed it, or its device was removed (also with
+    /// its track, or by [`Engine::clear`]). `token` is the one the window was last shown with.
+    EditorClosed { device: u64, token: u64 },
     /// The audio device or the device list changed.
     DeviceChanged,
     /// The audio callback has not returned for over a second.
@@ -689,21 +694,37 @@ impl Engine {
         check(unsafe { sys::mdaw_device_reset_state(self.ptr(), device) })
     }
 
-    /// Shows or hides the plugin's own window.
-    pub fn device_show_editor(&self, device: u64, show: bool) -> Result<(), Error> {
+    /// Shows or closes the plugin's own window; one per device at most. Showing one that is
+    /// open brings it to the front (also one the user has just closed, which then stays) and
+    /// gives it `token`, which [`Event::EditorClosed`] carries. A device that does not exist, or
+    /// a plugin without a window: [`Status::NotFound`]; the plugin failing to make its window:
+    /// [`Status::Plugin`]; after a failure there is no window. Closing sends no event and does
+    /// nothing if there is no window (`token` is not used then).
+    pub fn device_show_editor(&self, device: u64, show: bool, token: u64) -> Result<(), Error> {
         // SAFETY: valid handle.
-        check(unsafe { sys::mdaw_device_show_editor(self.ptr(), device, i32::from(show)) })
+        check(unsafe { sys::mdaw_device_show_editor(self.ptr(), device, i32::from(show), token) })
     }
 
     // ---- plugins on this machine
 
     /// Scans the usual folders for one format ("VST3", "LV2", "CLAP"). Blocks until done. With
     /// a scanner ([`Config::scanner_path`]) each file is examined in a child process with a
-    /// time limit (30 s; `MDAW_SCAN_TIMEOUT_MS` overrides it).
+    /// time limit (30 s; `MDAW_SCAN_TIMEOUT_MS` overrides it), and the scan blocks only the
+    /// calling thread: other calls, from other threads, are carried out meanwhile, and known
+    /// plugins stay loadable. One scan at a time. After [`Engine::plugins_scan_cancel`]:
+    /// [`Status::Cancelled`].
     pub fn plugins_scan(&self, format: &str) -> Result<(), Error> {
         let format = c_string(format)?;
         // SAFETY: valid handle; the string outlives the call.
         check(unsafe { sys::mdaw_plugins_scan(self.ptr(), format.as_ptr()) })
+    }
+
+    /// Cancels plugin scans for the rest of the engine's life (for shutting down): a scan in
+    /// progress kills its scanner process, keeps what it had taken in and returns
+    /// [`Status::Cancelled`], as every later scan does at once. Returns at once; any thread.
+    pub fn plugins_scan_cancel(&self) -> Result<(), Error> {
+        // SAFETY: valid handle.
+        check(unsafe { sys::mdaw_plugins_scan_cancel(self.ptr()) })
     }
 
     /// The plugins the engine knows from scans (this run's or earlier ones') and can load now.
@@ -822,7 +843,10 @@ impl Engine {
                 value: raw.value,
             },
             sys::MDAW_EVENT_STATE_CHANGED => Event::StateChanged { device: raw.device },
-            sys::MDAW_EVENT_EDITOR_CLOSED => Event::EditorClosed { device: raw.device },
+            sys::MDAW_EVENT_EDITOR_CLOSED => Event::EditorClosed {
+                device: raw.device,
+                token: raw.token,
+            },
             sys::MDAW_EVENT_AUDIO_STALLED => Event::AudioStalled,
             // DEVICE_CHANGED, and anything a newer library adds: the safest reading is "look
             // at the devices again".

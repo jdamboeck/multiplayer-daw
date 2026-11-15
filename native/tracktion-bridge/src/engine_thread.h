@@ -30,12 +30,19 @@ public:
     void start (Step setUp);
 
     /// Runs `step` on the message thread and waits for it. Rethrows what it threw.
-    void call (Step step);
+    ///
+    /// Every call is timed: how long it waited for the message thread (from being posted to its
+    /// first step starting there) and how long its steps ran there. With tracing on (trace.h) a
+    /// call with a `label` is always traced, any other one when either time reaches 50 ms (as
+    /// "call"). Either time reaching 100 ms is written to the engine's log, tracing or not.
+    /// `label` is a string literal: it is kept until the call is over.
+    void call (Step step, const char* label = nullptr);
 
     /// Runs the steps on the message thread one after the other, with `gapMs` of free message
     /// loop between them, and waits for the last. Calls from other threads wait until all steps
-    /// are done. The first exception skips the remaining steps and is rethrown here.
-    void call (std::vector<Step> steps, int gapMs);
+    /// are done. The first exception skips the remaining steps and is rethrown here. Timed as
+    /// the call above; the run time is that of the steps, without the gaps.
+    void call (std::vector<Step> steps, int gapMs, const char* label = nullptr);
 
     /// Runs `step` on the message thread as soon as it is free, without waiting for it. It runs
     /// between the steps of a call (steps, gapMs) if one is in progress, and after whatever was
@@ -49,7 +56,7 @@ public:
 
 private:
     struct Job;
-    std::shared_ptr<Job> post (std::vector<Step>, int gapMs, bool keepGoing);
+    std::shared_ptr<Job> post (std::vector<Step>, int gapMs, bool keepGoing, const char* label);
     void startNext();
     void runStep();
 

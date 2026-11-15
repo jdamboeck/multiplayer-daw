@@ -1,10 +1,28 @@
 //! Tracktion Engine behind [`Audio`], through the bridge (`mdaw-tracktion`).
 //!
 //! There is one engine per process (JUCE), so one `TracktionAudio`. Every call into the engine
-//! that changes something, or may take long (loading a plugin, scanning, rendering), runs on a
-//! worker thread owned by this value, in the order it was asked for; the UI thread only reads
-//! the engine's state and events, which never wait, and the results the worker leaves in
-//! [`Shared`]. So a plugin that takes seconds to load never freezes the window.
+//! that changes something, or may take long (loading a plugin, rendering), runs on a worker
+//! thread owned by this value; the UI thread only reads the engine's state and events, which
+//! never wait, and the results the worker leaves in [`Shared`]. So a plugin that takes seconds
+//! to load never freezes the window.
+//!
+//! The worker takes its jobs from a [`crate::engine_queue`], not in the order they were asked
+//! for but by urgency: a click on a plugin's window, a knob or the transport goes before the
+//! settings reads and syncs waiting (but never before one touching the same device), and the
+//! reads that repeat by themselves (the settings of a plugin whose window is open, the
+//! parameters shown in the device tab) run only when nothing else waits, at most one per device
+//! queued. So however slow a plugin is to give its settings, the queue stays short and a click
+//! waits at most for the job running when it came.
+//!
+//! The plugin scan runs on a thread of its own (it blocks the thread that asks for it, for as
+//! long as plugins take to be examined in their child processes, seconds per plugin that hangs).
+//! It first publishes the plugins known from earlier scans, so a project's plugins load at once,
+//! then each format's catalog as it is done.
+//!
+//! A plugin's window opens on the worker too. Until the engine answered, the device is
+//! `Opening` (or `Closing`); each request carries a number (token), and an answer or a "window
+//! closed" event that does not carry the device's latest number is about a window the user has
+//! since asked to close or open again, and changes nothing.
 //!
 //! The project reaches the engine by difference: the worker keeps the project it last brought
 //! the engine to and hands both states to [`mdaw_tracktion::sync_project`]. Requests to follow
@@ -23,7 +41,7 @@ use std::any::Any;
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -33,11 +51,13 @@ use mdaw_model::{
     BlobHash, BuiltinKind, DeviceId, DeviceKind, Op, PluginFormat, Project, Tick, TickRange, TrackContent,
     TrackId,
 };
-use mdaw_tracktion::{Config, Engine, EngineState, EntityKind, Event, Problem};
+use mdaw_tracktion::{Config, Engine, EngineState, EntityKind, Event, Problem, Status};
 
 use crate::audio::{
-    Audio, DeviceStatus, LiveSink, ParamEntry, PluginEntry, SavedState, TrackSound, track_sound_from,
+    Audio, DeviceStatus, EditorState, LiveSink, ParamEntry, PluginEntry, SavedState, TrackSound,
+    track_sound_from,
 };
+use crate::engine_queue::{Class, EngineQueue, JobInfo, Key, Picked, Spec};
 use crate::link::Waker;
 
 /// A plugin's settings are read this long after its last change...
@@ -51,6 +71,11 @@ const PARAMS_FRESH: Duration = Duration::from_millis(150);
 /// How often the settings of a plugin whose window is open are read, to see changes the plugin
 /// does not report (some pick a preset without a word to the host).
 const LOOK_EVERY: Duration = Duration::from_millis(500);
+/// Jobs that waited or ran this long are traced (with `MDAW_TRACE`); shorter ones are not, to
+/// keep the trace readable. Editor jobs always are.
+const TRACE_FROM: Duration = Duration::from_millis(50);
+/// Jobs that ran this long are marked slow in the trace.
+const TRACE_SLOW: Duration = Duration::from_millis(250);
 
 /// How to start the engine.
 #[derive(Clone, Debug)]
@@ -61,7 +86,7 @@ pub struct TracktionOptions {
     pub open_audio_device: bool,
     /// Host plugins (VST3, LV2, CLAP); without, plugin tracks are "not installed".
     pub enable_plugins: bool,
-    /// The formats to scan for at startup, on the worker thread.
+    /// The formats to scan for at startup, on a thread of its own.
     pub scan: Vec<PluginFormat>,
 }
 
@@ -90,9 +115,10 @@ struct Shared {
     params: HashMap<DeviceId, Vec<ParamEntry>>,
     /// Numbers the sets of plugin parameters made here, in the order they were sent.
     sets_sent: u64,
-    /// The number of the last set of each parameter. A reading of a device's parameters that
-    /// was asked for before that set must not overwrite the value the set put in `params`: the
-    /// reading would show the knob back where it was until the next one.
+    /// The number of the last set of each parameter. A reading of a device's parameters taken
+    /// before the plugin had that set must not overwrite the value the set put in `params`: the
+    /// reading would show the knob back where it was until the next one (see
+    /// [`Worker::read_params`]).
     last_set: HashMap<(DeviceId, String), u64>,
     /// States read from plugins, for the document.
     captured: Vec<((TrackId, DeviceId), SavedState)>,
@@ -105,17 +131,32 @@ struct Shared {
     wanted: HashSet<BlobHash>,
     /// Downloads blobs for the worker, straight to it; without, the session downloads them.
     fetcher: Option<crate::link::Fetcher>,
-    /// To hand downloaded blobs to the worker from the network thread.
-    jobs: Option<Sender<Job>>,
     /// Blobs being downloaded by the fetcher.
     fetching: HashSet<BlobHash>,
     notices: Vec<String>,
     waker: Option<Waker>,
+    /// What the engine answered to requests to open or close plugin windows, for `frame`.
+    editor_results: Vec<EditorResult>,
+    /// The devices whose settings are looked at: windows open, and watched ones. A look that
+    /// comes to run after its window closed is skipped.
+    looked: HashSet<DeviceId>,
+    /// Plugin windows open, for the trace.
+    open_editors: usize,
+}
+
+/// The engine's answer to opening or closing a plugin's window.
+struct EditorResult {
+    device: DeviceId,
+    token: u64,
+    show: bool,
+    result: Result<(), String>,
+    /// When the worker took the request and when the engine returned, for the trace.
+    picked: Instant,
+    returned: Instant,
 }
 
 enum Job {
     Sync,
-    Scan(Vec<PluginFormat>),
     Play,
     Stop,
     Seek(i64),
@@ -125,19 +166,22 @@ enum Job {
         device: DeviceId,
         param: String,
         value: f32,
+        /// Its number in `Shared::sets_sent`.
+        number: u64,
     },
-    /// Reads a device's parameters; the number is `sets_sent` when it was asked for.
-    Params(DeviceId, u64),
+    /// Reads a device's parameters for the device tab.
+    Params(DeviceId),
     Editor {
         device: DeviceId,
         show: bool,
+        token: u64,
     },
     Capture {
         track: TrackId,
         device: DeviceId,
     },
-    /// Reads the settings of plugins whose windows are open, for changes not reported.
-    Look(Vec<(TrackId, DeviceId)>),
+    /// Reads the settings of a plugin whose window is open, for changes not reported.
+    Look(TrackId, DeviceId),
     Blob(BlobHash, Arc<[u8]>),
     Retry {
         track: TrackId,
@@ -149,7 +193,96 @@ enum Job {
         to: i64,
         reply: Sender<Result<(), String>>,
     },
+    /// Runs the background jobs waiting, then answers.
     Flush(Sender<()>),
+    /// The scan published a catalog: devices left out for want of their plugin are tried
+    /// again. `last`: the scan is over.
+    CatalogChanged {
+        last: bool,
+    },
+}
+
+/// What may take the place of a queued job, or keeps one more from being queued.
+#[derive(Clone, PartialEq, Debug)]
+enum Coalesce {
+    Param(DeviceId, String),
+    Editor(DeviceId),
+    OutputGain,
+    Capture(DeviceId),
+    Retry(DeviceId),
+    Catalog(bool),
+    Look(DeviceId),
+    Params(DeviceId),
+}
+
+impl Coalesce {
+    fn device(&self) -> Option<DeviceId> {
+        match self {
+            Coalesce::Param(d, _)
+            | Coalesce::Editor(d)
+            | Coalesce::Capture(d)
+            | Coalesce::Retry(d)
+            | Coalesce::Look(d)
+            | Coalesce::Params(d) => Some(*d),
+            Coalesce::OutputGain | Coalesce::Catalog(_) => None,
+        }
+    }
+}
+
+type Queue = EngineQueue<Job, Coalesce>;
+
+/// How urgent a job is, what it touches and what may replace it (see the module doc of
+/// [`crate::engine_queue`]).
+fn spec(job: &Job) -> Spec<Coalesce> {
+    use Class::{Interactive, Normal};
+    let device = |d: &DeviceId| Key::Device(raw_device(*d));
+    match job {
+        Job::Sync => Spec::ordered(Normal, Key::Global, "sync"),
+        Job::Play => Spec::ordered(Interactive, Key::Transport, "play"),
+        Job::Stop => Spec::ordered(Interactive, Key::Transport, "stop"),
+        Job::Seek(_) => Spec::ordered(Interactive, Key::Transport, "seek"),
+        Job::Loop(..) => Spec::ordered(Interactive, Key::Transport, "loop"),
+        Job::OutputGain(_) => {
+            Spec::ordered(Interactive, Key::Transport, "output-gain").replace(Coalesce::OutputGain)
+        }
+        Job::SetParam { device: d, param, .. } => {
+            Spec::ordered(Interactive, device(d), "set-param").replace(Coalesce::Param(*d, param.clone()))
+        }
+        Job::Editor { device: d, .. } => {
+            Spec::ordered(Interactive, device(d), "editor").replace_always(Coalesce::Editor(*d))
+        }
+        Job::Capture { device: d, .. } => {
+            Spec::ordered(Normal, device(d), "capture").unique(Coalesce::Capture(*d))
+        }
+        Job::Retry { device: d, .. } => Spec::ordered(Normal, device(d), "retry").unique(Coalesce::Retry(*d)),
+        Job::Blob(..) => Spec::ordered(Normal, Key::Global, "blob"),
+        Job::Render { .. } => Spec::ordered(Normal, Key::Global, "render"),
+        Job::Flush(_) => Spec::ordered(Normal, Key::Global, "flush"),
+        Job::CatalogChanged { last } => {
+            Spec::ordered(Normal, Key::Global, "catalog").unique(Coalesce::Catalog(*last))
+        }
+        Job::Look(_, d) => Spec::background(Coalesce::Look(*d), "look"),
+        Job::Params(d) => Spec::background(Coalesce::Params(*d), "params"),
+    }
+}
+
+fn submit(queue: &Queue, job: Job) {
+    queue.submit(spec(&job), job);
+}
+
+/// Where a plugin's window is on its way, with the number of the latest request about it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Phase {
+    Opening,
+    Open,
+    Closing,
+}
+
+struct Editor {
+    phase: Phase,
+    token: u64,
+    /// When it was asked for, for the trace.
+    asked: Instant,
 }
 
 /// A device whose settings changed here and are to be read.
@@ -161,8 +294,10 @@ struct Pending {
 
 pub struct TracktionAudio {
     engine: Arc<Engine>,
-    jobs: Option<Sender<Job>>,
+    queue: Arc<Queue>,
     worker: Option<JoinHandle<()>>,
+    /// The plugin scan, while it runs.
+    scanner: Option<JoinHandle<()>>,
     shared: Arc<Mutex<Shared>>,
     enable_plugins: bool,
     playing: bool,
@@ -174,7 +309,10 @@ pub struct TracktionAudio {
     /// The view last handed over, to see cheaply that nothing changed.
     given: Option<Project>,
     pending: HashMap<DeviceId, Pending>,
-    editors: HashSet<DeviceId>,
+    /// Plugin windows not closed; a device missing here is `Closed`.
+    editors: HashMap<DeviceId, Editor>,
+    /// The number of the last request about a plugin window.
+    tokens: u64,
     params_asked: HashMap<DeviceId, Instant>,
     looked_at: Instant,
     /// Devices looked at as if their windows were open (for tests; see [`TracktionAudio::watch`]).
@@ -261,7 +399,7 @@ impl LiveSink for TeLive {
 
 impl TracktionAudio {
     /// Starts the engine (and opens the device, if asked) and its worker. The plugin scan, if
-    /// any, starts at once on the worker.
+    /// any, starts at once on a thread of its own.
     pub fn new(options: TracktionOptions) -> Result<Self, String> {
         let mut config = Config::new("mdaw", &options.settings_dir);
         config.open_audio_device = options.open_audio_device;
@@ -269,28 +407,47 @@ impl TracktionAudio {
         config.scanner_path = mdaw_tracktion::built_scanner_path().map(Path::to_path_buf);
         let engine = Arc::new(Engine::new(config).map_err(|e| e.to_string())?);
         let shared = Arc::new(Mutex::new(Shared::default()));
-        let (jobs, received) = channel();
+        let queue = Arc::new(Queue::new());
         let worker = Worker {
             engine: engine.clone(),
             shared: shared.clone(),
+            queue: queue.clone(),
             synced: None,
             blobs: HashMap::new(),
             output_gain: 1.0,
             flush_path: options.settings_dir.join("flush.wav"),
             looks: HashMap::new(),
+            applied: HashMap::new(),
+            unflushed: HashSet::new(),
         };
         let worker = std::thread::Builder::new()
             .name("mdaw-engine-worker".into())
-            .spawn(move || worker.run(received))
+            .spawn(move || worker.run())
             .map_err(|e| e.to_string())?;
+        let mut scanner = None;
         if options.enable_plugins && !options.scan.is_empty() {
             lock(&shared).scanning = true;
-            let _ = jobs.send(Job::Scan(options.scan.clone()));
+            let (engine, held, queue) = (engine.clone(), shared.clone(), queue.clone());
+            let formats = options.scan.clone();
+            let spawned = std::thread::Builder::new()
+                .name("mdaw-plugin-scan".into())
+                .spawn(move || scan(&engine, &held, &queue, &formats));
+            match spawned {
+                Ok(handle) => scanner = Some(handle),
+                Err(e) => {
+                    let mut shared = lock(&shared);
+                    shared.scanning = false;
+                    shared
+                        .notices
+                        .push(format!("Looking for plugins did not start: {e}"));
+                }
+            }
         }
         Ok(Self {
             engine,
-            jobs: Some(jobs),
+            queue,
             worker: Some(worker),
+            scanner,
             shared,
             enable_plugins: options.enable_plugins,
             playing: false,
@@ -299,29 +456,112 @@ impl TracktionAudio {
             peak: Cell::new([0.0; 2]),
             given: None,
             pending: HashMap::new(),
-            editors: HashSet::new(),
+            editors: HashMap::new(),
+            tokens: 0,
             looked_at: Instant::now(),
             watched: HashSet::new(),
             params_asked: HashMap::new(),
         })
     }
 
-    /// The engine, for what this type does not offer (tests, diagnostics). Calls on it wait
-    /// for the engine's thread.
     /// Looks at a device's settings as if its window were open, for tests of plugins that
     /// change without a report (the test synth has no window).
     #[doc(hidden)]
     pub fn watch(&mut self, device: DeviceId) {
         self.watched.insert(device);
+        self.publish_looked();
     }
 
+    /// The engine, for what this type does not offer (tests, diagnostics). Calls on it wait
+    /// for the engine's thread.
     pub fn engine(&self) -> &Engine {
         &self.engine
     }
 
+    /// What the worker's queue has seen, for tests and benchmarks.
+    #[doc(hidden)]
+    pub fn queue_stats(&self) -> crate::engine_queue::Stats {
+        self.queue.stats()
+    }
+
     fn send(&self, job: Job) {
-        if let Some(jobs) = &self.jobs {
-            let _ = jobs.send(job);
+        submit(&self.queue, job);
+    }
+
+    /// The devices whose settings are looked at, for the worker.
+    fn publish_looked(&self) {
+        let open: HashSet<DeviceId> = self
+            .editors
+            .iter()
+            .filter(|(_, e)| e.phase == Phase::Open)
+            .map(|(d, _)| *d)
+            .collect();
+        let mut shared = lock(&self.shared);
+        shared.open_editors = open.len();
+        shared.looked = open.union(&self.watched).copied().collect();
+    }
+
+    /// Forgets a device's window, and the reads of its settings waiting for it.
+    fn editor_gone(&mut self, device: DeviceId) {
+        self.editors.remove(&device);
+        if !self.watched.contains(&device) {
+            self.queue
+                .cancel_background(|c| matches!(c, Coalesce::Look(_)) && c.device() == Some(device));
+        }
+    }
+
+    /// Takes what the engine did with plugin windows: events first, then the answers to
+    /// requests (`results`, taken before the events were drained).
+    fn apply_editors(
+        &mut self,
+        closed: Vec<(DeviceId, u64)>,
+        results: Vec<EditorResult>,
+        notices: &mut Vec<String>,
+    ) {
+        for (device, token) in closed {
+            if self.editors.get(&device).is_some_and(|e| e.token == token) {
+                crate::trace::step(|| format!("the window of device {} was closed", raw_device(device)));
+                self.editor_gone(device);
+            }
+        }
+        let applied = Instant::now();
+        for r in results {
+            let Some(editor) = self.editors.get_mut(&r.device).filter(|e| e.token == r.token) else {
+                crate::trace::step(|| {
+                    format!(
+                        "the engine's answer {} for the window of device {} is out of date",
+                        r.token,
+                        raw_device(r.device)
+                    )
+                });
+                continue;
+            };
+            let asked = editor.asked;
+            crate::trace::step(|| {
+                let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+                format!(
+                    "window of device {} {} ({}): click -> picked {:.1} ms, picked -> engine returned {:.1} ms, returned -> shown here {:.1} ms, total {:.1} ms",
+                    raw_device(r.device),
+                    match (r.show, &r.result) {
+                        (true, Ok(())) => "opened",
+                        (true, Err(_)) => "did not open",
+                        (false, _) => "closed",
+                    },
+                    r.token,
+                    ms(r.picked.saturating_duration_since(asked)),
+                    ms(r.returned.saturating_duration_since(r.picked)),
+                    ms(applied.saturating_duration_since(r.returned)),
+                    ms(applied.saturating_duration_since(asked)),
+                )
+            });
+            match (r.show, r.result) {
+                (true, Ok(())) => editor.phase = Phase::Open,
+                (true, Err(e)) => {
+                    notices.push(format!("The plugin's window did not open: {e}."));
+                    self.editor_gone(r.device);
+                }
+                (false, _) => self.editor_gone(r.device),
+            }
         }
     }
 
@@ -440,16 +680,17 @@ impl TracktionAudio {
 
 impl Drop for TracktionAudio {
     fn drop(&mut self) {
-        // The worker ends when its queue is gone, the handle the downloads use included; the
-        // engine goes with the last holder (live notes may hold it a moment longer). A download
-        // still on its way holds a handle of its own until it ends, which the link's end makes
-        // happen.
-        {
-            let mut shared = lock(&self.shared);
-            shared.jobs = None;
-            shared.fetcher = None;
+        // The scan is cut short (its plugin's child process killed) and waited for; then the
+        // worker ends with the queue, whose waiting jobs are dropped (a caller waiting for a
+        // reply sees its channel close). The engine goes with the last holder (live notes may
+        // hold it a moment longer). A download still on its way holds the queue until it ends,
+        // which the link's end makes happen; it hands its blob to a closed queue.
+        let _ = self.engine.plugins_scan_cancel();
+        if let Some(scanner) = self.scanner.take() {
+            let _ = scanner.join();
         }
-        self.jobs = None;
+        lock(&self.shared).fetcher = None;
+        self.queue.close();
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
@@ -507,6 +748,13 @@ impl Audio for TracktionAudio {
         {
             self.seek.set(None);
         }
+        // The engine's answers about windows are taken before its events are drained: an answer
+        // is written after the call that showed the window returned, and the window's
+        // EditorClosed comes after that call too, so an event about a window whose answer is in
+        // hand now is drained in this frame (or a later one) and applied after it below; never
+        // is a window shown as open after the event of its closing was seen.
+        let results = std::mem::take(&mut lock(&self.shared).editor_results);
+        let mut closed = Vec::new();
         let mut notices = Vec::new();
         while let Some(event) = self.engine.poll_event() {
             match event {
@@ -524,24 +772,44 @@ impl Audio for TracktionAudio {
                         self.changed(track, device);
                     }
                 }
-                Event::EditorClosed { device } => {
-                    self.editors.remove(&DeviceId(mdaw_model::EntityId(device)));
+                Event::EditorClosed { device, token } => {
+                    closed.push((DeviceId(mdaw_model::EntityId(device)), token));
                 }
                 Event::AudioStalled => notices.push(self.stalled(project)),
                 Event::DeviceChanged => {}
             }
         }
+        let before: Vec<(DeviceId, Phase)> = self.editors.iter().map(|(d, e)| (*d, e.phase)).collect();
+        self.apply_editors(closed, results, &mut notices);
+        // A device gone from the project has no window (the engine closed it with the device).
+        let gone: Vec<DeviceId> = self
+            .editors
+            .keys()
+            .filter(|d| track_of(project, **d).is_none())
+            .copied()
+            .collect();
+        for device in gone {
+            self.editor_gone(device);
+        }
+        let after: Vec<(DeviceId, Phase)> = self.editors.iter().map(|(d, e)| (*d, e.phase)).collect();
+        if before.len() != after.len() || before.iter().any(|b| !after.contains(b)) {
+            self.publish_looked();
+        }
         self.capture_due(false);
-        if !(self.editors.is_empty() && self.watched.is_empty()) && self.looked_at.elapsed() >= LOOK_EVERY {
+        if self.looked_at.elapsed() >= LOOK_EVERY {
             self.looked_at = Instant::now();
+            // One job per device; the queue keeps one of each, however slow the reads.
             let open: Vec<(TrackId, DeviceId)> = self
                 .editors
-                .union(&self.watched)
+                .iter()
+                .filter(|(_, e)| e.phase == Phase::Open)
+                .map(|(d, _)| d)
+                .chain(self.watched.iter())
                 .filter(|d| !self.pending.contains_key(d))
                 .filter_map(|d| Some((track_of(project, *d)?, *d)))
                 .collect();
-            if !open.is_empty() {
-                self.send(Job::Look(open));
+            for (track, device) in open {
+                self.send(Job::Look(track, device));
             }
         }
         notices.append(&mut lock(&self.shared).notices);
@@ -693,8 +961,7 @@ impl Audio for TracktionAudio {
             .is_none_or(|at| at.elapsed() >= PARAMS_FRESH);
         if stale {
             self.params_asked.insert(device, Instant::now());
-            let asked_after = lock(&self.shared).sets_sent;
-            self.send(Job::Params(device, asked_after));
+            self.send(Job::Params(device));
         }
         let shared = lock(&self.shared);
         let params = shared.params.get(&device)?;
@@ -702,7 +969,7 @@ impl Audio for TracktionAudio {
     }
 
     fn set_plugin_param(&mut self, track: TrackId, device: DeviceId, param: &str, value: f64) {
-        let normalised = {
+        let (normalised, number) = {
             let mut shared = lock(&self.shared);
             let Some(entry) = shared
                 .params
@@ -721,12 +988,13 @@ impl Audio for TracktionAudio {
             shared.sets_sent += 1;
             let number = shared.sets_sent;
             shared.last_set.insert((device, param.to_string()), number);
-            normalised
+            (normalised, number)
         };
         self.send(Job::SetParam {
             device,
             param: param.to_string(),
             value: normalised as f32,
+            number,
         });
         // The bridge does not report the application's own sets; the settings changed all the
         // same, as when the knob is turned in the plugin's window.
@@ -745,17 +1013,50 @@ impl Audio for TracktionAudio {
     }
 
     fn editor_open(&self, _track: TrackId, device: DeviceId) -> bool {
-        self.editors.contains(&device)
+        self.editors.get(&device).is_some_and(|e| e.phase == Phase::Open)
     }
 
-    fn toggle_editor(&mut self, _track: TrackId, device: DeviceId, _title: &str) -> Result<(), String> {
-        let show = !self.editors.contains(&device);
-        if show {
-            self.editors.insert(device);
-        } else {
-            self.editors.remove(&device);
+    fn editor_state(&self, _track: TrackId, device: DeviceId) -> EditorState {
+        match self.editors.get(&device).map(|e| e.phase) {
+            None => EditorState::Closed,
+            Some(Phase::Opening) => EditorState::Opening,
+            Some(Phase::Open) => EditorState::Open,
+            Some(Phase::Closing) => EditorState::Closing,
         }
-        self.send(Job::Editor { device, show });
+    }
+
+    /// Asks the worker to open or close the window; the answer comes in a later frame (failures
+    /// as notices). A request waiting in the queue is replaced by this one; one already on its
+    /// way is answered under its own token, which is no longer the device's.
+    fn toggle_editor(&mut self, _track: TrackId, device: DeviceId, _title: &str) -> Result<(), String> {
+        let show = matches!(
+            self.editors.get(&device).map(|e| e.phase),
+            None | Some(Phase::Closing)
+        );
+        self.tokens += 1;
+        let token = self.tokens;
+        crate::trace::step(|| {
+            format!(
+                "asks to {} the window of device {} ({token})",
+                if show { "open" } else { "close" },
+                raw_device(device)
+            )
+        });
+        let phase = if show { Phase::Opening } else { Phase::Closing };
+        self.editors.insert(
+            device,
+            Editor {
+                phase,
+                token,
+                asked: Instant::now(),
+            },
+        );
+        if !show && !self.watched.contains(&device) {
+            self.queue
+                .cancel_background(|c| matches!(c, Coalesce::Look(_)) && c.device() == Some(device));
+        }
+        self.send(Job::Editor { device, show, token });
+        self.publish_looked();
         Ok(())
     }
 
@@ -765,9 +1066,7 @@ impl Audio for TracktionAudio {
     }
 
     fn set_fetcher(&mut self, fetcher: crate::link::Fetcher) {
-        let mut shared = lock(&self.shared);
-        shared.fetcher = Some(fetcher);
-        shared.jobs = self.jobs.clone();
+        lock(&self.shared).fetcher = Some(fetcher);
     }
 
     fn wanted_blobs(&mut self, asked: &HashSet<BlobHash>) -> Vec<BlobHash> {
@@ -833,11 +1132,84 @@ impl Audio for TracktionAudio {
     }
 }
 
+// ---- the plugin scan -------------------------------------------------------------------------------
+
+/// The plugins the engine knows and can load now.
+fn catalog_of(engine: &Engine) -> Vec<PluginEntry> {
+    engine
+        .plugins()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|p| {
+            Some(PluginEntry {
+                format: PluginFormat::from_name(&p.format)?,
+                id: p.identifier,
+                name: p.name,
+                vendor: p.vendor,
+                instrument: p.instrument,
+                location: String::new(),
+            })
+        })
+        .collect()
+}
+
+fn wake(shared: &Mutex<Shared>) {
+    let waker = lock(shared).waker.clone();
+    if let Some(waker) = waker {
+        waker();
+    }
+}
+
+/// The scan thread: the plugins known from earlier scans first, then each format scanned, the
+/// catalog published after each. The worker tries the devices left out again each time
+/// (`Job::CatalogChanged`) and ends `Shared::scanning` after the last.
+fn scan(engine: &Engine, shared: &Mutex<Shared>, queue: &Queue, formats: &[PluginFormat]) {
+    let publish = |last: bool| {
+        let catalog = catalog_of(engine);
+        let known = catalog.len();
+        lock(shared).catalog = catalog;
+        submit(queue, Job::CatalogChanged { last });
+        wake(shared);
+        known
+    };
+    let known = publish(false);
+    crate::trace::step(|| format!("plugin scan starts, {known} plugins known from earlier scans"));
+    for format in formats {
+        let started = Instant::now();
+        let result = engine.plugins_scan(format.name());
+        crate::trace::step(|| {
+            format!(
+                "plugin scan of {} took {} ms{}",
+                format.name(),
+                started.elapsed().as_millis(),
+                match &result {
+                    Ok(()) => String::new(),
+                    Err(e) => format!(": {}", e.message),
+                }
+            )
+        });
+        match result {
+            // Shutting down.
+            Err(e) if e.status == Status::Cancelled => return,
+            Err(e) => lock(shared).notices.push(format!(
+                "Looking for {} plugins failed: {}",
+                format.name(),
+                e.message
+            )),
+            Ok(()) => {}
+        }
+        publish(false);
+    }
+    publish(true);
+}
+
 // ---- the worker ----------------------------------------------------------------------------------
 
 struct Worker {
     engine: Arc<Engine>,
     shared: Arc<Mutex<Shared>>,
+    /// Its own jobs, also handed to downloads that come back to it.
+    queue: Arc<Queue>,
     /// The project the engine holds; `None` until the first load.
     synced: Option<Project>,
     /// Plugin states at hand: downloaded, or read from the plugins here.
@@ -849,17 +1221,63 @@ struct Worker {
     /// reading seen once since: a change counts when two readings in a row agree on it, so a
     /// plugin that writes its settings a little differently each time sends nothing.
     looks: HashMap<DeviceId, (BlobHash, Option<BlobHash>)>,
+    /// The number of the last set carried out per parameter (see [`Worker::read_params`]).
+    applied: HashMap<(DeviceId, String), u64>,
+    /// Devices with parameters set that may not have reached the plugin yet (see
+    /// [`Worker::deliver_sets`]).
+    unflushed: HashSet<DeviceId>,
 }
 
 impl Worker {
-    fn run(mut self, jobs: Receiver<Job>) {
-        while let Ok(job) = jobs.recv() {
-            self.job(job);
-            let waker = lock(&self.shared).waker.clone();
-            if let Some(waker) = waker {
-                waker();
-            }
+    fn run(mut self) {
+        while let Some(picked) = self.queue.next() {
+            self.run_one(picked);
         }
+    }
+
+    fn run_one(&mut self, picked: Picked<Job>) {
+        let info = picked.info;
+        match picked.payload {
+            Job::Flush(reply) => {
+                // Everything asked so far includes the reads waiting in the background. Those
+                // waiting now, not the ones asked for while they run.
+                for _ in 0..self.queue.background_len() {
+                    if let Some(job) = self.queue.next_background() {
+                        self.run_one(job);
+                    }
+                }
+                let _ = reply.send(());
+            }
+            job => self.job(job, &info),
+        }
+        let ran = self.queue.done(&info);
+        self.trace_job(&info, ran);
+        wake(&self.shared);
+    }
+
+    fn trace_job(&self, info: &JobInfo, ran: Duration) {
+        let waited = info.waited();
+        if !crate::trace::on() || !(waited >= TRACE_FROM || ran >= TRACE_FROM || info.label == "editor") {
+            return;
+        }
+        let (scanning, editors) = {
+            let shared = lock(&self.shared);
+            (shared.scanning, shared.open_editors)
+        };
+        crate::trace::step(|| {
+            format!(
+                "engine job {} ({:?}) waited {} ms, ran {} ms{}; waiting {}/{}/{} (interactive/normal/background){}, {editors} windows open",
+                info.label,
+                info.class,
+                waited.as_millis(),
+                ran.as_millis(),
+                if ran >= TRACE_SLOW { ", slow" } else { "" },
+                info.depths.interactive,
+                info.depths.normal,
+                info.depths.background,
+                if scanning { ", scanning" } else { "" },
+            )
+        });
     }
 
     fn notice(&self, text: String) {
@@ -872,11 +1290,11 @@ impl Worker {
         }
     }
 
-    fn job(&mut self, job: Job) {
+    fn job(&mut self, job: Job, info: &JobInfo) {
         let engine = self.engine.clone();
         match job {
             Job::Sync => self.sync(),
-            Job::Scan(formats) => self.scan(&formats),
+            Job::CatalogChanged { last } => self.catalog_changed(last),
             Job::Play => self.failed("play", engine.transport_play()),
             Job::Stop => self.failed("stop", engine.transport_stop()),
             Job::Seek(tick) => self.failed("move the playhead", engine.transport_seek(tick)),
@@ -885,21 +1303,36 @@ impl Worker {
                 self.output_gain = gain;
                 self.master_gain();
             }
-            Job::SetParam { device, param, value } => {
+            Job::SetParam {
+                device,
+                param,
+                value,
+                number,
+            } => {
                 self.failed(
                     "set the parameter",
                     engine.device_set_param(raw_device(device), &param, value.clamp(0.0, 1.0)),
                 );
+                self.applied.insert((device, param), number);
+                self.unflushed.insert(device);
             }
-            Job::Params(device, asked_after) => self.read_params(device, asked_after),
-            Job::Editor { device, show } => {
-                self.failed(
-                    "open the plugin's window",
-                    engine.device_show_editor(raw_device(device), show),
-                );
+            Job::Params(device) => self.read_params(device),
+            Job::Editor { device, show, token } => {
+                let result = engine
+                    .device_show_editor(raw_device(device), show, token)
+                    .map_err(|e| e.message);
+                let returned = Instant::now();
+                lock(&self.shared).editor_results.push(EditorResult {
+                    device,
+                    token,
+                    show,
+                    result,
+                    picked: info.picked,
+                    returned,
+                });
             }
             Job::Capture { track, device } => self.capture(track, device),
-            Job::Look(open) => self.look(&open),
+            Job::Look(track, device) => self.look(track, device),
             Job::Blob(hash, bytes) => self.blob(hash, bytes),
             Job::Retry { track, device } => {
                 self.retry(track, device);
@@ -913,15 +1346,13 @@ impl Worker {
             } => {
                 let _ = reply.send(self.render(&path, from, to));
             }
-            Job::Flush(reply) => {
-                let _ = reply.send(());
-            }
+            // Answered in `run_one`.
+            Job::Flush(_) => {}
         }
     }
 
-    /// Reads a device's parameters for the device tab; `asked_after` is `sets_sent` when the
-    /// reading was asked for.
-    fn read_params(&self, device: DeviceId, asked_after: u64) {
+    /// Reads a device's parameters for the device tab.
+    fn read_params(&self, device: DeviceId) {
         let params = self.engine.device_params(raw_device(device)).unwrap_or_default();
         let mut list: Vec<ParamEntry> = params
             .into_iter()
@@ -936,14 +1367,20 @@ impl Worker {
             })
             .collect();
         let mut shared = lock(&self.shared);
-        // A parameter set here after this reading was asked for may not have reached the
-        // plugin when it was taken: keep the value the set showed.
+        // A parameter set here that this worker has not carried out yet (it waits in the queue,
+        // or was asked for while this reading ran) is not in the reading: keep the value the
+        // set showed. The number of the last set when the reading was asked for does not tell
+        // that any longer: readings are background jobs that wait for later sets, or run before
+        // sets asked after them (a flush runs the waiting readings before the jobs queued behind
+        // it), and sets of different devices may change order. What tells is which sets were
+        // carried out, per parameter, as the worker alone knows.
         if let Some(shown) = shared.params.get(&device) {
             for entry in &mut list {
+                let key = (device, entry.id.clone());
                 let newer = shared
                     .last_set
-                    .get(&(device, entry.id.clone()))
-                    .is_some_and(|number| *number > asked_after);
+                    .get(&key)
+                    .is_some_and(|number| self.applied.get(&key).is_none_or(|done| number > done));
                 if newer && let Some(old) = shown.iter().find(|p| p.id == entry.id) {
                     entry.value = old.value;
                     entry.text = old.text.clone();
@@ -958,19 +1395,16 @@ impl Worker {
     /// So the readings of those devices that are shown are taken again now; the window is woken
     /// when this job is done.
     fn reread_params(&self, devices: &[DeviceId]) {
-        let (shown, asked_after): (Vec<DeviceId>, u64) = {
+        let shown: Vec<DeviceId> = {
             let shared = lock(&self.shared);
-            (
-                devices
-                    .iter()
-                    .copied()
-                    .filter(|d| shared.params.contains_key(d))
-                    .collect(),
-                shared.sets_sent,
-            )
+            devices
+                .iter()
+                .copied()
+                .filter(|d| shared.params.contains_key(d))
+                .collect()
         };
         for device in shown {
-            self.read_params(device, asked_after);
+            self.read_params(device);
         }
     }
 
@@ -1082,13 +1516,13 @@ impl Worker {
         shared.wanted.extend(wanted.iter().copied());
         // With a fetcher the download starts here, on the worker, and comes back to it: no
         // round trip through the window's thread, which may run seldom while it is not shown.
-        if let (Some(fetcher), Some(jobs)) = (shared.fetcher.clone(), shared.jobs.clone()) {
+        if let Some(fetcher) = shared.fetcher.clone() {
             for hash in wanted {
                 if !shared.fetching.insert(hash) {
                     continue;
                 }
                 crate::trace::step(|| format!("engine asks for settings {}", crate::trace::short(&hash)));
-                let (jobs, back) = (jobs.clone(), self.shared.clone());
+                let (queue, back) = (self.queue.clone(), self.shared.clone());
                 fetcher.fetch(
                     hash,
                     Box::new(move |bytes| {
@@ -1096,9 +1530,7 @@ impl Worker {
                             format!("engine's download {} arrived", crate::trace::short(&hash))
                         });
                         match bytes {
-                            Some(bytes) => {
-                                let _ = jobs.send(Job::Blob(hash, bytes));
-                            }
+                            Some(bytes) => submit(&queue, Job::Blob(hash, bytes)),
                             None => {
                                 let mut shared = lock(&back);
                                 shared.wanted.remove(&hash);
@@ -1137,35 +1569,9 @@ impl Worker {
         shared.statuses = statuses;
     }
 
-    fn scan(&mut self, formats: &[PluginFormat]) {
-        for format in formats {
-            if let Err(e) = self.engine.plugins_scan(format.name()) {
-                self.notice(format!(
-                    "Looking for {} plugins failed: {}",
-                    format.name(),
-                    e.message
-                ));
-            }
-        }
-        let list = self.engine.plugins().unwrap_or_default();
-        let catalog: Vec<PluginEntry> = list
-            .into_iter()
-            .filter_map(|p| {
-                Some(PluginEntry {
-                    format: PluginFormat::from_name(&p.format)?,
-                    id: p.identifier,
-                    name: p.name,
-                    vendor: p.vendor,
-                    instrument: p.instrument,
-                    location: String::new(),
-                })
-            })
-            .collect();
-        {
-            let mut shared = lock(&self.shared);
-            shared.catalog = catalog;
-            shared.scanning = false;
-        }
+    /// The scan published a catalog: devices left out because their plugin was not known are
+    /// tried again. After the last, the scan is over for the UI, with the statuses settled.
+    fn catalog_changed(&mut self, last: bool) {
         // Devices left out because their plugin was not known yet.
         let missing: Vec<(TrackId, DeviceId)> = self
             .synced
@@ -1182,6 +1588,9 @@ impl Worker {
             problems.extend(self.retry(track, device));
         }
         self.publish_statuses(&problems);
+        if last {
+            lock(&self.shared).scanning = false;
+        }
     }
 
     /// Tries to put a device that is not in the engine into it again.
@@ -1214,39 +1623,51 @@ impl Worker {
         }
     }
 
-    /// Reads the settings of plugins whose windows are open; one that changed without a report
-    /// is read as if it had reported.
-    fn look(&mut self, open: &[(TrackId, DeviceId)]) {
-        for &(track, device) in open {
-            let raw = raw_device(device);
-            if !self.engine.has(EntityKind::Device, raw) {
-                continue;
+    /// Reads the settings of a plugin whose window is open; one that changed without a report
+    /// is read as if it had reported. Skipped when the window closed since it was asked for.
+    fn look(&mut self, track: TrackId, device: DeviceId) {
+        let raw = raw_device(device);
+        if !lock(&self.shared).looked.contains(&device) || !self.engine.has(EntityKind::Device, raw) {
+            return;
+        }
+        if self.unflushed.contains(&device) {
+            self.deliver_sets(device);
+        }
+        let started = Instant::now();
+        let bytes = self.engine.device_get_state(raw);
+        let took = started.elapsed();
+        if took >= TRACE_FROM {
+            crate::trace::step(|| {
+                format!(
+                    "looked at the settings of device {raw}: {} bytes in {} ms",
+                    bytes.len(),
+                    took.as_millis()
+                )
+            });
+        }
+        if bytes.is_empty() {
+            return;
+        }
+        let hash = mdaw_proto::blob_hash(&bytes);
+        match self.looks.get(&device).copied() {
+            None => {
+                self.looks.insert(device, (hash, None));
             }
-            let bytes = self.engine.device_get_state(raw);
-            if bytes.is_empty() {
-                continue;
+            Some((last, _)) if last == hash => {
+                self.looks.insert(device, (last, None));
             }
-            let hash = mdaw_proto::blob_hash(&bytes);
-            match self.looks.get(&device).copied() {
-                None => {
-                    self.looks.insert(device, (hash, None));
-                }
-                Some((last, _)) if last == hash => {
-                    self.looks.insert(device, (last, None));
-                }
-                Some((last, Some(seen))) if seen == hash => {
-                    crate::trace::step(|| {
-                        format!(
-                            "found the settings changed without a report: {} -> {}",
-                            crate::trace::short(&last),
-                            crate::trace::short(&hash)
-                        )
-                    });
-                    self.capture(track, device);
-                }
-                Some((last, _)) => {
-                    self.looks.insert(device, (last, Some(hash)));
-                }
+            Some((last, Some(seen))) if seen == hash => {
+                crate::trace::step(|| {
+                    format!(
+                        "found the settings changed without a report: {} -> {}",
+                        crate::trace::short(&last),
+                        crate::trace::short(&hash)
+                    )
+                });
+                self.capture(track, device);
+            }
+            Some((last, _)) => {
+                self.looks.insert(device, (last, Some(hash)));
             }
         }
     }
@@ -1261,23 +1682,20 @@ impl Worker {
         if !is_plugin || !self.engine.has(EntityKind::Device, raw) {
             return;
         }
-        // A parameter reaches the plugin with the next block it processes. With a device open
-        // blocks are processed all the time; without, a moment of render does it.
-        if !self.engine.state().device_open
-            && let Err(e) = self.engine.render(&self.flush_path, 0, 1, RENDER_RATE)
-        {
-            self.notice(format!("Plugin settings may be read too early: {}", e.message));
-        }
+        self.deliver_sets(device);
+        let started = Instant::now();
         let bytes: Arc<[u8]> = self.engine.device_get_state(raw).into();
+        let took = started.elapsed();
         if bytes.is_empty() {
             return;
         }
         let hash = mdaw_proto::blob_hash(&bytes);
         crate::trace::step(|| {
             format!(
-                "settings read: {} ({} bytes)",
+                "settings read: {} ({} bytes in {} ms)",
                 crate::trace::short(&hash),
-                bytes.len()
+                bytes.len(),
+                took.as_millis()
             )
         });
         self.looks.insert(device, (hash, None));
@@ -1304,6 +1722,21 @@ impl Worker {
             },
         );
         shared.captured.push(((track, device), (hash, bytes)));
+    }
+
+    /// A parameter reaches the plugin with the next block it processes. With a device open
+    /// blocks are processed all the time; without, a moment of render does it. It has to be
+    /// there before the plugin's settings are read: reading them before takes the plugin's old
+    /// value back into the engine (CLAP), and the set is lost.
+    fn deliver_sets(&mut self, device: DeviceId) {
+        self.unflushed.remove(&device);
+        if !self.engine.state().device_open
+            && let Err(e) = self.engine.render(&self.flush_path, 0, 1, RENDER_RATE)
+        {
+            self.notice(format!("Plugin settings may be read too early: {}", e.message));
+        }
+        // The render processed every plugin.
+        self.unflushed.clear();
     }
 
     fn blob(&mut self, hash: BlobHash, bytes: Arc<[u8]>) {

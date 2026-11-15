@@ -8,7 +8,7 @@ use mdaw_dsp::pocket::{self, ParamInfo, Scale};
 use mdaw_model::two_osc::{self, Group, Kind};
 use mdaw_model::{BuiltinKind, Device, DeviceKind, Op, PluginFormat, TrackId};
 
-use crate::{DawApp, DeviceStatus, PluginEntry, theme};
+use crate::{DawApp, DeviceStatus, EditorState, PluginEntry, theme};
 
 /// Parameters by section, as indices into `pocket::PARAMS`.
 const SECTIONS: [(&str, &[usize]); 5] = [
@@ -88,8 +88,14 @@ fn plugin_panel(
         ui.label(RichText::new(&name).strong().size(15.0));
         ui.label(RichText::new(format.name()).small().color(theme::TEXT_DIM));
         if running && app.session.plugin_has_editor(track, device.id) {
-            let open = app.session.plugin_editor_open(track, device.id);
-            let label = if open { "Close window" } else { "Open window" };
+            // The engine opens and closes windows on its own thread; until it has, the button
+            // says so, and a click turns the request around.
+            let label = match app.session.plugin_editor_state(track, device.id) {
+                EditorState::Closed => "Open window",
+                EditorState::Opening => "Opening…",
+                EditorState::Open => "Close window",
+                EditorState::Closing => "Closing…",
+            };
             if ui
                 .button(label)
                 .on_hover_text("The plugin's own window, with all of its controls")

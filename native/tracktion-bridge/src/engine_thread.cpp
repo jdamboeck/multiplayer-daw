@@ -1,4 +1,5 @@
 #include "engine_thread.h"
+#include "trace.h"
 #include "x11_atoms.h"
 
 #include <juce_gui_basics/juce_gui_basics.h>
@@ -16,7 +17,28 @@ struct EngineThread::Job
     size_t next = 0;
     std::exception_ptr failure;
     std::promise<void> done;
+
+    // Timings (nowMs): written on the message thread before `done` is set.
+    const char* label = nullptr;
+    double postedAt = 0, startedAt = 0, runMs = 0;
 };
+
+namespace
+{
+/// The call's timings: traced and logged as EngineThread::call says.
+void report (const char* label, double postedAt, double startedAt, double runMs)
+{
+    if (startedAt <= 0)
+        return;   // never ran
+    const auto wait = startedAt - postedAt;
+    const juce::String name = label != nullptr ? label : "call";
+    const auto text = name + ": waited " + ms (wait) + " ms, ran " + ms (runMs) + " ms";
+    if (traceOn() && (label != nullptr || wait >= 50 || runMs >= 50))
+        trace (text);
+    if (wait >= 100 || runMs >= 100)
+        juce::Logger::writeToLog ("slow engine call: " + text);
+}
+} // namespace
 
 EngineThread::~EngineThread()
 {
@@ -76,12 +98,14 @@ void EngineThread::start (Step setUp)
     }
 }
 
-std::shared_ptr<EngineThread::Job> EngineThread::post (std::vector<Step> steps, int gapMs, bool keepGoing)
+std::shared_ptr<EngineThread::Job> EngineThread::post (std::vector<Step> steps, int gapMs, bool keepGoing, const char* label)
 {
     auto job = std::make_shared<Job>();
     job->steps = std::move (steps);
     job->gapMs = gapMs;
     job->keepGoing = keepGoing;
+    job->label = label;
+    job->postedAt = nowMs();
 
     if (! juce::MessageManager::callAsync ([this, job]
                                            {
@@ -115,6 +139,9 @@ void EngineThread::runStep()
     auto job = current;
     while (job->next < job->steps.size())
     {
+        const auto stepStart = nowMs();
+        if (job->startedAt <= 0)
+            job->startedAt = stepStart;
         try
         {
             job->steps[job->next++]();
@@ -126,6 +153,7 @@ void EngineThread::runStep()
             if (! job->keepGoing)
                 job->next = job->steps.size();
         }
+        job->runMs += nowMs() - stepStart;
 
         if (job->next < job->steps.size() && job->gapMs > 0)
         {
@@ -145,16 +173,28 @@ void EngineThread::runStep()
         juce::MessageManager::callAsync ([this] { startNext(); });
 }
 
-void EngineThread::call (Step step)
+void EngineThread::call (Step step, const char* label)
 {
     std::vector<Step> steps;
     steps.push_back (std::move (step));
-    call (std::move (steps), 0);
+    call (std::move (steps), 0, label);
 }
 
-void EngineThread::call (std::vector<Step> steps, int gapMs)
+void EngineThread::call (std::vector<Step> steps, int gapMs, const char* label)
 {
-    post (std::move (steps), gapMs, false)->done.get_future().get();
+    auto job = post (std::move (steps), gapMs, false, label);
+    std::exception_ptr failure;
+    try
+    {
+        job->done.get_future().get();
+    }
+    catch (...)
+    {
+        failure = std::current_exception();
+    }
+    report (job->label, job->postedAt, job->startedAt, job->runMs);
+    if (failure != nullptr)
+        std::rethrow_exception (failure);
 }
 
 void EngineThread::stop (std::vector<Step> tearDown, int gapMs, Step after)
@@ -168,7 +208,7 @@ void EngineThread::stop (std::vector<Step> tearDown, int gapMs, Step after)
     std::exception_ptr failure;
     try
     {
-        post (std::move (tearDown), gapMs, true)->done.get_future().get();
+        post (std::move (tearDown), gapMs, true, nullptr)->done.get_future().get();
     }
     catch (...)
     {

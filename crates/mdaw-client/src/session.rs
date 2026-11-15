@@ -19,7 +19,7 @@ use mdaw_net::JoinInfo;
 use mdaw_proto::{ClientMsg, Event, Peer, Presence, ServerMsg, Superseded, SyncData, Txn, TxnId, Welcome};
 use mdaw_sync::{Gesture, Loopback, Replica};
 
-use crate::audio::{Audio, DeviceStatus, ParamEntry, PluginEntry, TrackSound};
+use crate::audio::{Audio, DeviceStatus, EditorState, ParamEntry, PluginEntry, TrackSound};
 use crate::audio_old::OldAudio;
 use crate::link::{Link, LinkEvent, Upload, Waker, Who};
 use crate::live::Live;
@@ -576,6 +576,11 @@ impl Session {
 
     pub fn plugin_editor_open(&self, track: TrackId, device: DeviceId) -> bool {
         self.audio.editor_open(track, device)
+    }
+
+    /// Where a plugin's window is, while it opens or closes too.
+    pub fn plugin_editor_state(&self, track: TrackId, device: DeviceId) -> EditorState {
+        self.audio.editor_state(track, device)
     }
 
     /// Whether a plugin running here has a window of its own.

@@ -1,4 +1,5 @@
 #include "plugin_scan.h"
+#include "trace.h"
 
 #include <algorithm>
 #include <chrono>
@@ -21,7 +22,8 @@ extern char** environ;
 namespace mdaw::bridge
 {
 #if JUCE_LINUX || JUCE_MAC || JUCE_BSD
-ChildOutcome runChild (const juce::File& exe, const juce::StringArray& args, const juce::File& log, int timeoutMs)
+ChildOutcome runChild (const juce::File& exe, const juce::StringArray& args, const juce::File& log, int timeoutMs,
+                       const std::atomic<bool>* cancel)
 {
     ChildOutcome out;
     std::vector<std::string> strings { exe.getFullPathName().toStdString() };
@@ -84,6 +86,11 @@ ChildOutcome runChild (const juce::File& exe, const juce::StringArray& args, con
             if (::kill (pid, 0) != 0)
                 break;
         }
+        if (cancel != nullptr && cancel->load())
+        {
+            out.cancelled = true;
+            break;
+        }
         if (juce::Time::getMillisecondCounterHiRes() >= deadline)
         {
             out.timedOut = true;
@@ -92,8 +99,8 @@ ChildOutcome runChild (const juce::File& exe, const juce::StringArray& args, con
         std::this_thread::sleep_for (std::chrono::milliseconds (5));
     }
 
-    // The child (if it hung) and anything it started.
-    if (! statusLost || out.timedOut)
+    // The child (if it hung or the scan was cancelled) and anything it started.
+    if (! statusLost || out.timedOut || out.cancelled)
         ::kill (-pid, SIGKILL);
     int status = 0;
     pid_t reaped = 0;
@@ -101,9 +108,9 @@ ChildOutcome runChild (const juce::File& exe, const juce::StringArray& args, con
         reaped = statusLost ? -1 : waitpid (pid, &status, 0);
     while (reaped < 0 && errno == EINTR && ! statusLost);
 
-    if (out.timedOut || reaped != pid)
+    if (out.timedOut || out.cancelled || reaped != pid)
     {
-        if (! out.timedOut)
+        if (! out.timedOut && ! out.cancelled)
             out.error = "its exit status is not available (the application ignores SIGCHLD)";
         return out;
     }
@@ -121,8 +128,10 @@ ChildOutcome runChild (const juce::File& exe, const juce::StringArray& args, con
 }
 #else
 // Windows: juce::ChildProcess. Compiled for, NOT tested (no such machine here). It kills only
-// the child itself, not processes the child started.
-ChildOutcome runChild (const juce::File& exe, const juce::StringArray& args, const juce::File& log, int timeoutMs)
+// the child itself, not processes the child started. Waits in short slices, so that the cancel
+// flag is seen.
+ChildOutcome runChild (const juce::File& exe, const juce::StringArray& args, const juce::File& log, int timeoutMs,
+                       const std::atomic<bool>* cancel)
 {
     juce::ignoreUnused (log);
     ChildOutcome out;
@@ -135,9 +144,15 @@ ChildOutcome runChild (const juce::File& exe, const juce::StringArray& args, con
         return out;
     }
     out.started = true;
-    if (! child.waitForProcessToFinish (timeoutMs))
+    const auto deadline = juce::Time::getMillisecondCounterHiRes() + timeoutMs;
+    while (! child.waitForProcessToFinish (20))
     {
-        out.timedOut = true;
+        if (cancel != nullptr && cancel->load())
+            out.cancelled = true;
+        else if (juce::Time::getMillisecondCounterHiRes() >= deadline)
+            out.timedOut = true;
+        else
+            continue;
         child.kill();
         return out;
     }
@@ -156,6 +171,79 @@ ChildOutcome runChild (const juce::File& exe, const juce::StringArray& args, con
     return out;
 }
 #endif
+
+namespace
+{
+/// The last line the scanner wrote to stderr (it says why it gave up), shortened.
+juce::String lastLineOf (const juce::File& log)
+{
+    auto lines = juce::StringArray::fromLines (log.loadFileAsString());
+    lines.removeEmptyStrings();
+    auto last = lines.isEmpty() ? juce::String ("(nothing)") : lines[lines.size() - 1].trim();
+    return last.length() > 300 ? last.substring (0, 300) + "..." : last;
+}
+
+juce::String signalName (int signal)
+{
+   #if JUCE_LINUX || JUCE_MAC || JUCE_BSD
+    if (const char* name = strsignal (signal))
+        return juce::String (signal) + ", " + name;
+   #endif
+    return juce::String (signal);
+}
+} // namespace
+
+Examined examineInChild (const juce::File& scanner, const juce::String& format, const juce::String& file,
+                         juce::int64 stamp, const juce::File& result, const juce::File& log, int timeoutMs,
+                         const std::atomic<bool>* cancel)
+{
+    Examined out;
+    result.deleteFile();
+    const auto started = nowMs();
+    const auto outcome = runChild (scanner, { format, file, result.getFullPathName() }, log, timeoutMs, cancel);
+    out.childMs = nowMs() - started;
+    if (! outcome.started)
+    {
+        out.startError = outcome.error;
+        return out;
+    }
+    if (outcome.cancelled)
+    {
+        out.cancelled = true;
+        return out;
+    }
+
+    auto& entry = out.entry;
+    entry = { stamp, false, {} };
+    if (outcome.timedOut)
+        entry.reason = "hung: no result within " + juce::String (timeoutMs) + " ms, so the scanner was stopped";
+    else if (outcome.signalled)
+        entry.reason = "crashed while being examined (signal " + signalName (outcome.signal) + ")";
+    else if (outcome.exited && outcome.code != 0)
+        entry.reason = "the scanner could not examine it (exit status " + juce::String (outcome.code) + "): " + lastLineOf (log);
+    else if (! outcome.exited && ! result.existsAsFile())
+        entry.reason = "the scanner ended without a result; " + outcome.error;
+    else if (auto xml = juce::XmlDocument::parse (result); xml == nullptr || ! xml->hasTagName ("MDAW_PLUGIN_SCAN"))
+        entry.reason = "the scanner gave no readable result";
+    else
+    {
+        // Only plugins whose own id could be read are of use: they are named by it.
+        for (auto* found : xml->getChildWithTagNameIterator ("FOUND"))
+        {
+            juce::PluginDescription d;
+            const auto id = found->getStringAttribute ("id");
+            if (auto* p = found->getChildByName ("PLUGIN"); p != nullptr && d.loadFromXml (*p) && id.isNotEmpty()
+                                                            && d.pluginFormatName == format && d.fileOrIdentifier == file)
+            {
+                out.found.emplace_back (d, id);
+                entry.ok = true;
+            }
+        }
+        if (! entry.ok)
+            entry.reason = "no plugin found in it (not a plugin, or it failed to load)";
+    }
+    return out;
+}
 
 int scanTimeoutMs()
 {

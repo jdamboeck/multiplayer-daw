@@ -768,6 +768,7 @@ public:
     }
 
     bool isAttached() const   { return attached; }
+    bool isCreated() const    { return created; }
 
 private:
     Instance& instance;
@@ -780,9 +781,11 @@ private:
 juce::AudioProcessorEditor* Instance::createEditor()
 {
     if (! hasEditor()) return nullptr;
-    auto* e = new Editor (*this);
-    editor = e;
-    return e;
+    auto e = std::make_unique<Editor> (*this);
+    // The plugin could not make its window: no editor, rather than an empty black one.
+    if (! e->isCreated()) return nullptr;
+    editor = e.get();
+    return e.release();
 }
 
 void Instance::requestResize (int w, int h)

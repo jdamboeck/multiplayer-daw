@@ -39,6 +39,8 @@ struct Shared
     std::atomic<double> outputLatency { 0 };
     /// When positionTick was last taken, in Time::getMillisecondCounterHiRes() milliseconds.
     std::atomic<double> positionTakenAt { 0 };
+    /// A plugin scan is in progress (for the traces).
+    std::atomic<bool> scanning { false };
 
     /// Adds an event. A parameter change replaces one still queued for the same parameter, and a
     /// device change one still queued, so a dragged knob does not flood the queue.
@@ -109,9 +111,37 @@ public:
     juce::MemoryBlock deviceGetState (uint64_t id);
     void deviceSetState (uint64_t id, const void* data, size_t size);
     void deviceResetState (uint64_t id);
-    void deviceShowEditor (uint64_t id, bool show);
+    void deviceShowEditor (uint64_t id, bool show, uint64_t token);
 
-    void pluginsScan (const juce::String& format);
+    // For mdaw_engine_test.h.
+    bool testEditorPressClose (uint64_t id);
+    bool testEditorState (uint64_t id, bool& visible, uint64_t& token) const;
+
+    /// A plugin scan, in steps (see mdaw_plugins_scan). Every step runs on the message thread;
+    /// between them, the caller runs the scanner on its own thread (examineInChild).
+    struct ScanPlan
+    {
+        bool staged = false;   // false: there was no scanner, and the scan is done
+        juce::String format;
+        juce::StringArray candidates;
+        juce::File scanner, result, log;
+        int timeoutMs = 0;
+    };
+    /// Checks the format and lists the candidates. Without a scanner it scans in this process,
+    /// saves, and returns a plan that is not staged.
+    ScanPlan scanStart (const juce::String& format);
+    struct ScanDecision
+    {
+        juce::String file;
+        juce::int64 stamp = 0;
+        bool examine = false;   // false: examined before, unchanged
+    };
+    /// For the candidates [from, to) of the plan: whether each needs examining.
+    std::vector<ScanDecision> scanDecide (const ScanPlan&, int from, int to);
+    /// Takes in what the scanner found in one file: it replaces what was known of the file.
+    void scanMerge (const juce::String& format, const ScanDecision&, const Examined&);
+    /// Saves the known-plugin list, the ids and the records, and deletes the scanner's files.
+    void scanFinish (const ScanPlan&);
     juce::String pluginsList();
     juce::String pluginsFailed();
 
@@ -191,13 +221,13 @@ private:
     /// in the known-plugin list wins.
     std::vector<std::pair<juce::PluginDescription, juce::String>> loadablePlugins();
     bool usesScanner() const { return config.scanner != juce::File(); }
+    juce::AudioPluginFormat* formatNamed (const juce::String& name) const;
     void scanInProcess (juce::AudioPluginFormat&);
-    void scanWithScanner (juce::AudioPluginFormat&);
-    void examineInChild (juce::AudioPluginFormat&, const juce::String& file, juce::int64 stamp,
-                         const juce::File& result, const juce::File& log, int timeoutMs);
     juce::int64 candidateStamp (juce::AudioPluginFormat&, const juce::String& file);
-    void closeEditor (uint64_t id);
-    void closeAllEditors();
+    /// Deletes the device's window, if any; with `notify`, MDAW_EVENT_EDITOR_CLOSED says so.
+    void closeEditor (uint64_t id, bool notify);
+    void closeAllEditors (bool notify);
+    void editorClosedEvent (uint64_t device, uint64_t token);
     int insertIndexFor (te::AudioTrack&, uint64_t after, const te::Plugin* moving) const;
 
     void timerCallback() override;

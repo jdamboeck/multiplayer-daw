@@ -87,6 +87,7 @@ fn main() {
         "mdaw-test-clap-crash",
         "mdaw-test-clap-hang",
         "mdaw-test-clap-stateless",
+        "mdaw-test-clap-gui",
     ]);
     run(
         compile,

@@ -4,12 +4,17 @@
  * The CLAP test synth is used if CLAP_PATH points at a folder with it (see the bridge brief).
  * The plugin scanner and the test plugins of test/bad_clap.c are found where CMake built them
  * (MDAW_TEST_SCANNER, MDAW_TEST_CLAP_DIR, compiled in; the environment variables of the same
- * names override them). */
+ * names override them).
+ *
+ * The plugin windows are tested only when MDAW_TEST_GUI=1 and DISPLAY is set; run that under a
+ * virtual display, never the desktop's: test/run_gui_tests.sh does. */
 #define _POSIX_C_SOURCE 200809L
 #define _DEFAULT_SOURCE
 #include "mdaw_engine.h"
+#include "mdaw_engine_test.h"
 
 #include <dirent.h>
+#include <pthread.h>
 #include <errno.h>
 #include <math.h>
 #include <stdio.h>
@@ -462,6 +467,164 @@ static double timedScan (mdaw_engine* e, mdaw_status* status)
     return now() - start;
 }
 
+static void touchLater (const char* path, int seconds)
+{
+    struct timeval times[2];
+    gettimeofday (&times[0], NULL);
+    times[0].tv_sec += seconds;
+    times[1] = times[0];
+    utimes (path, times);
+}
+
+/* A scan on a thread of its own. */
+typedef struct
+{
+    mdaw_engine* engine;
+    volatile int done;
+    double seconds;
+    mdaw_status status;
+} ScanJob;
+
+static void* scanThread (void* arg)
+{
+    ScanJob* job = arg;
+    double start = now();
+    job->status = mdaw_plugins_scan (job->engine, "CLAP");
+    job->seconds = now() - start;
+    __atomic_store_n (&job->done, 1, __ATOMIC_SEQ_CST);
+    return NULL;
+}
+
+static int scanDone (ScanJob* job) { return __atomic_load_n (&job->done, __ATOMIC_SEQ_CST); }
+
+/* The FILE line of the scan records (settings folder) for a file; empty if none. */
+static void recordLine (const char* settings, const char* file, char* out, size_t capacity)
+{
+    char path[1200], line[8192];
+    snprintf (path, sizeof path, "%s/plugin-scan.xml", settings);
+    out[0] = 0;
+    FILE* f = fopen (path, "r");
+    if (f == NULL) return;
+    while (fgets (line, sizeof line, f) != NULL)
+        if (strstr (line, file) != NULL) { snprintf (out, capacity, "%s", line); break; }
+    fclose (f);
+}
+
+/* -------- plugin windows (on a virtual display) ------------------------------------------ */
+
+/* Waits ms milliseconds while reading events; returns how many EDITOR_CLOSED events for the
+ * device came, and the token of the last one. Also notes whether one carried `unwanted`. */
+static int editorClosedEvents (mdaw_engine* e, uint64_t device, int ms, uint64_t* lastToken, uint64_t unwanted, int* sawUnwanted)
+{
+    int n = 0;
+    for (int waited = 0; waited <= ms; waited += 20)
+    {
+        mdaw_event ev;
+        while (mdaw_engine_poll_event (e, &ev))
+            if (ev.kind == MDAW_EVENT_EDITOR_CLOSED && ev.device == device)
+            {
+                printf ("event editor closed device=%llu token=%llu\n", (unsigned long long) ev.device, (unsigned long long) ev.token);
+                ++n;
+                if (lastToken != NULL) *lastToken = ev.token;
+                if (sawUnwanted != NULL && ev.token == unwanted) *sawUnwanted = 1;
+            }
+        if (waited < ms) sleepMs (20);
+    }
+    return n;
+}
+
+static int windowOf (mdaw_engine* e, uint64_t device, int32_t* visible, uint64_t* token)
+{
+    *visible = -1;
+    *token = 0;
+    return mdaw_test_editor_state (e, device, visible, token);
+}
+
+static void editorChecks (const char* scanner)
+{
+    mdaw_engine* e = createWith (SCRATCH "/settings-scanner", scanner);
+    check (e != NULL, "editor_engine_create");
+    if (e == NULL) { printLastError ("create for the editor checks"); return; }
+    enum { T = 60, A = 61, B = 62 };
+    mdaw_status s = mdaw_track_add (e, T, 0, "Windows");
+    s |= mdaw_device_add (e, T, A, 0, "CLAP", "org.mdaw.test-gui");
+    s |= mdaw_device_add (e, T, B, A, "CLAP", "org.mdaw.test-gui");
+    if (s != MDAW_OK) printLastError ("add the gui plugins");
+    check (s == MDAW_OK, "editor_devices_added");
+    int32_t visible;
+    uint64_t token, last;
+    int unwanted;
+
+    check (mdaw_device_show_editor (e, A, 1, 1) == MDAW_OK && windowOf (e, A, &visible, &token) == 1 && visible == 1 && token == 1,
+           "editor_open");
+    check (mdaw_device_show_editor (e, A, 1, 2) == MDAW_OK && windowOf (e, A, &visible, &token) == 1 && visible == 1 && token == 2,
+           "editor_open_again_one_window_new_token");
+    check (mdaw_device_show_editor (e, A, 0, 0) == MDAW_OK && windowOf (e, A, &visible, &token) == 0, "editor_close");
+    check (mdaw_device_show_editor (e, A, 0, 0) == MDAW_OK && windowOf (e, A, &visible, &token) == 0, "editor_close_again");
+    check (editorClosedEvents (e, A, 200, NULL, 0, NULL) == 0, "editor_close_sends_no_event");
+
+    /* The plugin failing to make its window. */
+    setenv ("MDAW_TEST_GUI_FAIL", "1", 1);
+    s = mdaw_device_show_editor (e, A, 1, 3);
+    unsetenv ("MDAW_TEST_GUI_FAIL");
+    check (s == MDAW_ERR_PLUGIN && windowOf (e, A, &visible, &token) == 0, "editor_gui_fail_plugin_no_window");
+    check (mdaw_device_show_editor (e, A, 1, 4) == MDAW_OK && windowOf (e, A, &visible, &token) == 1 && token == 4,
+           "editor_open_after_fail");
+
+    /* Closed by the user: the timer deletes it and says so, with its token. */
+    check (mdaw_test_editor_press_close (e, A) == MDAW_OK, "editor_press_close");
+    last = 0;
+    int closed = editorClosedEvents (e, A, 300, &last, 0, NULL);
+    check (closed == 1 && last == 4 && windowOf (e, A, &visible, &token) == 0, "editor_user_close_event_with_token");
+    check (mdaw_test_editor_press_close (e, A) == MDAW_ERR_NOT_FOUND, "editor_press_close_without_window");
+
+    /* Closed and opened again at once, many times: the window that was opened stays. */
+    check (mdaw_device_show_editor (e, A, 1, 100) == MDAW_OK, "editor_race_first_open");
+    for (int i = 1; i <= 20; ++i)
+    {
+        mdaw_test_editor_press_close (e, A);
+        mdaw_device_show_editor (e, A, 1, 100 + (uint64_t) i);
+    }
+    unwanted = 0;
+    editorClosedEvents (e, A, 300, NULL, 120, &unwanted);
+    check (windowOf (e, A, &visible, &token) == 1 && visible == 1 && token == 120 && ! unwanted, "editor_close_reopen_race");
+
+    /* Two windows; closing one leaves the other. */
+    check (mdaw_device_show_editor (e, B, 1, 200) == MDAW_OK, "editor_second_device_open");
+    mdaw_test_editor_press_close (e, A);
+    last = 0;
+    closed = editorClosedEvents (e, A, 300, &last, 0, NULL);
+    check (closed == 1 && last == 120 && windowOf (e, A, &visible, &token) == 0 && windowOf (e, B, &visible, &token) == 1
+           && token == 200 && visible == 1, "editor_two_windows_close_one");
+
+    /* The device removed with its window open. */
+    check (mdaw_device_remove (e, B) == MDAW_OK, "editor_device_removed");
+    last = 0;
+    closed = editorClosedEvents (e, B, 100, &last, 0, NULL);
+    check (closed == 1 && last == 200 && windowOf (e, B, &visible, &token) == 0, "editor_device_remove_event");
+
+    /* The project cleared with a window open. */
+    check (mdaw_device_show_editor (e, A, 1, 300) == MDAW_OK, "editor_open_before_clear");
+    check (mdaw_project_clear (e) == MDAW_OK, "editor_project_clear");
+    last = 0;
+    closed = editorClosedEvents (e, A, 100, &last, 0, NULL);
+    check (closed == 1 && last == 300 && windowOf (e, A, &visible, &token) == 0, "editor_project_clear_event");
+
+    /* A plugin slow to make its window. */
+    s = mdaw_track_add (e, T, 0, "Windows");
+    s |= mdaw_device_add (e, T, A, 0, "CLAP", "org.mdaw.test-gui");
+    setenv ("MDAW_TEST_GUI_DELAY_MS", "300", 1);
+    double start = now();
+    s |= mdaw_device_show_editor (e, A, 1, 400);
+    double took = now() - start;
+    unsetenv ("MDAW_TEST_GUI_DELAY_MS");
+    measure ("editor_slow_open_seconds", took);
+    check (s == MDAW_OK && took >= 0.3 && windowOf (e, A, &visible, &token) == 1 && token == 400, "editor_slow_open");
+    mdaw_device_show_editor (e, A, 0, 0);
+
+    mdaw_engine_destroy (e);
+}
+
 /* Good, crashing, hanging and stateless plugins in one CLAP folder, scanned with the scanner.
  * The machine's own CLAP folders are scanned as well (the format always looks there). */
 static void scannerChecks (int haveSynth)
@@ -480,7 +643,7 @@ static void scannerChecks (int haveSynth)
         check (system (command) == 0, "vst3_id_byte_order");
     }
 
-    char cwd[1024], dir[1200], crash[1300], hang[1300], stateless[1300], synth[1300], from[1300];
+    char cwd[1024], dir[1200], crash[1300], hang[1300], stateless[1300], synth[1300], gui[1300], from[1300];
     if (getcwd (cwd, sizeof cwd) == NULL) cwd[0] = 0;
     snprintf (dir, sizeof dir, "%s/" SCRATCH "/scan-clap", cwd);
     mkdir (dir, 0755);
@@ -491,7 +654,10 @@ static void scannerChecks (int haveSynth)
     snprintf (hang, sizeof hang, "%s/bad-hang.clap", dir);
     snprintf (stateless, sizeof stateless, "%s/test-stateless.clap", dir);
     snprintf (synth, sizeof synth, "%s/mdaw-test-synth.clap", dir);
+    snprintf (gui, sizeof gui, "%s/test-gui.clap", dir);
     int copied = 1;
+    snprintf (from, sizeof from, "%s/test-gui.clap", testPlugins);
+    copied &= copyFile (from, gui);
     snprintf (from, sizeof from, "%s/bad-crash.clap", testPlugins);
     copied &= copyFile (from, crash);
     snprintf (from, sizeof from, "%s/bad-hang.clap", testPlugins);
@@ -576,6 +742,88 @@ static void scannerChecks (int haveSynth)
         mdaw_device_get_param (e, 51, "0", &value);
         measure ("stateless_param_after_reset", value);
         check (reset == MDAW_OK && fabsf (value - 0.5f) < 0.01f && mdaw_project_has (e, MDAW_ENTITY_DEVICE, 51) == 1, "stateless_reset_to_defaults");
+
+        /* A plugin without a window of its own: no editor, before any window is made. */
+        check (mdaw_device_show_editor (e, 51, 1, 1) == MDAW_ERR_NOT_FOUND, "show_editor_no_gui_not_found");
+    }
+
+    /* One state read per round trip: a call with a buffer too small keeps what it read, and
+     * the next one with a buffer that fits returns it without asking the plugin again. */
+    {
+        mdaw_status a = mdaw_device_add (e, 50, 55, 51, "CLAP", "org.mdaw.test-gui");
+        if (a != MDAW_OK) printLastError ("add the gui plugin");
+        check (a == MDAW_OK, "gui_plugin_added");
+        uint8_t reference[256], small[1], fitting[256];
+        size_t n = mdaw_device_get_state (e, 55, reference, sizeof reference);
+        setenv ("MDAW_TEST_STATE_DELAY_MS", "300", 1);
+        double start = now();
+        size_t first = mdaw_device_get_state (e, 55, small, sizeof small);
+        size_t second = first <= sizeof fitting ? mdaw_device_get_state (e, 55, fitting, sizeof fitting) : 0;
+        double both = now() - start;
+        unsetenv ("MDAW_TEST_STATE_DELAY_MS");
+        measure ("state_round_trip_seconds", both);
+        check (n > 1 && n <= sizeof reference && first == n && second == n && memcmp (reference, fitting, n) == 0,
+               "state_round_trip_same_bytes");
+        check (both >= 0.3 && both < 0.55, "state_round_trip_one_read");
+        /* Kept only for the next call: another call in between drops it, and the plugin is
+         * asked again. */
+        setenv ("MDAW_TEST_STATE_DELAY_MS", "300", 1);
+        start = now();
+        first = mdaw_device_get_state (e, 55, small, sizeof small);
+        (void) mdaw_project_has (e, MDAW_ENTITY_DEVICE, 55);
+        second = mdaw_device_get_state (e, 55, fitting, sizeof fitting);
+        both = now() - start;
+        unsetenv ("MDAW_TEST_STATE_DELAY_MS");
+        check (second == n && both >= 0.6, "state_kept_only_for_next_call");
+        check (mdaw_device_remove (e, 55) == MDAW_OK, "gui_plugin_removed");
+    }
+
+    /* A scan does not hold the engine's thread while the scanner examines a file: other calls
+     * are answered, a known plugin is added and removed, and the timer keeps the position
+     * fresh. */
+    {
+        touchLater (hang, 20);
+        ScanJob job = { e, 0, 0.0, MDAW_OK };
+        pthread_t t;
+        pthread_create (&t, NULL, scanThread, &job);
+        sleepMs (300);
+        double worstHas = 0.0, worstAge = 0.0;
+        int during = 1, addOk = 1, samples = 0;
+        double start = now();
+        int added = mdaw_device_add (e, 50, 56, 51, "CLAP", "org.mdaw.test-stateless") == MDAW_OK
+                    && mdaw_project_has (e, MDAW_ENTITY_DEVICE, 56) == 1;
+        int removed = mdaw_device_remove (e, 56) == MDAW_OK && mdaw_project_has (e, MDAW_ENTITY_DEVICE, 56) == 0;
+        double addRemove = now() - start;
+        addOk = added && removed;
+        during = ! scanDone (&job);
+        while (! scanDone (&job))
+        {
+            double t0 = now();
+            (void) mdaw_project_has (e, MDAW_ENTITY_TRACK, 50);
+            double took = now() - t0;
+            if (took > worstHas) worstHas = took;
+            mdaw_engine_state st;
+            mdaw_engine_state_read (e, &st);
+            if (st.position_age_seconds > worstAge) worstAge = st.position_age_seconds;
+            ++samples;
+            sleepMs (50);
+        }
+        pthread_join (t, NULL);
+        measure ("scan_beside_seconds", job.seconds);
+        measure ("scan_beside_worst_has_seconds", worstHas);
+        measure ("scan_beside_worst_position_age", worstAge);
+        measure ("scan_beside_add_remove_seconds", addRemove);
+        measure ("scan_beside_samples", samples);
+        check (during && samples > 10, "scan_beside_ran_during_scan");
+        check (job.status == MDAW_OK && job.seconds >= 3.0, "scan_beside_took_the_time_limit");
+        check (worstHas < 1.0, "scan_beside_calls_answered");
+        check (addOk, "scan_beside_device_add_remove");
+        check (worstAge < 1.0, "scan_beside_timer_runs");
+        failed = failedJson (e);
+        reasonFor (failed, hang, hangReason, sizeof hangReason);
+        check (strstr (hangReason, "hung") != NULL, "scan_beside_hang_recorded");
+        free (failed);
+        check (noChildren(), "scan_beside_children_reaped");
     }
     if (haveSynth)
     {
@@ -608,6 +856,45 @@ static void scannerChecks (int haveSynth)
         mdaw_engine_destroy (e);
     }
     check (noChildren(), "scanner_no_children_at_end");
+
+    /* Plugin windows, on a virtual display only. */
+    const char* wantGui = getenv ("MDAW_TEST_GUI");
+    const char* display = getenv ("DISPLAY");
+    if (wantGui != NULL && strcmp (wantGui, "1") == 0 && display != NULL && *display != 0)
+        editorChecks (scanner);
+    else
+        printf ("RESULT editor_checks_skipped=1\n");
+
+    /* Cancel, last: it is for the engine's life. */
+    e = createWith (SCRATCH "/settings-scanner", scanner);
+    check (e != NULL, "cancel_engine_create");
+    if (e == NULL) return;
+    {
+        touchLater (hang, 40);
+        char before[8192], after[8192];
+        recordLine (SCRATCH "/settings-scanner", hang, before, sizeof before);
+        ScanJob job = { e, 0, 0.0, MDAW_OK };
+        pthread_t t;
+        pthread_create (&t, NULL, scanThread, &job);
+        sleepMs (300);
+        double cancelledAt = now();
+        check (mdaw_plugins_scan_cancel (e) == MDAW_OK, "cancel_ok");
+        while (! scanDone (&job) && now() - cancelledAt < 5.0) sleepMs (10);
+        double took = now() - cancelledAt;
+        pthread_join (t, NULL);
+        measure ("cancel_return_seconds", took);
+        measure ("cancelled_scan_seconds", job.seconds);
+        check (job.status == MDAW_ERR_CANCELLED && took < 3.0, "cancel_returns_cancelled");
+        recordLine (SCRATCH "/settings-scanner", hang, after, sizeof after);
+        printf ("hang record before: %safter: %s", before, after);
+        check (before[0] != 0 && strcmp (before, after) == 0, "cancel_leaves_record");
+        check (noChildren() && system ("pgrep -f 'mdaw-plugin-scan CLAP .*/bad[-]' > /dev/null") != 0, "cancel_no_children");
+        double start = now();
+        mdaw_status again = mdaw_plugins_scan (e, "CLAP");
+        check (again == MDAW_ERR_CANCELLED && now() - start < 0.5, "cancel_is_sticky");
+        check (mdaw_plugins_scan_cancel (NULL) == MDAW_ERR_ARGUMENT, "cancel_null_engine");
+    }
+    mdaw_engine_destroy (e);
 }
 
 int main (void)
@@ -701,9 +988,10 @@ int main (void)
         s |= mdaw_device_move (e, 999, 0);
         s |= mdaw_device_set_bypass (e, 999, 1);
         s |= mdaw_device_set_param (e, 999, "x", 0.5f);
-        s |= mdaw_device_show_editor (e, 999, 1);
+        s |= mdaw_device_show_editor (e, 999, 0, 0);
         s |= mdaw_tempo_remove (e, 999);
         check (s == MDAW_OK, "missing_ids_ok");
+        check (mdaw_device_show_editor (e, 999, 1, 1) == MDAW_ERR_NOT_FOUND, "show_editor_missing_device_not_found");
         check (mdaw_device_get_state (e, 999, NULL, 0) == 0, "missing_device_no_state");
 
         char error[512];
@@ -1004,7 +1292,7 @@ int main (void)
         int events = drainEvents (e);
         measure ("events_after_own_changes", events);
         check (events == 0, "no_echo_events_builtin");
-        check (mdaw_device_show_editor (e, SYNTH, 1) == MDAW_ERR_NOT_FOUND, "builtin_has_no_editor");
+        check (mdaw_device_show_editor (e, SYNTH, 1, 1) == MDAW_ERR_NOT_FOUND, "builtin_has_no_editor");
     }
 
     /* 10. An external plugin -------------------------------------------------------------- */
@@ -1140,9 +1428,9 @@ int main (void)
                 check (events == 0, "no_echo_events_external");
             }
             /* Reported only: whether the test synth has a window depends on the plugin. */
-            mdaw_status editor = mdaw_device_show_editor (e, EXT, 1);
+            mdaw_status editor = mdaw_device_show_editor (e, EXT, 1, 1);
             printf ("RESULT external_editor_status=%d\n", (int) editor);
-            if (editor == MDAW_OK) mdaw_device_show_editor (e, EXT, 0);
+            if (editor == MDAW_OK) mdaw_device_show_editor (e, EXT, 0, 0);
             check (mdaw_device_remove (e, EXT) == MDAW_OK && mdaw_project_has (e, MDAW_ENTITY_DEVICE, EXT) == 0, "external_removed");
         }
     }

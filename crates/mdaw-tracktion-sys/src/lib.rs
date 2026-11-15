@@ -11,7 +11,7 @@
 
 use std::ffi::c_char;
 
-pub const MDAW_ABI_VERSION: u32 = 4;
+pub const MDAW_ABI_VERSION: u32 = 5;
 pub const MDAW_TICKS_PER_QUARTER: i64 = 960;
 
 /// Opaque engine handle.
@@ -32,6 +32,8 @@ pub const MDAW_ERR_DEVICE: mdaw_status = 3;
 pub const MDAW_ERR_PLUGIN: mdaw_status = 4;
 pub const MDAW_ERR_IO: mdaw_status = 5;
 pub const MDAW_ERR_INTERNAL: mdaw_status = 6;
+/// ABI 5.
+pub const MDAW_ERR_CANCELLED: mdaw_status = 7;
 
 /// `mdaw_entity_kind`, as `mdaw_project_has` takes it.
 pub type mdaw_entity_kind = i32;
@@ -97,6 +99,8 @@ pub struct mdaw_event {
     pub device: u64,
     pub value: f32,
     pub param_id: [c_char; 64],
+    /// ABI 5.
+    pub token: u64,
 }
 
 impl Default for mdaw_event {
@@ -106,6 +110,7 @@ impl Default for mdaw_event {
             device: 0,
             value: 0.0,
             param_id: [0; 64],
+            token: 0,
         }
     }
 }
@@ -225,10 +230,16 @@ unsafe extern "C" {
         length: usize,
     ) -> mdaw_status;
     pub fn mdaw_device_reset_state(engine: *mut mdaw_engine, device: u64) -> mdaw_status;
-    pub fn mdaw_device_show_editor(engine: *mut mdaw_engine, device: u64, show: i32) -> mdaw_status;
+    pub fn mdaw_device_show_editor(
+        engine: *mut mdaw_engine,
+        device: u64,
+        show: i32,
+        token: u64,
+    ) -> mdaw_status;
 
     // ---- plugins on this machine
     pub fn mdaw_plugins_scan(engine: *mut mdaw_engine, format: *const c_char) -> mdaw_status;
+    pub fn mdaw_plugins_scan_cancel(engine: *mut mdaw_engine) -> mdaw_status;
     pub fn mdaw_plugins_list(engine: *mut mdaw_engine, buffer: *mut c_char, capacity: usize) -> usize;
     pub fn mdaw_plugins_failed(engine: *mut mdaw_engine, buffer: *mut c_char, capacity: usize) -> usize;
 
@@ -327,14 +338,15 @@ mod tests {
             [8, 16, 24, 32, 40, 44, 48, 52, 56, 64, 72]
         );
 
-        assert_eq!((size_of::<mdaw_event>(), align_of::<mdaw_event>()), (88, 8));
+        assert_eq!((size_of::<mdaw_event>(), align_of::<mdaw_event>()), (96, 8));
         assert_eq!(
             [
                 offset_of!(mdaw_event, device),
                 offset_of!(mdaw_event, value),
                 offset_of!(mdaw_event, param_id),
+                offset_of!(mdaw_event, token),
             ],
-            [8, 16, 20]
+            [8, 16, 20, 88]
         );
 
         // The C enums are int-sized.

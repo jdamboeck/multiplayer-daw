@@ -342,7 +342,7 @@ fn the_engine_follows_the_model() {
     let engine = Engine::new(config()).expect("create the engine");
     println!("versions: {}", engine.versions());
     assert!(engine.versions().contains("JUCE"), "versions");
-    assert_eq!(mdaw_tracktion::abi_version(), 4);
+    assert_eq!(mdaw_tracktion::abi_version(), 5);
     assert!(
         !engine.versions().contains("Tracktion Engine Tracktion Engine"),
         "versions: name not doubled"
