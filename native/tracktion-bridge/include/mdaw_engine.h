@@ -97,8 +97,11 @@ int32_t mdaw_project_has(mdaw_engine* engine, int32_t kind, uint64_t id);
 
 /* Removes everything: tracks, tempo points, mappings. Playback stops, at 0, loop off; tempo
  * 120, master 0 dB. A full clear replaces the edit and takes about 600 ms (teardown gaps, doc
- * point 7). A clear of an edit nothing has changed since it was made (a new engine, or right
- * after a clear) returns at once; afterwards the engine is as after a full clear. */
+ * point 7). A clear of an edit nothing has changed since it was made returns at once; afterwards
+ * the engine is as after a full clear. That is only the first clear on a new engine and a clear
+ * right after a clear: any other call that changes the edit or the transport (also play, stop,
+ * seek, loop and render, and the master gain every project load sets) makes the next clear a
+ * full one. */
 mdaw_status mdaw_project_clear(mdaw_engine* engine);
 
 /* Tempo map. A point at tick 0 always exists (120 bpm until put). bpm in thousandths. One

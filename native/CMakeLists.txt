@@ -16,7 +16,10 @@ endif()
 # plugin host still gives a backtrace with file:line, but no local variables or types. Full
 # debug info made every Rust binary that links the bridge about 800 MB (some 240 MB of it from
 # here) and target/debug grow to 60 GB. Set before JUCE and Tracktion are added, so they get it
-# too; a normal variable, so it also wins over the -g already in an existing cache.
+# too; a normal variable, so it also wins over the -g already in an existing cache. That also
+# means that while the option is off, CMAKE_C/CXX_FLAGS_RELWITHDEBINFO given with -D or set in
+# the cache are ignored, though ccmake and CMakeCache.txt still show them: set
+# MDAW_NATIVE_FULL_DEBUG=ON to build with your own flags.
 option(MDAW_NATIVE_FULL_DEBUG "Build the native code with full debug info (-g)" OFF)
 if(NOT MDAW_NATIVE_FULL_DEBUG AND NOT MSVC)
     set(CMAKE_C_FLAGS_RELWITHDEBINFO "-O2 -g1 -DNDEBUG")

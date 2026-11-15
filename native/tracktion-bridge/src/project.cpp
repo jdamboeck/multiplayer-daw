@@ -396,6 +396,11 @@ void Project::forgetProject()
     tracks.clear();
     tempos.clear();
     loopStart = loopEnd = 0;
+    // The timer only refreshes the position while there is an edit, so a state read right after
+    // a clear would otherwise still show the old one.
+    shared.positionTick = 0;
+    shared.positionSeconds = 0.0;
+    shared.positionTakenAt = juce::Time::getMillisecondCounterHiRes();
 }
 
 /// Takes the edit out of use; the next step deletes it.

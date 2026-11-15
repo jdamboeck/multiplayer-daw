@@ -418,15 +418,27 @@ static int projectEmpty (mdaw_engine* e)
            && mdaw_project_has (e, MDAW_ENTITY_DEVICE, SYNTH) == 0 && mdaw_project_has (e, MDAW_ENTITY_TEMPO, TEMPO0) == 0;
 }
 
+/* Whether the engine stands at 0, read at once (no wait for the timer). */
+static int stoppedAtZero (mdaw_engine* e)
+{
+    mdaw_engine_state st;
+    memset (&st, 0, sizeof st);
+    mdaw_engine_state_read (e, &st);
+    return st.playing == 0 && st.position_tick == 0 && st.position_seconds == 0.0;
+}
+
 /* A clear of an edit nothing has changed returns at once; after any change it replaces the edit
- * (two teardown gaps of 300 ms). Either way the project is empty afterwards, and the same
- * project renders the same (the built-in synth varies by a few tenths of a percent from render
- * to render; 5 % allowed). On a new engine. */
+ * (two teardown gaps of 300 ms). Either way the project is empty and the engine stopped at 0
+ * afterwards, and the same project renders the same (the built-in synth varies by a few tenths
+ * of a percent from render to render; 5 % allowed). On a new engine.
+ * Kept clears take well under a millisecond and full ones at least 0.6 s, so the bound for a
+ * kept clear is generous (0.3 s) to stay clear of a busy machine's scheduling delays. */
 static void clearChecks (mdaw_engine* e, mdaw_note* notes)
 {
+    const double kept = 0.3, full = 0.5;
     double took = timedClear (e);
     measure ("clear_unchanged_seconds", took);
-    check (took >= 0.0 && took < 0.05 && projectEmpty (e), "clear_unchanged_returns_at_once");
+    check (took >= 0.0 && took < kept && projectEmpty (e) && stoppedAtZero (e), "clear_unchanged_returns_at_once");
     build (e, notes);
     Wav w = render (e, "after_kept_edit", 0, 8 * Q);
     double keptPeak = peakOf (&w);
@@ -435,24 +447,41 @@ static void clearChecks (mdaw_engine* e, mdaw_note* notes)
 
     took = timedClear (e);
     measure ("clear_after_build_seconds", took);
-    check (took >= 0.5 && projectEmpty (e), "clear_after_build_full");
+    check (took >= full && projectEmpty (e) && stoppedAtZero (e), "clear_after_build_full");
     took = timedClear (e);
-    check (took >= 0.0 && took < 0.05, "clear_twice_returns_at_once");
+    check (took >= 0.0 && took < kept && stoppedAtZero (e), "clear_twice_returns_at_once");
 
     /* Each single change makes the next clear a full one. */
     check (mdaw_master_set_gain (e, 0.5f) == MDAW_OK, "clear_master_gain");
     took = timedClear (e);
     measure ("clear_after_master_gain_seconds", took);
-    check (took >= 0.5, "clear_after_master_gain_full");
+    check (took >= full, "clear_after_master_gain_full");
     check (mdaw_tempo_put (e, TEMPO0, 0, 90000) == MDAW_OK, "clear_tempo_put");
     took = timedClear (e);
-    check (took >= 0.5 && projectEmpty (e), "clear_after_tempo_full");
+    check (took >= full && projectEmpty (e), "clear_after_tempo_full");
     check (mdaw_track_add (e, TRACK, 0, "T") == MDAW_OK, "clear_track_add");
     took = timedClear (e);
-    check (took >= 0.5 && projectEmpty (e), "clear_after_track_add_full");
+    check (took >= full && projectEmpty (e), "clear_after_track_add_full");
+    /* The timer does not refresh the position while the edit is being replaced: the clear
+     * itself must leave the state at 0. */
     check (mdaw_transport_seek (e, 4 * Q) == MDAW_OK, "clear_seek");
     took = timedClear (e);
-    check (took >= 0.5, "clear_after_seek_full");
+    check (took >= full && stoppedAtZero (e), "clear_after_seek_full_at_zero");
+    check (mdaw_transport_play (e) == MDAW_OK, "clear_play");
+    took = timedClear (e);
+    check (took >= full && stoppedAtZero (e), "clear_after_play_full_stopped");
+    check (mdaw_transport_stop (e) == MDAW_OK, "clear_stop");
+    took = timedClear (e);
+    check (took >= full, "clear_after_stop_full");
+    check (mdaw_transport_set_loop (e, 0, 4 * Q) == MDAW_OK, "clear_set_loop");
+    took = timedClear (e);
+    check (took >= full, "clear_after_set_loop_full");
+    /* Render on an edit nothing else has changed: the empty project renders silence. */
+    w = render (e, "empty_after_clear", 0, Q);
+    check (w.ok && peakOf (&w) == 0.0, "clear_render_empty");
+    freeWav (&w);
+    took = timedClear (e);
+    check (took >= full, "clear_after_render_full");
 
     build (e, notes);
     w = render (e, "after_new_edit", 0, 8 * Q);
@@ -460,7 +489,7 @@ static void clearChecks (mdaw_engine* e, mdaw_note* notes)
     measure ("after_new_edit_peak", newPeak);
     check (keptPeak > 0.05 && fabs (newPeak - keptPeak) < 0.05 * keptPeak, "kept_edit_renders_as_new_one");
     freeWav (&w);
-    check (timedClear (e) >= 0.5 && projectEmpty (e), "clear_after_render");
+    check (timedClear (e) >= full && projectEmpty (e), "clear_after_new_edit_full");
 }
 
 static char* failedJson (mdaw_engine* e)

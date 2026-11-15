@@ -79,7 +79,10 @@ The native code is built with `-g1` (function names and line numbers for backtra
 variables), and Cargo builds dependencies with line tables only, so that the test binaries stay
 small. For full debug info of the native side, configure once with
 `cmake -S native -B target/native -DMDAW_NATIVE_FULL_DEBUG=ON` and build again (about ten
-minutes); `-DMDAW_NATIVE_FULL_DEBUG=OFF` goes back.
+minutes); `-DMDAW_NATIVE_FULL_DEBUG=OFF` goes back. While it is off, the project's
+RelWithDebInfo flags override any `CMAKE_C_FLAGS_RELWITHDEBINFO` or
+`CMAKE_CXX_FLAGS_RELWITHDEBINFO` given with `-D` or in the cache (which `ccmake` and
+`CMakeCache.txt` still show), so turn it on to use your own.
 
 `native/CMakeLists.txt` passes `-Wno-template-body`: GCC 15 and later reject the bundled
 `nanorange.hpp` without it. Older GCC ignores the unknown option (see the comment there). The
@@ -198,7 +201,10 @@ These were all found by running into them.
    once with `RTLD_NODELETE` before use fixes it (5 of 5 pass).
 7. **Drain the message loop before and after destroying an edit** (about 300 ms), or VST3
    teardown can crash. So the bridge's `mdaw_project_clear` takes about 600 ms, except on an
-   edit nothing has changed since it was made (a new engine, a second clear): that one it keeps.
+   edit nothing has changed since it was made: that one it keeps. That saves the 600 ms only on
+   the first load on a new engine (and on a clear right after a clear): `mdaw-tracktion`'s
+   `load_project` sets the master gain after its clear, so every later clear or reload is a full
+   one.
 8. **A parameter reaches the plugin with the next processed block.** Set a value, save
    immediately, and the saved state has the old value. Tracktion passes the value to JUCE's
    parameter at once, on the message thread; what the format does with it then:

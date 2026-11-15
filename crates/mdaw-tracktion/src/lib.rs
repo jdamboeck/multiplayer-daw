@@ -513,8 +513,10 @@ impl Engine {
     }
 
     /// Removes everything: tracks, tempo points, mappings. Playback stops. Takes about 600 ms
-    /// (the edit is replaced), unless nothing has changed the edit since it was made (a new
-    /// engine, or right after a clear): then it returns at once, with the same result.
+    /// (the edit is replaced), unless nothing has changed the edit since it was made: then it
+    /// returns at once, with the same result. That is only the first clear on a new engine and a
+    /// clear right after a clear; [`load_project`] sets the master gain after its clear, so every
+    /// later clear or load is a full one.
     pub fn clear(&self) -> Result<(), Error> {
         // SAFETY: valid handle.
         check(unsafe { sys::mdaw_project_clear(self.ptr()) })
