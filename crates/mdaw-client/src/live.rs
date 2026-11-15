@@ -11,11 +11,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use mdaw_engine::clock;
-use mdaw_engine::midi::{self, MidiDevice, MidiMsg};
 use mdaw_model::TrackId;
 
 use crate::audio::LiveSink;
+use crate::clock;
+use crate::midi::{self, MidiDevice, MidiMsg};
 
 /// Engine keys of this player's notes: the pitch is added.
 const OWN_KEY: u64 = 1 << 40;

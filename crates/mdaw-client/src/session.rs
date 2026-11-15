@@ -10,7 +10,6 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use mdaw_dsp::pocket;
-use mdaw_engine::clock;
 use mdaw_model::{
     ActorId, BlobHash, BuiltinKind, Device, DeviceId, DeviceKind, EntityRef, IdGen, Op, Project, TempoMap,
     TempoPoint, Tick, TickRange, TrackContent, TrackId, TrackShell, UserId, apply, apply_all,
@@ -21,6 +20,7 @@ use mdaw_sync::{Gesture, Loopback, Replica};
 
 use crate::audio::{Audio, DeviceStatus, EditorState, ParamEntry, PluginEntry, TrackSound};
 use crate::audio_old::OldAudio;
+use crate::clock;
 use crate::link::{Link, LinkEvent, Upload, Waker, Who};
 use crate::live::Live;
 use crate::outbox::{self, Outbox};

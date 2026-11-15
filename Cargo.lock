@@ -2593,6 +2593,7 @@ dependencies = [
  "mdaw-sync",
  "mdaw-test-plugin",
  "mdaw-tracktion",
+ "midir",
  "postcard",
  "quinn",
  "serde",
@@ -2617,7 +2618,6 @@ dependencies = [
  "cpal",
  "mdaw-dsp",
  "mdaw-model",
- "midir",
  "rtrb",
 ]
 

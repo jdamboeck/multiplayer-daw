@@ -15,7 +15,6 @@ mdaw-model.workspace = true
 mdaw-dsp.workspace = true
 rtrb.workspace = true
 cpal.workspace = true
-midir.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 cpal = { workspace = true, features = ["pipewire"] }

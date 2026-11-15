@@ -182,7 +182,12 @@ impl Audio for OldAudio {
     }
 
     fn position_heard(&self) -> (f64, i64) {
-        self.engine.position_heard()
+        // The engine times the playhead on its own clock; the session compares it with
+        // `crate::clock`, whose origin differs. Only differences mean anything on either, so the
+        // time is carried over as how far from now it is.
+        let (tick, at) = self.engine.position_heard();
+        let ahead = at - mdaw_engine::clock::now_micros();
+        (tick, crate::clock::now_micros() + ahead)
     }
 
     fn live(&self) -> Arc<dyn LiveSink> {

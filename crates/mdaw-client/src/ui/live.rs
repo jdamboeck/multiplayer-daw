@@ -7,8 +7,8 @@ use egui::{Button, ComboBox, Event, Key, RichText, Ui};
 use mdaw_model::TrackId;
 
 use crate::live::MidiWatch;
+use crate::midi;
 use crate::{DawApp, theme};
-use mdaw_engine::midi;
 
 /// The keys that play, with their semitone above the octave's C: two rows like a piano's
 /// white and black keys.

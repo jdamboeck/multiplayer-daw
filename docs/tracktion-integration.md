@@ -375,7 +375,7 @@ Added 2026-11-13 for the client (feature `tracktion` of `mdaw-client`).
   Launchkey on this machine), but a port reaches a track only through an input destination
   assigned to it (`InputDeviceInstance::setTarget`; `createLiveInputsNode` takes only inputs
   whose targets contain the track), and the bridge assigns none. So notes from a MIDI device are
-  not played twice: the client reads the port itself (midir, `mdaw_engine::midi`) and plays the
+  not played twice: the client reads the port itself (midir, `mdaw-client`'s `midi`) and plays the
   notes with `mdaw_track_live_note`. Not done: closing Tracktion's ports. On Linux (ALSA
   sequencer) several readers of one port are fine; on Windows a port opened by Tracktion would
   be busy for the client.

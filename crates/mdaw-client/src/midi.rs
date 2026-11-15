@@ -1,6 +1,5 @@
 //! MIDI input devices, through `midir`.
 
-use crate::EngineError;
 use midir::{Ignore, MidiInput, MidiInputConnection};
 
 const CLIENT_NAME: &str = "mdaw";
@@ -78,14 +77,14 @@ pub struct MidiDevice {
 impl MidiDevice {
     /// Opens the input called `name` (see [`same_device`]). `on_msg` is called on a thread of the MIDI system for
     /// every message, as it arrives.
-    pub fn open(name: &str, mut on_msg: impl FnMut(MidiMsg) + Send + 'static) -> Result<Self, EngineError> {
-        let mut input = MidiInput::new(CLIENT_NAME).map_err(crate::engine::err)?;
+    pub fn open(name: &str, mut on_msg: impl FnMut(MidiMsg) + Send + 'static) -> Result<Self, String> {
+        let mut input = MidiInput::new(CLIENT_NAME).map_err(|e| e.to_string())?;
         input.ignore(Ignore::All);
         let port = input
             .ports()
             .into_iter()
             .find(|port| input.port_name(port).is_ok_and(|n| same_device(&n, name)))
-            .ok_or_else(|| crate::engine::err(format!("no MIDI input called {name}")))?;
+            .ok_or_else(|| format!("no MIDI input called {name}"))?;
         let connection = input
             .connect(
                 &port,
@@ -97,7 +96,7 @@ impl MidiDevice {
                 },
                 (),
             )
-            .map_err(crate::engine::err)?;
+            .map_err(|e| e.to_string())?;
         Ok(Self {
             name: name.to_string(),
             _connection: connection,

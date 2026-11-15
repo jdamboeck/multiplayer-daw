@@ -139,7 +139,7 @@ pub trait Audio: Any {
     fn is_playing(&self) -> bool;
     /// The playhead in ticks.
     fn position(&self) -> f64;
-    /// The playhead in ticks, with when it is heard on `mdaw_engine::clock::now_micros`.
+    /// The playhead in ticks, with when it is heard on [`crate::clock::now_micros`].
     fn position_heard(&self) -> (f64, i64);
 
     // ---- live notes and what is heard

@@ -46,7 +46,6 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use mdaw_engine::clock;
 use mdaw_model::{
     BlobHash, BuiltinKind, DeviceId, DeviceKind, Op, PluginFormat, Project, Tick, TickRange, TrackContent,
     TrackId,
@@ -57,6 +56,7 @@ use crate::audio::{
     Audio, DeviceStatus, EditorState, LiveSink, ParamEntry, PluginEntry, SavedState, TrackSound,
     track_sound_from,
 };
+use crate::clock;
 use crate::engine_queue::{Class, EngineQueue, JobInfo, Key, Picked, Spec};
 use crate::link::Waker;
 

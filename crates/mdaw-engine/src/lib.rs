@@ -6,6 +6,4 @@ pub mod clock;
 pub(crate) mod engine;
 mod rt;
 
-pub mod midi;
-
 pub use engine::{Engine, EngineError, LiveInput, Stats};

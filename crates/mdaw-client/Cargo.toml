@@ -28,6 +28,7 @@ tokio.workspace = true
 eframe.workspace = true
 egui.workspace = true
 chrono.workspace = true
+midir.workspace = true
 mdaw-tracktion = { workspace = true, optional = true }
 
 [features]

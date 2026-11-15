@@ -9,9 +9,11 @@ pub mod audio;
 pub mod audio_old;
 #[cfg(feature = "tracktion")]
 pub mod audio_tracktion;
+pub mod clock;
 pub mod engine_queue;
 mod link;
 pub mod live;
+pub mod midi;
 pub mod outbox;
 pub mod plugins;
 pub mod profile;
