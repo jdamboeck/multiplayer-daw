@@ -53,7 +53,10 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU")
     target_compile_options(mdaw_engine_config INTERFACE -Wno-unknown-pragmas)
     # Tracktion v3.2.0 bundles nanorange, which has a typo in a template body that is never
     # instantiated. GCC 15 and later diagnose such bodies as errors; this turns that back into
-    # the old behaviour without touching the pinned sources.
+    # the old behaviour without touching the pinned sources. Older GCC (13 and 14, as on Ubuntu)
+    # does not know the flag, but GCC accepts any unknown -Wno- option silently, so the check
+    # below passes and the flag is passed there too; it is only mentioned (as a warning, never an
+    # error) when some other diagnostic is printed for the same file. We rely on that.
     include(CheckCXXCompilerFlag)
     check_cxx_compiler_flag(-Wno-template-body MDAW_HAS_WNO_TEMPLATE_BODY)
     if(MDAW_HAS_WNO_TEMPLATE_BODY)

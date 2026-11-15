@@ -4,24 +4,82 @@ on:
     branches: [main]
   pull_request:
 
+# Linux only: the Tracktion bridge builds on Linux only so far (docs/retire-rust-engine.md,
+# decision 1). The client links it, so every run builds the native part (JUCE and Tracktion,
+# about ten minutes cold) and keeps its build folder, target/native, in a cache of its own.
 jobs:
   test:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # Some nested submodules of Tracktion use SSH URLs.
+      - name: Submodules
+        run: git -c url."https://github.com/".insteadOf="git@github.com:" submodule update --init --recursive --depth 1
       - uses: dtolnay/rust-toolchain@1.97.1
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
-      - name: Linux audio and windowing headers
-        if: runner.os == 'Linux'
+      # winit and egui (X11, Wayland, xkbcommon), midir (ALSA), and JUCE: ALSA, the JACK headers,
+      # X11 and its extensions for plugin windows, freetype and fontconfig, LADSPA. curl and
+      # WebKit are off in the native build. xvfb and xprop (x11-utils) for the window tests.
+      - name: System packages
         run: |
           sudo apt-get update
-          sudo apt-get install -y libasound2-dev libjack-jackd2-dev libpipewire-0.3-dev libclang-dev libx11-dev libxcb1-dev libxkbcommon-dev libwayland-dev
+          sudo apt-get install -y cmake ninja-build pkg-config \
+            libasound2-dev libjack-jackd2-dev libx11-dev libxcb1-dev libxkbcommon-dev libwayland-dev \
+            libxext-dev libxrandr-dev libxinerama-dev libxcursor-dev libxcomposite-dev libxrender-dev \
+            libfreetype-dev libfontconfig1-dev ladspa-sdk \
+            xvfb x11-utils
+      # The key names the runner image, the submodule commits and the blobs of every file under
+      # native/ (the submodules included as their commits), so an exact hit is a build folder of
+      # exactly these sources. A fallback (same image and submodules, other own sources) is
+      # rebuilt where the own sources differ; see the next step.
+      # This step comes after rust-cache on purpose: post steps run in reverse order, so this
+      # cache is saved before rust-cache's post step prunes everything under target/ that is
+      # not a Cargo profile, which includes target/native.
+      - name: Native cache key
+        id: native-key
+        run: |
+          modules=$(git submodule status --recursive | sha256sum | cut -c1-16)
+          sources=$(git ls-files -s -- native | sha256sum | cut -c1-16)
+          echo "prefix=native-$ImageOS-$modules-" >> "$GITHUB_OUTPUT"
+          echo "key=native-$ImageOS-$modules-$sources" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        id: native-cache
+        with:
+          path: target/native
+          key: ${{ steps.native-key.outputs.key }}
+          restore-keys: ${{ steps.native-key.outputs.prefix }}
+      # Ninja compares times: after a checkout every source is newer than the cached objects and
+      # everything would be compiled again. The submodules are the commits in the key, so they
+      # get a time before any build; so do the own sources on an exact hit. On a fallback the own
+      # sources keep the checkout time and what depends on them is rebuilt.
+      - name: Native source times
+        run: |
+          [ -f target/native/CMakeCache.txt ] || exit 0
+          git submodule foreach --recursive --quiet 'git ls-files -z | xargs -0 -r touch -h -d 2000-01-01T00:00:00Z'
+          if [ "${{ steps.native-cache.outputs.cache-hit }}" = "true" ]; then
+            git ls-files -z -- native | xargs -0 -r touch -h -d 2000-01-01T00:00:00Z
+          fi
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --exclude mdaw-tracktion --exclude mdaw-tracktion-sys --all-targets -- -D warnings
-      - run: cargo test --workspace --exclude mdaw-tracktion --exclude mdaw-tracktion-sys
+      # The first cargo command runs mdaw-tracktion-sys's build script, which configures and
+      # builds target/native.
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      # The test synth as a .clap file where the bridge's C test (and the Tracktion crates'
+      # tests) look for it.
+      - name: Test synth
+        run: |
+          cargo build -p mdaw-test-plugin
+          mkdir -p target/bridge-scratch/clap
+          cp target/debug/libmdaw_test_plugin.so target/bridge-scratch/clap/mdaw-test-synth.clap
+      # No display: the tests that need one are ignored here and run below on a virtual one.
+      - run: env -u DISPLAY -u WAYLAND_DISPLAY cargo test --workspace
+      - name: Bridge C test
+        run: |
+          cmake --build target/native --target mdaw-bridge-test
+          env -u DISPLAY -u WAYLAND_DISPLAY CLAP_PATH="$PWD/target/bridge-scratch/clap" \
+            target/native/tracktion-bridge/mdaw-bridge-test
+      - name: Window tests (Xvfb)
+        run: |
+          native/tracktion-bridge/test/run_gui_tests.sh
+          native/tracktion-bridge/test/run_gui_tests.sh cargo test -p mdaw-client --test editor_gui -- --ignored
