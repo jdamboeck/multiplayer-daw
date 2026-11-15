@@ -12,7 +12,7 @@
 use mdaw_model::{
     ActorId, BlobHash, BuiltinKind, Clip, ClipId, ClipProp, Device, DeviceId, DeviceKind, IdGen, MixProp,
     Note, NoteId, NoteProp, Op, PluginFormat, Project, TempoId, TempoPoint, Tick, TrackContent, TrackId,
-    TrackShell,
+    TrackShell, two_osc,
 };
 use mdaw_tracktion::{
     Config, Engine, EntityKind, Event, Problem, Status, apply_op, load_project, sync_project,
@@ -174,7 +174,7 @@ fn assert_same_envelope(a: &Wav, b: &Wav, step: &str) {
     }
     assert!(sounding > 0, "{step}: nothing sounds");
     let ratio = (energy_a / energy_b).sqrt();
-    // Two free-running oscillators (Pocket's default sound on 4osc) sum to a level that varies
+    // Two free-running oscillators (the built-in instrument's default sound) sum to a level that varies
     // by up to about 3 dB, a factor of 1.41, from one render to the next; 0.7..1.4 was hit by
     // that alone. Tests that need a tight level use one oscillator and check it themselves.
     assert!(
@@ -269,11 +269,11 @@ fn build_model(ids_gen: &mut IdGen) -> (Project, Vec<Op>, Ids) {
     let mut synth = Device::new(
         ids.synth,
         DeviceKind::Builtin {
-            kind: BuiltinKind::Pocket,
-            dsp_version: 1,
+            kind: BuiltinKind::TwoOsc,
+            dsp_version: two_osc::DSP_VERSION,
         },
     );
-    synth.params.insert(0, 0.5);
+    synth.params.insert(two_osc::id::OSC1_WAVE, 1.0);
     let mut ops = vec![
         Op::TempoPut {
             id: ids.tempo,
@@ -363,7 +363,7 @@ fn the_engine_follows_the_model() {
     incremental_equals_reload(&mut world, &ids, &mut ids_gen);
     repeated_ops_are_idempotent(&mut world, &ids, &mut ids_gen);
     params_and_state(&world, &ids);
-    pocket_params(&mut world, &ids);
+    unknown_param_reported(&mut world, &ids);
     no_events_for_own_changes(&world);
     track_removed(&mut world, &ids);
     sync_by_difference(&world, &mut ids_gen);
@@ -410,7 +410,7 @@ fn world_ids(world: &World) -> (u64, u64, u64, u64) {
 fn loaded_project_renders(world: &World) {
     let problems = world.load();
     println!("load problems: {problems:?}");
-    // The Pocket parameter (Osc 1 wave) is carried over to the engine's synth.
+    // The instrument's parameter (OSC 1 Wave) is carried over to the engine's synth.
     assert!(problems.is_empty(), "load: no problems: {problems:?}");
     let engine = &world.engine;
     let ids = &world_ids(world);
@@ -589,8 +589,8 @@ fn other_ops(world: &mut World, ids: &Ids, ids_gen: &mut IdGen) {
         device: Device::new(
             extra,
             DeviceKind::Builtin {
-                kind: BuiltinKind::Pocket,
-                dsp_version: 1,
+                kind: BuiltinKind::TwoOsc,
+                dsp_version: two_osc::DSP_VERSION,
             },
         ),
         after: Some(ids.synth),
@@ -820,94 +820,8 @@ fn brightness(wav: &Wav) -> f64 {
     diff / rms.max(1e-12)
 }
 
-/// Step 5b: Pocket's parameters reach the engine's synth (Tracktion's 4osc, an approximation of
-/// Pocket, apply.rs). The texts 4osc shows for the converted values confirm the conversions;
-/// release, volume and cutoff are heard in renders.
-fn pocket_params(world: &mut World, ids: &Ids) {
-    // A Pocket parameter set through the model, then back to its default.
-    let set = |world: &mut World, param: u32, value: Option<f64>| {
-        let problems = world.op(Op::DeviceSetParam {
-            track: ids.track,
-            id: ids.synth,
-            param,
-            value,
-        });
-        assert!(problems.is_empty(), "pocket param {param}: {problems:?}");
-    };
-    // The state-applying step before may have changed 4osc parameters directly: start from the
-    // model's values again.
-    set(world, 19, None);
-    let device = ids.synth.0.0;
-    let text = |world: &World, id: &str| {
-        let params = world.engine.device_params(device).expect("4osc params");
-        params
-            .iter()
-            .find(|p| p.id == id)
-            .unwrap_or_else(|| panic!("4osc has no {id}: {params:?}"))
-            .text
-            .clone()
-    };
-    // Pocket's defaults as 4osc shows them.
-    for (id, expected) in [
-        ("ampRelease", "300ms"),
-        ("ampAttack", "5ms"),
-        ("ampSustain", "70.0%"),
-        ("filterFreq", "2500Hz"),
-        ("masterLevel", "-3.10"),
-        ("level1", "-6.02dB"),
-        ("tune2", "0st"),
-    ] {
-        assert_eq!(text(world, id), expected, "pocket default on 4osc: {id}");
-    }
-
-    let reference = render(&world.engine, "pocket_reference", 16 * Q);
-    let reference_end = reference.last_above(SILENT).expect("pocket: sounds");
-
-    // Release 2 s instead of 0.3 s: the last note rings on for longer.
-    set(world, 10, Some(2.0));
-    assert_eq!(text(world, "ampRelease"), "2.00s", "pocket release on 4osc");
-    let long = render(&world.engine, "pocket_long_release", 16 * Q);
-    let long_end = long.last_above(SILENT).expect("pocket long release: sounds");
-    println!("pocket release: sound ends at {reference_end:.3} s, with 2 s release at {long_end:.3} s");
-    assert!(
-        long_end > reference_end + 1.0,
-        "pocket release: longer tail ({reference_end} -> {long_end})"
-    );
-    set(world, 10, None);
-
-    // Volume 0.2 instead of 0.7: about 11 dB quieter.
-    set(world, 19, Some(0.2));
-    let quiet = render(&world.engine, "pocket_quiet", 16 * Q);
-    println!(
-        "pocket volume: peak {:.4} -> {:.4}",
-        reference.peak(),
-        quiet.peak()
-    );
-    assert!(
-        quiet.peak() > SILENT && quiet.peak() < 0.5 * reference.peak(),
-        "pocket volume: quieter ({} vs {})",
-        quiet.peak(),
-        reference.peak()
-    );
-    set(world, 19, None);
-
-    // Cutoff 150 Hz (and no filter envelope) against 12 kHz: much less high-frequency content.
-    set(world, 13, Some(0.0));
-    set(world, 11, Some(12_000.0));
-    let bright = brightness(&render(&world.engine, "pocket_bright", 16 * Q));
-    set(world, 11, Some(150.0));
-    assert_eq!(text(world, "filterFreq"), "150Hz", "pocket cutoff on 4osc");
-    let dark = brightness(&render(&world.engine, "pocket_dark", 16 * Q));
-    println!("pocket cutoff: brightness {bright:.4} at 12 kHz, {dark:.4} at 150 Hz");
-    assert!(dark < 0.5 * bright, "pocket cutoff: darker ({bright} -> {dark})");
-    set(world, 11, None);
-    set(world, 13, None);
-
-    // Back at the defaults: as at the start.
-    let again = render(&world.engine, "pocket_defaults_again", 16 * Q);
-    assert_same_envelope(&reference, &again, "pocket defaults again");
-
-    // A parameter Pocket does not have is still reported.
+/// Step 5b: a parameter the built-in instrument does not have is reported, not applied.
+fn unknown_param_reported(world: &mut World, ids: &Ids) {
     let problems = world.op(Op::DeviceSetParam {
         track: ids.track,
         id: ids.synth,
@@ -916,7 +830,7 @@ fn pocket_params(world: &mut World, ids: &Ids) {
     });
     assert!(
         matches!(problems.as_slice(), [Problem::ParamNotMapped { param: 99, .. }]),
-        "pocket: unknown parameter reported: {problems:?}"
+        "unknown parameter reported: {problems:?}"
     );
     world.op(Op::DeviceSetParam {
         track: ids.track,
@@ -973,17 +887,17 @@ fn track_removed(world: &mut World, ids: &Ids) {
 fn sync_by_difference(world: &World, ids_gen: &mut IdGen) {
     let engine = &world.engine;
     let no_blobs = |_: &BlobHash| None;
-    // One oscillator only (Pocket's oscillator mix at 0): two free-running oscillators sum to a
-    // level that changes by some 3 dB from render to render, one does not.
-    let pocket = |id| {
+    // One oscillator only (OSC 2 Wave None): two free-running oscillators sum to a level that
+    // changes by some 3 dB from render to render, one does not.
+    let instrument = |id| {
         let mut device = Device::new(
             id,
             DeviceKind::Builtin {
-                kind: BuiltinKind::Pocket,
-                dsp_version: 1,
+                kind: BuiltinKind::TwoOsc,
+                dsp_version: two_osc::DSP_VERSION,
             },
         );
-        device.params.insert(4, 0.0);
+        device.params.insert(two_osc::id::OSC2_WAVE, 0.0);
         device
     };
     let (t1, t2, t3) = (ids_gen.track(), ids_gen.track(), ids_gen.track());
@@ -1031,7 +945,7 @@ fn sync_by_difference(world: &World, ids_gen: &mut IdGen) {
             },
             Op::DeviceAdd {
                 track: t1,
-                device: pocket(d1),
+                device: instrument(d1),
                 after: None,
             },
             Op::ClipAdd {
@@ -1092,7 +1006,7 @@ fn sync_by_difference(world: &World, ids_gen: &mut IdGen) {
             },
             Op::DeviceAdd {
                 track: t2,
-                device: pocket(d2),
+                device: instrument(d2),
                 after: None,
             },
             Op::ClipAdd {
@@ -1179,7 +1093,7 @@ fn sync_by_difference(world: &World, ids_gen: &mut IdGen) {
             },
             Op::DeviceAdd {
                 track: t3,
-                device: pocket(d3),
+                device: instrument(d3),
                 after: None,
             },
             Op::ClipAdd {

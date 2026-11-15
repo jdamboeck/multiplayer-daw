@@ -13,15 +13,12 @@
 //! first, then the values (which the model keeps in the plugin's own units, converted here with
 //! the range the engine reports).
 //!
-//! Both built-in devices are played by the engine's own synth, Tracktion's 4osc. The built-in
-//! instrument for this engine (`BuiltinKind::TwoOsc`) is a front for 4osc whose values are 4osc's
-//! own (see [`crate::two_osc`]). The old engine's Pocket synth is set up from Pocket's
-//! parameters through [`POCKET_TO_FOUR_OSC`]: an approximation kept for old projects, not the
-//! same synth.
+//! The built-in instrument (`BuiltinKind::TwoOsc`) is played by the engine's own synth,
+//! Tracktion's 4osc: it is a front for 4osc whose values are 4osc's own (see
+//! [`crate::two_osc`]).
 
 use crate::two_osc::{self as two_osc_map, Target};
 use crate::{Engine, EntityKind, Error, Note as EngineNote, ParamInfo, PluginInfo, Status};
-use mdaw_dsp::pocket::{PocketParams, param as pocket};
 use mdaw_model::two_osc::Values as TwoOscValues;
 use mdaw_model::{
     BlobHash, BuiltinKind, ClipId, ClipProp, Device, DeviceId, DeviceKind, MAX_MILLI_BPM, MAX_TICK,
@@ -50,8 +47,8 @@ pub enum Problem {
         reason: String,
     },
     /// A device parameter the engine cannot be given: one the plugin does not have, or one the
-    /// built-in device does not have (the engine takes all of Pocket's own, see
-    /// [`POCKET_TO_FOUR_OSC`], and all of the built-in instrument's, see [`crate::two_osc`]).
+    /// built-in instrument does not have (the engine takes all of its own, see
+    /// [`crate::two_osc`]).
     ParamNotMapped {
         track: TrackId,
         device: DeviceId,
@@ -620,12 +617,12 @@ impl<'a> Sync<'a> {
                 kind: BuiltinKind::TwoOsc,
                 ..
             } => self.put_two_osc(track, device),
-            _ => self.put_pocket(track, device),
+            DeviceKind::Plugin { .. } => Ok(()),
         }
     }
 
     /// Carries changes of some of a built-in device's parameters over; the values are read from
-    /// `device`. For Pocket the whole synth is set up again.
+    /// `device`.
     pub(crate) fn put_builtin_changes(
         &mut self,
         track: TrackId,
@@ -637,7 +634,7 @@ impl<'a> Sync<'a> {
             ..
         } = &device.kind
         else {
-            return self.put_pocket(track, device);
+            return Ok(());
         };
         let raw = raw_device(device.id);
         let values = TwoOscValues::from_map(&device.params);
@@ -717,48 +714,6 @@ impl<'a> Sync<'a> {
         Ok(())
     }
 
-    /// Sets the engine's synth up from all of a Pocket device's parameters, defaults included
-    /// (see [`POCKET_TO_FOUR_OSC`]): first the settings that are part of 4osc's state, then its
-    /// parameters. Parameter ids Pocket does not have are reported.
-    pub(crate) fn put_pocket(&mut self, track: TrackId, device: &Device) -> Result<(), Error> {
-        let raw = raw_device(device.id);
-        let values = PocketParams::from_map(&device.params);
-        let state = self.engine.device_get_state(raw);
-        let properties: Vec<(&str, i32)> = FOUR_OSC_FIXED_STATE
-            .iter()
-            .copied()
-            .chain(
-                POCKET_TO_FOUR_OSC_STATE
-                    .iter()
-                    .map(|(from, property, convert)| (*property, convert(values.0[*from]))),
-            )
-            .collect();
-        let patched = value_tree::with_int_properties(&state, &properties).ok_or_else(|| {
-            Error::new(
-                Status::Internal,
-                "the engine's synth gave a state that is not a ValueTree",
-            )
-        })?;
-        if patched != state {
-            self.engine.device_set_state(raw, &patched)?;
-        }
-        for row in POCKET_TO_FOUR_OSC {
-            let plain = row.convert.apply(values.0[row.pocket]);
-            self.engine
-                .device_set_param(raw, row.four_osc, row.range.normalise(plain) as f32)?;
-        }
-        for param in device.params.keys() {
-            if *param as usize >= pocket::COUNT {
-                self.problems.push(Problem::ParamNotMapped {
-                    track,
-                    device: device.id,
-                    param: *param,
-                });
-            }
-        }
-        Ok(())
-    }
-
     /// Sets one parameter of a plugin device. `plain` is the model's value, in the plugin's own
     /// units; `None` is the parameter's default. `params` is the device's list from the engine.
     pub(crate) fn put_param(
@@ -806,7 +761,7 @@ impl<'a> Sync<'a> {
     }
 }
 
-// ---- Pocket on the engine's synth ------------------------------------------------------------------
+// ---- the engine's synth ------------------------------------------------------------------------
 
 /// A 4osc parameter's range, as Tracktion's `FourOscPlugin` declares it
 /// (`juce::NormalisableRange (start, end, interval, skew)`): normalised = proportion^skew.
@@ -828,7 +783,7 @@ impl FourOscRange {
     }
 }
 
-/// The ranges of the 4osc parameters the built-in devices use.
+/// The ranges of the 4osc parameters the built-in instrument uses.
 pub(crate) mod four_osc_range {
     use super::FourOscRange;
 
@@ -893,156 +848,6 @@ pub(crate) mod four_osc_range {
         skew: 1.0,
     };
 }
-
-use four_osc_range::*;
-
-/// How a Pocket value (in Pocket's units) becomes a 4osc value (in 4osc's units).
-#[derive(Clone, Copy, Debug)]
-enum Convert {
-    Same,
-    /// 0..1 to percent.
-    Percent,
-    /// A linear gain to dB (0 to -100 dB, silence).
-    Decibels,
-    /// `1 - x` as a gain, to dB: the first oscillator's share of Pocket's oscillator mix.
-    ComplementDecibels,
-    /// Hz to a MIDI note number.
-    MidiNote,
-    /// Pocket's resonance (state-variable filter, Q = 1 / (2 - 1.9 r)) to 4osc's (biquad,
-    /// Q = 0.7071 / (1 - 0.99 res/100)) with the same Q; 4osc's Q cannot go below 0.7071.
-    Resonance,
-    /// Octaves of filter envelope to 4osc's units of 137 semitones.
-    FilterAmount,
-}
-
-impl Convert {
-    fn apply(self, value: f32) -> f64 {
-        let v = f64::from(value);
-        let decibels = |gain: f64| {
-            if gain > 1e-5 {
-                (20.0 * gain.log10()).max(-100.0)
-            } else {
-                -100.0
-            }
-        };
-        match self {
-            Convert::Same => v,
-            Convert::Percent => v * 100.0,
-            Convert::Decibels => decibels(v),
-            Convert::ComplementDecibels => decibels(1.0 - v),
-            Convert::MidiNote => 12.0 * (v.max(1.0) / 440.0).log2() + 69.0,
-            Convert::Resonance => {
-                let q = 1.0 / (2.0 - 1.9 * v);
-                (100.0 * (1.0 - std::f64::consts::FRAC_1_SQRT_2 / q) / 0.99).max(0.0)
-            }
-            Convert::FilterAmount => v * 12.0 / 137.0,
-        }
-    }
-}
-
-/// One 4osc parameter set from one Pocket parameter.
-#[derive(Clone, Copy, Debug)]
-struct PocketRow {
-    pocket: usize,
-    four_osc: &'static str,
-    range: FourOscRange,
-    convert: Convert,
-}
-
-const fn row(pocket: usize, four_osc: &'static str, range: FourOscRange, convert: Convert) -> PocketRow {
-    PocketRow {
-        pocket,
-        four_osc,
-        range,
-        convert,
-    }
-}
-
-/// Pocket's parameters (`mdaw_dsp::pocket::PARAMS`) on Tracktion's 4osc, which plays Pocket
-/// devices in the engine. Every Pocket parameter has a counterpart:
-///
-/// | Pocket                   | 4osc                                  | conversion                      |
-/// |--------------------------|---------------------------------------|---------------------------------|
-/// | 0 Osc 1 (Saw/Pulse/Sine) | state `waveShape1`                    | saw / square / sine             |
-/// | 1 Osc 2                  | state `waveShape2`                    | saw / square / sine             |
-/// | 2 Osc 2 semi             | `tune2`                               | semitones                       |
-/// | 3 Osc 2 fine             | `fineTune2`                           | cents                           |
-/// | 4 Osc mix                | `level1`, `level2`                    | gains 1 - mix and mix, in dB    |
-/// | 5 Pulse width            | `pulseWidth1`, `pulseWidth2`          | same                            |
-/// | 6 Noise                  | state `waveShape3` (noise), `level3`  | gain in dB                      |
-/// | 7, 8 Attack, Decay       | `ampAttack`, `ampDecay`               | seconds                         |
-/// | 9 Sustain                | `ampSustain`                          | percent                         |
-/// | 10 Release               | `ampRelease`                          | seconds                         |
-/// | 11 Cutoff                | `filterFreq` (state `filterType` low-pass, `filterSlope` 12) | Hz to MIDI note |
-/// | 12 Resonance             | `filterResonance`                     | same Q (4osc's lowest is 0.707) |
-/// | 13 Filter env            | `filterAmount`                        | octaves to 137-semitone units   |
-/// | 14..17 F attack..release | `filterAttack` .. `filterRelease`     | seconds, sustain in percent     |
-/// | 18 Key track             | `filterKey`                           | percent                         |
-/// | 19 Volume                | `masterLevel`                         | gain in dB                      |
-///
-/// Not the same synth: 4osc's oscillators, its filter (a biquad, not Pocket's state-variable
-/// filter), its envelopes (Pocket's time is to -60 dB, 4osc's to silence), its velocity curve
-/// and its voice count (32, Pocket 16) are its own. Wave shape, noise and filter type are not
-/// parameters in 4osc but properties of its state, so they are set through the device's state
-/// ([`POCKET_TO_FOUR_OSC_STATE`]). The ranges are those of Tracktion's FourOscPlugin.cpp; the
-/// integration test reads the texts 4osc shows for the converted values to check them.
-const POCKET_TO_FOUR_OSC: &[PocketRow] = &[
-    row(pocket::OSC2_SEMI, "tune2", TUNE, Convert::Same),
-    row(pocket::OSC2_FINE, "fineTune2", FINE_TUNE, Convert::Same),
-    row(pocket::OSC_MIX, "level1", LEVEL_DB, Convert::ComplementDecibels),
-    row(pocket::OSC_MIX, "level2", LEVEL_DB, Convert::Decibels),
-    row(pocket::PULSE_WIDTH, "pulseWidth1", PULSE_WIDTH, Convert::Same),
-    row(pocket::PULSE_WIDTH, "pulseWidth2", PULSE_WIDTH, Convert::Same),
-    row(pocket::NOISE, "level3", LEVEL_DB, Convert::Decibels),
-    row(pocket::AMP_ATTACK, "ampAttack", AMP_TIME, Convert::Same),
-    row(pocket::AMP_DECAY, "ampDecay", AMP_TIME, Convert::Same),
-    row(pocket::AMP_SUSTAIN, "ampSustain", PERCENT, Convert::Percent),
-    row(pocket::AMP_RELEASE, "ampRelease", AMP_TIME, Convert::Same),
-    row(pocket::CUTOFF, "filterFreq", FILTER_NOTE, Convert::MidiNote),
-    row(pocket::RESONANCE, "filterResonance", PERCENT, Convert::Resonance),
-    row(
-        pocket::FILTER_ENV,
-        "filterAmount",
-        FILTER_AMOUNT,
-        Convert::FilterAmount,
-    ),
-    row(pocket::FILTER_ATTACK, "filterAttack", FILTER_TIME, Convert::Same),
-    row(pocket::FILTER_DECAY, "filterDecay", FILTER_TIME, Convert::Same),
-    row(pocket::FILTER_SUSTAIN, "filterSustain", PERCENT, Convert::Percent),
-    row(
-        pocket::FILTER_RELEASE,
-        "filterRelease",
-        FILTER_TIME,
-        Convert::Same,
-    ),
-    row(pocket::KEY_TRACK, "filterKey", PERCENT, Convert::Percent),
-    row(pocket::VOLUME, "masterLevel", LEVEL_DB, Convert::Decibels),
-];
-
-/// 4osc's oscillator waves (`tracktion::Oscillator::Waves`): none 0, sine 1, square 2, saw 3,
-/// triangle 4, noise 5. Pocket's: Saw 0, Pulse 1, Sine 2.
-fn four_osc_wave(pocket_wave: f32) -> i32 {
-    match pocket_wave as i32 {
-        0 => 3,
-        1 => 2,
-        _ => 1,
-    }
-}
-
-fn four_osc_noise(noise: f32) -> i32 {
-    if noise > 0.0 { 5 } else { 0 }
-}
-
-/// Pocket parameters that are properties of 4osc's state, not parameters.
-type StateRow = (usize, &'static str, fn(f32) -> i32);
-const POCKET_TO_FOUR_OSC_STATE: &[StateRow] = &[
-    (pocket::OSC1_WAVE, "waveShape1", four_osc_wave),
-    (pocket::OSC2_WAVE, "waveShape2", four_osc_wave),
-    (pocket::NOISE, "waveShape3", four_osc_noise),
-];
-
-/// Pocket's filter is always a 12 dB/octave low-pass; 4osc's starts switched off.
-const FOUR_OSC_FIXED_STATE: &[(&str, i32)] = &[("filterType", 1), ("filterSlope", 12)];
 
 /// Just enough of JUCE's binary `ValueTree` format (`ValueTree::writeToStream`, which is what
 /// the engine gives as a built-in device's state) to set integer properties of the top-level
@@ -1198,35 +1003,10 @@ mod tests {
     }
 
     #[test]
-    fn pocket_defaults_on_four_osc() {
-        let defaults = PocketParams::default();
-        let plain = |id: &str| {
-            let row = POCKET_TO_FOUR_OSC.iter().find(|r| r.four_osc == id).unwrap();
-            row.convert.apply(defaults.0[row.pocket])
-        };
-        assert!((plain("filterFreq") - (12.0 * (2500.0f64 / 440.0).log2() + 69.0)).abs() < 1e-9);
-        assert!((plain("level1") + 6.0206).abs() < 1e-3 && (plain("level2") + 6.0206).abs() < 1e-3);
-        assert!((plain("ampSustain") - 70.0).abs() < 1e-4);
-        assert!((plain("masterLevel") - 20.0 * 0.7f64.log10()).abs() < 1e-4);
-        assert_eq!(
-            plain("filterResonance"),
-            0.0,
-            "Pocket's default Q is below 4osc's lowest"
-        );
-        assert!((Convert::Resonance.apply(1.0) - 93.9).abs() < 0.1);
+    fn four_osc_ranges_normalise() {
+        use four_osc_range::{AMP_TIME, LEVEL_DB};
         assert!((AMP_TIME.normalise(60.0) - 1.0).abs() < 1e-12 && AMP_TIME.normalise(0.001) == 0.0);
         assert!((LEVEL_DB.normalise(-50.0) - 0.5f64.powi(4)).abs() < 1e-12);
-        assert_eq!(four_osc_wave(0.0), 3);
-        assert_eq!(four_osc_wave(1.0), 2);
-        assert_eq!(four_osc_wave(2.0), 1);
-        // Every Pocket parameter is set from the table or the state rows.
-        for id in 0..pocket::COUNT {
-            assert!(
-                POCKET_TO_FOUR_OSC.iter().any(|r| r.pocket == id)
-                    || POCKET_TO_FOUR_OSC_STATE.iter().any(|r| r.0 == id),
-                "Pocket parameter {id} has no counterpart"
-            );
-        }
     }
 
     #[test]

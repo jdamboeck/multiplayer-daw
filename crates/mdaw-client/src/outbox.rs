@@ -11,6 +11,9 @@
 //!   edit is never lost to a crash of the client, while a power cut may take the last moments.
 //! - `blobs/<hash>`: the bytes of blobs a pending transaction names, written (and forced to the
 //!   disk) before the transaction, so they can be uploaded again after a restart.
+//! - `format`: the protocol version (`PROTO_VERSION`) the transactions are encoded in. An
+//!   outbox that holds transactions of another version (or of a client from before this file)
+//!   is refused, not misread: their ops would decode as something else, or not at all.
 //!
 //! Confirmed transactions are dropped by writing the file anew (to the side, forced to disk,
 //! then renamed over the old one), at most every [`COMPACT_EVERY`], or at once when nothing is
@@ -19,10 +22,10 @@
 //! leaves either the old file or the new one, never a transaction lost; a record cut short by a
 //! crash is the last one, which was not sent yet, and is dropped on the next start.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use mdaw_model::{BlobHash, Op};
 use mdaw_net::JoinInfo;
-use mdaw_proto::{Txn, TxnId, blob_hash};
+use mdaw_proto::{PROTO_VERSION, Txn, TxnId, blob_hash};
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -37,6 +40,7 @@ pub const COMPACT_EVERY: Duration = Duration::from_secs(1);
 
 const PENDING: &str = "pending";
 const BLOBS: &str = "blobs";
+const FORMAT: &str = "format";
 
 pub struct Outbox {
     dir: PathBuf,
@@ -75,6 +79,7 @@ impl Outbox {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
         };
+        check_format(dir, !bytes.is_empty())?;
         let (txns, whole) = parse(&bytes);
         let mut blobs = HashMap::new();
         for hash in txns.iter().flat_map(|t| t.ops.iter().flat_map(Op::blobs)) {
@@ -247,6 +252,37 @@ fn parse(bytes: &[u8]) -> (Vec<Txn>, usize) {
     (txns, at)
 }
 
+/// Refuses an outbox whose transactions (`pending` is `true` when there are any) are of another
+/// protocol version; marks one without any as this version's.
+fn check_format(dir: &Path, pending: bool) -> Result<()> {
+    let path = dir.join(FORMAT);
+    let format = PROTO_VERSION.to_string();
+    let found = match std::fs::read_to_string(&path) {
+        Ok(found) => Some(found.trim().to_string()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
+    };
+    if found.as_deref() == Some(format.as_str()) {
+        return Ok(());
+    }
+    if pending {
+        let found = match found {
+            Some(found) => format!("protocol {found}"),
+            None => "an earlier protocol".to_string(),
+        };
+        bail!(
+            "the unsent edits in {} were saved in {found}, this client uses protocol {format}. They \
+             are not converted: move the directory away to join without them.",
+            dir.display()
+        );
+    }
+    let mut file = File::create(&path).with_context(|| format!("writing {}", path.display()))?;
+    file.write_all(format.as_bytes())
+        .and_then(|()| file.sync_data())
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
 /// Makes a file created or renamed in `dir` survive a power cut.
 fn sync_dir(dir: &Path) -> Result<()> {
     #[cfg(unix)]
@@ -301,6 +337,41 @@ mod tests {
         let (_, saved) = Outbox::open(dir.path()).unwrap();
         assert_eq!(saved.txns, [a, b]);
         assert_eq!(saved.blobs.get(&hash).map(|b| b.to_vec()), Some(bytes));
+    }
+
+    #[test]
+    fn edits_of_another_protocol_are_refused_not_misread() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut outbox, _) = Outbox::open(dir.path()).unwrap();
+        outbox.append(&edit(1, None)).unwrap();
+        drop(outbox);
+        let refused = |found: &str| {
+            let err = Outbox::open(dir.path()).err().expect("refused").to_string();
+            assert!(
+                err.contains(&format!(
+                    "saved in {found}, this client uses protocol {PROTO_VERSION}"
+                )) && err.contains("move the directory away"),
+                "{err}"
+            );
+        };
+
+        // From a client of an earlier protocol.
+        std::fs::write(dir.path().join(FORMAT), "10").unwrap();
+        refused("protocol 10");
+        // From a client from before the outbox kept its format.
+        std::fs::remove_file(dir.path().join(FORMAT)).unwrap();
+        refused("an earlier protocol");
+        // Refusing changed nothing: the edit is still there for the client it belongs to.
+        std::fs::write(dir.path().join(FORMAT), PROTO_VERSION.to_string()).unwrap();
+        assert_eq!(Outbox::open(dir.path()).unwrap().1.txns.len(), 1);
+
+        // An outbox without edits is taken over, whatever wrote it.
+        let empty = tempfile::tempdir().unwrap();
+        std::fs::write(empty.path().join(PENDING), b"").unwrap();
+        std::fs::write(empty.path().join(FORMAT), "10").unwrap();
+        Outbox::open(empty.path()).unwrap();
+        let format = std::fs::read_to_string(empty.path().join(FORMAT)).unwrap();
+        assert_eq!(format, PROTO_VERSION.to_string());
     }
 
     #[test]

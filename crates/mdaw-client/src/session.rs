@@ -1176,8 +1176,6 @@ fn record_displaced(displaced: &mut Vec<Displaced>, event: Event) {
 /// A built-in device of this kind, as a new one is made.
 pub fn builtin_kind(kind: BuiltinKind) -> DeviceKind {
     let dsp_version = match kind {
-        // The old Pocket's (`mdaw-dsp`), for documents that still have it; no engine plays it.
-        BuiltinKind::Pocket => 1,
         BuiltinKind::TwoOsc => mdaw_model::two_osc::DSP_VERSION,
     };
     DeviceKind::Builtin { kind, dsp_version }

@@ -6,11 +6,8 @@ members = ["crates/*", "xtask"]
 # tests run with `-p mdaw-tracktion` or `--workspace`. New crates must be added here too.
 default-members = [
     "crates/mdaw-client",
-    "crates/mdaw-dsp",
-    "crates/mdaw-engine",
     "crates/mdaw-model",
     "crates/mdaw-net",
-    "crates/mdaw-plugin",
     "crates/mdaw-proto",
     "crates/mdaw-server",
     "crates/mdaw-sync",
@@ -29,11 +26,8 @@ publish = false
 mdaw-model = { path = "crates/mdaw-model" }
 mdaw-proto = { path = "crates/mdaw-proto" }
 mdaw-sync = { path = "crates/mdaw-sync" }
-mdaw-dsp = { path = "crates/mdaw-dsp" }
-mdaw-engine = { path = "crates/mdaw-engine" }
 mdaw-net = { path = "crates/mdaw-net" }
 mdaw-server = { path = "crates/mdaw-server" }
-mdaw-plugin = { path = "crates/mdaw-plugin" }
 mdaw-tracktion-sys = { path = "crates/mdaw-tracktion-sys" }
 mdaw-tracktion = { path = "crates/mdaw-tracktion" }
 imbl = { version = "7", features = ["serde"] }
@@ -42,12 +36,9 @@ serde_json = "1"
 postcard = { version = "1.1", features = ["use-std"] }
 proptest = "1.12"
 tempfile = "3"
-libm = "0.2"
-rtrb = "0.4"
 eframe = "0.37"
 egui = "0.37"
 egui_kittest = "0.37"
-cpal = "0.18"
 blake3 = "1.8"
 anyhow = "1"
 tokio = { version = "1.54", features = ["rt", "rt-multi-thread", "net", "sync", "time", "macros", "signal"] }

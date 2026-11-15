@@ -32,8 +32,8 @@ fn base() -> Project {
             device: Device::new(
                 DEVICE(),
                 DeviceKind::Builtin {
-                    kind: BuiltinKind::Pocket,
-                    dsp_version: 1,
+                    kind: BuiltinKind::TwoOsc,
+                    dsp_version: two_osc::DSP_VERSION,
                 },
             ),
             after: None,
@@ -83,7 +83,7 @@ fn cutoff(value: f64) -> Op {
     Op::DeviceSetParam {
         track: TRACK(),
         id: DEVICE(),
-        param: 11,
+        param: two_osc::id::FILTER_FREQ,
         value: Some(value),
     }
 }
@@ -99,7 +99,7 @@ fn param(project: &Project) -> Option<f64> {
         .content
         .device(DEVICE())?
         .params
-        .get(&11)
+        .get(&two_osc::id::FILTER_FREQ)
         .copied()
 }
 
@@ -665,8 +665,8 @@ fn any_op() -> impl Strategy<Value = Op> {
             track: TRACK(), clip: CLIP(), id: note_id(n), prop: NoteProp::Start(t)
         }),
         2 => tick.clone().prop_map(|t| Op::ClipSet { track: TRACK(), id: CLIP(), prop: ClipProp::Start(t) }),
-        2 => (0u8..4).prop_map(|v| cutoff(500.0 * v as f64)),
-        1 => Just(Op::DeviceSetParam { track: TRACK(), id: DEVICE(), param: 11, value: None }),
+        2 => (0u8..4).prop_map(|v| cutoff(500.0 * (v as f64 + 1.0))),
+        1 => Just(Op::DeviceSetParam { track: TRACK(), id: DEVICE(), param: two_osc::id::FILTER_FREQ, value: None }),
         1 => (0u8..3).prop_map(|g| Op::TrackSetMix { track: TRACK(), prop: MixProp::Gain(g as f32 * 0.5) }),
         1 => (0u8..3).prop_map(|g| Op::MasterSetGain { gain: g as f32 * 0.5 }),
         1 => Just(Op::ClipRemove { track: TRACK(), id: CLIP() }),

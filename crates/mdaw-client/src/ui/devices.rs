@@ -36,10 +36,6 @@ pub fn show(app: &mut DawApp, ui: &mut Ui) {
         for device in &track.content.devices {
             ui.push_id(device.id.0.0, |ui| match &device.kind {
                 DeviceKind::Builtin {
-                    kind: BuiltinKind::Pocket,
-                    ..
-                } => old_pocket_panel(app, ui, track_id, device),
-                DeviceKind::Builtin {
                     kind: BuiltinKind::TwoOsc,
                     ..
                 } => two_osc_panel(app, ui, track_id, device),
@@ -254,30 +250,6 @@ fn by_format(catalog: &[PluginEntry], instruments: bool) -> Vec<(PluginFormat, V
             (!plugins.is_empty()).then_some((format, plugins))
         })
         .collect()
-}
-
-/// The old Pocket of the Rust engine (`BuiltinKind::Pocket`), from documents made before
-/// Tracktion: nothing plays it any more, so it is shown as an instrument to replace.
-fn old_pocket_panel(app: &mut DawApp, ui: &mut Ui, track: TrackId, device: &Device) {
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("Pocket (old engine)").strong().size(15.0));
-        if ui
-            .button("Use the built-in instrument")
-            .on_hover_text("Put the built-in instrument in its place")
-            .clicked()
-        {
-            app.session.use_builtin(track);
-        }
-        if ui
-            .button("Remove")
-            .on_hover_text("Take the instrument off the track")
-            .clicked()
-        {
-            app.session.edit(vec![Op::DeviceRemove { track, id: device.id }]);
-        }
-    });
-    let why = "Not played any more; replace it with the built-in instrument.";
-    ui.label(RichText::new(why).color(theme::WARN));
 }
 
 /// The name of a built-in instrument and its on switch, left of its controls.

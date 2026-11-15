@@ -18,10 +18,7 @@ use mdaw_model::{
     BlobHash, BuiltinKind, DeviceId, PluginFormat, Project, TempoMap, Tick, TickRange, TrackId,
 };
 
-use crate::audio::{
-    Audio, DeviceStatus, LiveSink, ParamEntry, PluginEntry, SavedState, TrackSound, has_old_pocket,
-    is_old_pocket,
-};
+use crate::audio::{Audio, DeviceStatus, LiveSink, ParamEntry, PluginEntry, SavedState, TrackSound};
 use crate::clock;
 
 /// The notes played live and not let go yet: `(track, key, pitch)`.
@@ -236,16 +233,12 @@ impl Audio for SilentAudio {
     fn device_status(&self, project: &Project, track: TrackId, device: DeviceId) -> DeviceStatus {
         match project.track(track).and_then(|t| t.content.device(device)) {
             None => DeviceStatus::Loading,
-            Some(d) if is_old_pocket(d) => DeviceStatus::NotInstalled,
             Some(d) if matches!(d.kind, mdaw_model::DeviceKind::Builtin { .. }) => DeviceStatus::Builtin,
             Some(_) => DeviceStatus::NotInstalled,
         }
     }
 
     fn track_sound(&self, project: &Project, track: TrackId) -> TrackSound {
-        if has_old_pocket(project, track) {
-            return TrackSound::Silent;
-        }
         let Some(t) = project.track(track) else {
             return TrackSound::Silent;
         };

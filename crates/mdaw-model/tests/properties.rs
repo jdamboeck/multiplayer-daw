@@ -62,11 +62,21 @@ fn clip() -> impl Strategy<Value = Clip> {
         })
 }
 
+/// The parameters the generated ops use: ids and whole values the built-in instrument takes
+/// (`two_osc::check`), so that a device carrying them is valid whatever its kind.
+fn param() -> impl Strategy<Value = (u32, f64)> {
+    use two_osc::id;
+    (
+        prop::sample::select(&[id::OSC1_TUNE, id::OSC1_FINE, id::OSC2_TUNE, id::OSC2_FINE][..]),
+        (-2i32..=2).prop_map(f64::from),
+    )
+}
+
 fn device() -> impl Strategy<Value = Device> {
     let kind = prop_oneof![
         Just(DeviceKind::Builtin {
-            kind: BuiltinKind::Pocket,
-            dsp_version: 1
+            kind: BuiltinKind::TwoOsc,
+            dsp_version: mdaw_model::two_osc::DSP_VERSION
         }),
         prop::option::of(any::<[u8; 32]>().prop_map(BlobHash)).prop_map(|state| DeviceKind::Plugin {
             format: PluginFormat::Clap,
@@ -78,13 +88,13 @@ fn device() -> impl Strategy<Value = Device> {
     (
         device_id(),
         kind,
-        prop::collection::vec((0u32..4, -2i32..=2), 0..3),
+        prop::collection::vec(param(), 0..3),
         any::<bool>(),
     )
         .prop_map(|(id, kind, params, bypass)| Device {
             id,
             kind,
-            params: params.into_iter().map(|(k, v)| (k, v as f64 * 0.5)).collect(),
+            params: params.into_iter().collect(),
             bypass,
         })
 }
@@ -159,8 +169,8 @@ fn op() -> impl Strategy<Value = Op> {
         3 => (track_id(), device_id()).prop_map(|(track, id)| Op::DeviceRemove { track, id }),
         8 => (track_id(), device_id(), prop::option::of(device_id()))
             .prop_map(|(track, id, after)| Op::DeviceMove { track, id, after }),
-        6 => (track_id(), device_id(), 0u32..4, prop::option::of(-2i32..=2)).prop_map(
-            |(track, id, param, v)| Op::DeviceSetParam { track, id, param, value: v.map(|v| v as f64 * 0.5) }
+        6 => (track_id(), device_id(), param(), any::<bool>()).prop_map(
+            |(track, id, (param, v), set)| Op::DeviceSetParam { track, id, param, value: set.then_some(v) }
         ),
         4 => (track_id(), device_id(), any::<bool>())
             .prop_map(|(track, id, bypass)| Op::DeviceSetBypass { track, id, bypass }),

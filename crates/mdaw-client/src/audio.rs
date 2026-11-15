@@ -112,8 +112,7 @@ pub trait Audio: Any {
     // ---- the project
 
     /// The built-in instrument this engine plays, which new tracks get: the one for 4OSC
-    /// (`BuiltinKind::TwoOsc`, called "Pocket" in the UI). The old Pocket of the Rust engine
-    /// (`BuiltinKind::Pocket`) is played by none of them any more.
+    /// (`BuiltinKind::TwoOsc`, called "Pocket" in the UI).
     fn default_instrument(&self) -> BuiltinKind;
 
     /// The project as it should sound from now on: the session's view. Cheap when it did not
@@ -236,24 +235,4 @@ pub fn track_sound_from(statuses: impl IntoIterator<Item = DeviceStatus>) -> Tra
         return TrackSound::NotInstalled;
     }
     TrackSound::Silent
-}
-
-/// The old Pocket of the Rust engine (`BuiltinKind::Pocket`): no engine plays it any more, and
-/// the client shows it as an instrument to replace. It leaves the model with the next store
-/// format.
-pub fn is_old_pocket(device: &mdaw_model::Device) -> bool {
-    matches!(
-        device.kind,
-        mdaw_model::DeviceKind::Builtin {
-            kind: BuiltinKind::Pocket,
-            ..
-        }
-    )
-}
-
-/// Whether a track's instrument is the old Pocket, so that the track is silent here.
-pub fn has_old_pocket(project: &Project, track: TrackId) -> bool {
-    project
-        .track(track)
-        .is_some_and(|t| t.content.devices.iter().any(is_old_pocket))
 }
