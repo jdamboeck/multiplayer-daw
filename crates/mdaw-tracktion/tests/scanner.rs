@@ -4,8 +4,8 @@
 //! and the engine is one per process. Files go to `target/bridge-scratch/`.
 //!
 //! The crashing and hanging plugins (`native/tracktion-bridge/test/bad_clap.c`) are built next to
-//! the scanner by `mdaw-tracktion-sys`. The test synth is played if it was built (see
-//! `tests/engine.rs`).
+//! the scanner by `mdaw-tracktion-sys`. The test synth (`mdaw-test-plugin`, a dev-dependency) is
+//! copied next to them by `mdaw_test_plugin::clap_folder`.
 
 use mdaw_model::{
     ActorId, Clip, Device, DeviceKind, IdGen, Note, Op, PluginFormat, Project, TempoPoint, Tick,
@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 const Q: i64 = 960;
-const TEST_SYNTH: &str = "org.mdaw.test-synth";
+const TEST_SYNTH: &str = mdaw_test_plugin::ID;
 
 fn scratch() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/bridge-scratch")
@@ -48,8 +48,7 @@ fn bad_plugins_are_examined_in_a_child_process() {
     for name in ["bad-crash.clap", "bad-hang.clap"] {
         std::fs::copy(built.join(name), clap.join(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
     }
-    let synth = scratch().join("clap/mdaw-test-synth.clap");
-    let have_synth = synth.is_file() && std::fs::copy(&synth, clap.join("mdaw-test-synth.clap")).is_ok();
+    mdaw_test_plugin::clap_folder(&clap);
     // SAFETY: set before the engine (and any other thread of this test binary that could read
     // the environment) starts; this binary has a single test.
     unsafe {
@@ -102,12 +101,6 @@ fn bad_plugins_are_examined_in_a_child_process() {
         failures.len()
     );
 
-    if !have_synth {
-        println!(
-            "NOTE: target/bridge-scratch/clap/mdaw-test-synth.clap is missing; the CLAP synth is not played"
-        );
-        return;
-    }
     assert!(
         plugins
             .iter()

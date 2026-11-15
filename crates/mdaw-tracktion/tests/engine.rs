@@ -2,12 +2,8 @@
 //!
 //! One engine per process, and tests in one binary run on parallel threads: so this is a single
 //! `#[test]` whose steps are the helper functions below. Files go to `target/bridge-scratch/`.
-//! The CLAP step runs if `target/bridge-scratch/clap/mdaw-test-synth.clap` exists:
-//!
-//! ```sh
-//! cargo build -p mdaw-test-plugin && mkdir -p target/bridge-scratch/clap \
-//!     && cp target/debug/libmdaw_test_plugin.so target/bridge-scratch/clap/mdaw-test-synth.clap
-//! ```
+//! The CLAP step plays the test synth (`mdaw-test-plugin`, a dev-dependency built with the tests),
+//! copied into `target/bridge-scratch/clap` by `mdaw_test_plugin::clap_folder`.
 
 use mdaw_model::{
     ActorId, BlobHash, BuiltinKind, Clip, ClipId, ClipProp, Device, DeviceId, DeviceKind, IdGen, MixProp,
@@ -27,7 +23,7 @@ const RATE: f64 = 44_100.0;
 /// Below this a stretch of a render counts as silent, above `SOUND` as sounding.
 const SILENT: f64 = 0.001;
 const SOUND: f64 = 0.05;
-const TEST_SYNTH: &str = "org.mdaw.test-synth";
+const TEST_SYNTH: &str = mdaw_test_plugin::ID;
 
 fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -331,13 +327,10 @@ fn build_model(ids_gen: &mut IdGen) -> (Project, Vec<Op>, Ids) {
 fn the_engine_follows_the_model() {
     let started = Instant::now();
     std::fs::create_dir_all(scratch()).unwrap();
-    let clap_dir = scratch().join("clap");
-    let have_clap = clap_dir.join("mdaw-test-synth.clap").is_file();
-    if have_clap {
-        // SAFETY: set before the engine (and any other thread of this test binary that could
-        // read the environment) starts; this binary has a single test.
-        unsafe { std::env::set_var("CLAP_PATH", &clap_dir) };
-    }
+    let clap_dir = mdaw_test_plugin::clap_folder(&scratch().join("clap"));
+    // SAFETY: set before the engine (and any other thread of this test binary that could read
+    // the environment) starts; this binary has a single test.
+    unsafe { std::env::set_var("CLAP_PATH", &clap_dir) };
 
     let engine = Engine::new(config()).expect("create the engine");
     println!("versions: {}", engine.versions());
@@ -370,7 +363,7 @@ fn the_engine_follows_the_model() {
     world.load();
     builtin_instrument(&mut world, &mut ids_gen);
     world.load();
-    plugins(&mut world, &mut ids_gen, have_clap);
+    plugins(&mut world, &mut ids_gen);
 
     drop(world);
     second_life();
@@ -1595,26 +1588,20 @@ fn builtin_instrument(world: &mut World, ids_gen: &mut IdGen) {
 }
 
 /// Step 8: plugin devices. One whose plugin is not installed is left out and reported; the
-/// CLAP test synth, if built, is found by its CLAP id and plays; its parameters follow the model
+/// CLAP test synth is found by its CLAP id and plays; its parameters follow the model
 /// (plain values in the plugin's own range) and its state comes back through the blob resolver.
-fn plugins(world: &mut World, ids_gen: &mut IdGen, have_clap: bool) {
-    if have_clap {
-        let engine = &world.engine;
-        engine.plugins_scan("CLAP").expect("scan CLAP");
-        let list = engine.plugins().expect("plugin list");
-        println!("plugins: {list:?}");
-        let synths: Vec<_> = list.iter().filter(|p| p.identifier == TEST_SYNTH).collect();
-        assert_eq!(
-            synths.len(),
-            1,
-            "plugins: the test synth listed once under its CLAP id"
-        );
-        assert_eq!(synths[0].format, "CLAP");
-    } else {
-        println!(
-            "NOTE: target/bridge-scratch/clap/mdaw-test-synth.clap is missing; the CLAP synth is not played"
-        );
-    }
+fn plugins(world: &mut World, ids_gen: &mut IdGen) {
+    let engine = &world.engine;
+    engine.plugins_scan("CLAP").expect("scan CLAP");
+    let list = engine.plugins().expect("plugin list");
+    println!("plugins: {list:?}");
+    let synths: Vec<_> = list.iter().filter(|p| p.identifier == TEST_SYNTH).collect();
+    assert_eq!(
+        synths.len(),
+        1,
+        "plugins: the test synth listed once under its CLAP id"
+    );
+    assert_eq!(synths[0].format, "CLAP");
 
     let (track, synth, missing, clip) = (
         ids_gen.track(),
@@ -1665,18 +1652,11 @@ fn plugins(world: &mut World, ids_gen: &mut IdGen, have_clap: bool) {
             .any(|p| matches!(p, Problem::DeviceSkipped { device: d, .. } if *d == device))
     };
     assert!(skipped(missing), "plugins: the missing one is reported");
-    assert_eq!(
-        skipped(synth),
-        !have_clap,
-        "plugins: the test synth is skipped only when not built"
-    );
+    assert!(!skipped(synth), "plugins: the test synth is not skipped");
     assert!(
         !world.engine.has(EntityKind::Device, missing.0.0),
         "plugins: the missing one is not in the engine"
     );
-    if !have_clap {
-        return;
-    }
     let raw = synth.0.0;
     assert!(world.engine.has(EntityKind::Device, raw), "clap: in the engine");
 

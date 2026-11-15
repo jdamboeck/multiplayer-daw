@@ -2486,6 +2486,7 @@ version = "0.2.0"
 dependencies = [
  "imbl",
  "mdaw-model",
+ "mdaw-test-plugin",
  "mdaw-tracktion-sys",
  "serde",
  "serde_json",

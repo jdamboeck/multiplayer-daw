@@ -65,8 +65,8 @@ jobs:
       # The first cargo command runs mdaw-tracktion-sys's build script, which configures and
       # builds target/native.
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      # The test synth as a .clap file where the bridge's C test (and the Tracktion crates'
-      # tests) look for it.
+      # The test synth as a .clap file where the bridge's C test looks for it. The Rust tests
+      # copy it themselves (mdaw_test_plugin::clap_folder).
       - name: Test synth
         run: |
           cargo build -p mdaw-test-plugin

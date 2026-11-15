@@ -17,6 +17,7 @@ mdaw-net = { path = "crates/mdaw-net" }
 mdaw-server = { path = "crates/mdaw-server" }
 mdaw-tracktion-sys = { path = "crates/mdaw-tracktion-sys" }
 mdaw-tracktion = { path = "crates/mdaw-tracktion" }
+mdaw-test-plugin = { path = "crates/mdaw-test-plugin" }
 imbl = { version = "7", features = ["serde"] }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
