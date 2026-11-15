@@ -1437,6 +1437,13 @@ int main (void)
                 check (r == MDAW_OK && fabsf (value - 0.3f) < 0.01f, "external_state_has_value_set_just_before");
                 free (state);
 
+                /* A state the plugin will not take: an error, and the plugin keeps its value. */
+                static const uint8_t garbage[] = "not a state of the test synth";
+                r = mdaw_device_set_state (e, EXT, garbage, sizeof garbage);
+                mdaw_device_get_param (e, EXT, param, &value);
+                check (r == MDAW_ERR_PLUGIN && fabsf (value - 0.3f) < 0.01f && mdaw_project_has (e, MDAW_ENTITY_DEVICE, EXT) == 1,
+                       "external_refused_state_reported_and_kept");
+
                 /* Back to the freshly loaded plugin: Level 0.5. Level 0.1 is rendered first so
                  * that it has reached the plugin (and its state). */
                 mdaw_track_set_mix (e, TRACK, 1.0f, 0.0f, 1);

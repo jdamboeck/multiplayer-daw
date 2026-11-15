@@ -554,6 +554,7 @@ public:
 
     void setStateInformation (const void* data, int size) override
     {
+        stateRefused = false;
         if (loaded->state == nullptr || size <= 0) return;
         juce::MemoryInputStream input (data, (size_t) size, false);
         clap_istream_t stream {};
@@ -570,7 +571,13 @@ public:
             p->sendToPlugin.store (false);
         if (loaded->state->load (plugin, &stream))
             readValuesFromPlugin();
+        else
+            stateRefused = true;
     }
+
+    /// Whether the plugin said no to the last state setStateInformation gave it (JUCE's
+    /// interface has no way to say so).
+    bool stateRefused = false;
 
     //==============================================================================
     bool hasEditor() const override
@@ -1006,6 +1013,12 @@ juce::String clapPluginId (const juce::PluginDescription& description)
             if (d->id != nullptr && idOf (*d) == description.uniqueId)
                 return juce::String (juce::CharPointer_UTF8 (d->id));
     return {};
+}
+
+bool clapStateRefused (const juce::AudioPluginInstance* instance)
+{
+    auto* i = dynamic_cast<const Instance*> (instance);
+    return i != nullptr && i->stateRefused;
 }
 
 bool clapParameterRange (const juce::AudioProcessorParameter* parameter, double& min, double& max)

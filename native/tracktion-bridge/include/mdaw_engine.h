@@ -186,6 +186,8 @@ size_t mdaw_device_param_text(mdaw_engine* engine, uint64_t device, const char* 
  * between (another device, a buffer that is still too small, any other function) drops what
  * was kept. */
 size_t mdaw_device_get_state(mdaw_engine* engine, uint64_t device, uint8_t* buffer, size_t capacity);
+/* A state the plugin says no to (a CLAP plugin's state load fails): MDAW_ERR_PLUGIN, and the
+ * plugin keeps what it had, as far as it can. */
 mdaw_status mdaw_device_set_state(mdaw_engine* engine, uint64_t device, const uint8_t* bytes, size_t length);
 /* Back to the state the plugin had when the device was made. The device keeps its id and
  * place. For a plugin that saves no state, every parameter goes back to its default. */

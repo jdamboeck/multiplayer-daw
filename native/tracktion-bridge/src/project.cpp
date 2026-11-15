@@ -1001,6 +1001,8 @@ void Project::restoreState (Device& device, const void* data, size_t size)
     if (auto* pi = d->instance())
     {
         pi->setStateInformation (data, (int) size);
+        if (mdaw::clapStateRefused (pi))
+            fail (MDAW_ERR_PLUGIN, "the plugin refused the state");
         // Tracktion takes the plugin's new values over asynchronously; take them now, so that
         // reading a parameter straight after this returns the restored value.
         d->refreshParams();

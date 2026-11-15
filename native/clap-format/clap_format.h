@@ -24,6 +24,11 @@ namespace mdaw
     /// False, leaving min and max as they are, for any other parameter.
     bool clapParameterRange (const juce::AudioProcessorParameter*, double& min, double& max);
 
+    /// Whether a CLAP instance made by this format said no to the last state it was given with
+    /// setStateInformation (it then keeps what it had, as far as it can). False for any other
+    /// instance.
+    bool clapStateRefused (const juce::AudioPluginInstance*);
+
     /// Things the host did that CLAP does not allow, counted so that a test can see them.
     struct ClapHostCounters
     {
