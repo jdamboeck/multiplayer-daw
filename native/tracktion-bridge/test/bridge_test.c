@@ -775,6 +775,45 @@ static void scannerChecks (int haveSynth)
         both = now() - start;
         unsetenv ("MDAW_TEST_STATE_DELAY_MS");
         check (second == n && both >= 0.6, "state_kept_only_for_next_call");
+
+        /* A state read at once after a set holds the value set (the plugin saves its Level as
+         * 8 raw bytes), and the value stays: it is not taken back from the plugin. Before the
+         * bridge handed sets over first, the state had the old Level and the parameter went
+         * back to it, reported as the plugin's own change. */
+        drainEvents (e);
+        int fresh = 1, kept = 1;
+        for (int round = 0; round < 5; ++round)
+        {
+            const double wanted = round % 2 == 0 ? 0.2 : 0.7;
+            double saved = -1.0;
+            mdaw_device_set_param (e, 55, "0", (float) wanted);
+            size_t got = mdaw_device_get_state (e, 55, fitting, sizeof fitting);
+            if (got == sizeof saved) memcpy (&saved, fitting, sizeof saved);
+            if (fabs (saved - wanted) > 1e-3) { fresh = 0; printf ("round %d: state holds %g, set %g\n", round, saved, wanted); }
+            sleepMs (100);
+            float value = -1.0f;
+            mdaw_device_get_param (e, 55, "0", &value);
+            if (fabsf (value - (float) wanted) > 1e-3f) { kept = 0; printf ("round %d: parameter %g after the read, set %g\n", round, value, wanted); }
+        }
+        sleepMs (400);
+        int events = drainEvents (e);
+        check (fresh, "state_read_right_after_set_has_it");
+        check (kept, "state_read_right_after_set_keeps_value");
+        check (events == 0, "state_read_right_after_set_no_events");
+        /* And restoring that state brings the value back. */
+        {
+            mdaw_device_set_param (e, 55, "0", 0.35f);
+            size_t got = mdaw_device_get_state (e, 55, fitting, sizeof fitting);
+            mdaw_device_set_param (e, 55, "0", 0.9f);
+            mdaw_status r = mdaw_device_set_state (e, 55, fitting, got);
+            float value = -1.0f;
+            mdaw_device_get_param (e, 55, "0", &value);
+            sleepMs (100);
+            float later = -1.0f;
+            mdaw_device_get_param (e, 55, "0", &later);
+            measure ("state_restore_after_set_value", value);
+            check (r == MDAW_OK && fabsf (value - 0.35f) < 1e-3f && fabsf (later - 0.35f) < 1e-3f, "state_restore_after_set_has_it");
+        }
         check (mdaw_device_remove (e, 55) == MDAW_OK, "gui_plugin_removed");
     }
 
@@ -1385,6 +1424,8 @@ int main (void)
                 measure ("external_param_read_back", value);
                 check (fabsf (value - 0.3f) < 0.01f, "external_param_set_get");
 
+                /* The state is read right after the set, with no block processed in between: it
+                 * holds the value all the same, and restoring it brings the value back. */
                 size_t n = mdaw_device_get_state (e, EXT, NULL, 0);
                 uint8_t* state = malloc (n + 1);
                 mdaw_device_get_state (e, EXT, state, n);
@@ -1393,9 +1434,7 @@ int main (void)
                 mdaw_status r = mdaw_device_set_state (e, EXT, state, n);
                 mdaw_device_get_param (e, EXT, param, &value);
                 measure ("external_param_after_restore", value);
-                /* The value set just before the state was read may not have reached the plugin
-                 * yet (no block processed in between), so this is reported, not required. */
-                printf ("RESULT external_state_restore_ok=%d\n", r == MDAW_OK);
+                check (r == MDAW_OK && fabsf (value - 0.3f) < 0.01f, "external_state_has_value_set_just_before");
                 free (state);
 
                 /* Back to the freshly loaded plugin: Level 0.5. Level 0.1 is rendered first so

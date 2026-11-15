@@ -159,8 +159,10 @@ mdaw_status mdaw_device_set_bypass(mdaw_engine* engine, uint64_t device, int32_t
 /* Parameters are named by the plugin's own parameter id, never by name or index (for CLAP the
  * decimal clap_id, for LV2 "sym:" and the port symbol). value is normalised 0..1. Unknown parameter: MDAW_ERR_NOT_FOUND; so is
  * mdaw_device_get_param on a device that does not exist, as it has no value to give.
- * A value set here reaches the plugin with the next block it processes: state read before
- * that still holds the old value. */
+ * A value set here reaches the plugin's audio side with the next block it processes; until
+ * then only mdaw_device_get_param has it. mdaw_device_get_state hands it over first (see
+ * there), so a state read at any time after this call holds the value, and the value is not
+ * taken back from the plugin afterwards. */
 mdaw_status mdaw_device_set_param(mdaw_engine* engine, uint64_t device, const char* param_id, float value);
 mdaw_status mdaw_device_get_param(mdaw_engine* engine, uint64_t device, const char* param_id, float* value);
 /* JSON array of {"id","name","value","default","steps","min","max","text"}; returns the
@@ -173,7 +175,12 @@ size_t mdaw_device_params(mdaw_engine* engine, uint64_t device, char* buffer, si
 size_t mdaw_device_param_text(mdaw_engine* engine, uint64_t device, const char* param_id, float value,
                               char* buffer, size_t capacity);
 /* The plugin's opaque state. Reading flushes it from the plugin first. Returns the length
- * needed; 0 if the device does not exist or has no state. A call that did not fit keeps the
+ * needed; 0 if the device does not exist or has no state.
+ * It holds every value mdaw_device_set_param set on the device before this call, with or
+ * without an audio device: if a set has not reached the plugin yet, the engine first waits for
+ * the device to process the plugin (at most 50 ms, or three blocks with a larger buffer) or,
+ * when nothing processes it, processes one inaudible block of it itself. Only if the audio
+ * device stops advancing altogether may a read miss the last sets (the next read tries again). A call that did not fit keeps the
  * state it read for the calling thread's next call for the same device, so the second call
  * returns the same bytes without asking the plugin again. Any other call from that thread in
  * between (another device, a buffer that is still too small, any other function) drops what

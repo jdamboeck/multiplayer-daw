@@ -630,7 +630,8 @@ impl Engine {
         check(unsafe { sys::mdaw_device_set_bypass(self.ptr(), device, i32::from(bypass)) })
     }
 
-    /// `value` normalised 0..1. Reaches the plugin with the next block it processes.
+    /// `value` normalised 0..1. Reaches the plugin with the next block it processes; a state
+    /// read after this call ([`Engine::device_get_state`]) holds it all the same.
     pub fn device_set_param(&self, device: u64, param_id: &str, value: f32) -> Result<(), Error> {
         let param_id = c_string(param_id)?;
         // SAFETY: valid handle; the string outlives the call.

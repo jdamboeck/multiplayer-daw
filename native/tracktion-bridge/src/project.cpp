@@ -262,6 +262,8 @@ struct Project::Device : te::AutomatableParameter::Listener,
     juce::ValueTree initialTree;
     std::atomic<bool> stateChanged { false };
     juce::uint32 ignoreStateUntil = 0;
+    /// A parameter was set that may not have reached the plugin yet (see deliverParameterSets).
+    bool setsPending = false;
 };
 
 /// The plugin's own editor in a window with the system's title bar.
@@ -842,9 +844,9 @@ void Project::deviceSetBypass (uint64_t id, bool bypass)
         d->plugin->setEnabled (! bypass);
 }
 
-// A value set here reaches an external plugin with the next block it processes (Tracktion
-// hands parameters over on the audio thread). Reading the plugin's state straight after a set,
-// with nothing processed in between, can still give the old value.
+// A value set here reaches an external plugin's processing side with the next block it
+// processes; deviceGetState hands it over first if that has not happened yet
+// (deliverParameterSets).
 void Project::deviceSetParam (uint64_t id, const juce::String& paramId, float value)
 {
     if (! std::isfinite (value) || value < 0.0f || value > 1.0f) fail (MDAW_ERR_ARGUMENT, "parameter value must be 0..1");
@@ -859,6 +861,7 @@ void Project::deviceSetParam (uint64_t id, const juce::String& paramId, float va
     const juce::ScopedValueSetter<bool> own (ownChange, true);
     p->setNormalisedParameter (value, juce::sendNotification);
     d->known[paramId] = p->getCurrentNormalisedValue();   // stepped parameters snap
+    d->setsPending = d->instance() != nullptr;
 }
 
 float Project::deviceGetParam (uint64_t id, const juce::String& paramId)
@@ -928,6 +931,7 @@ juce::MemoryBlock Project::deviceGetState (uint64_t id)
     if (d == nullptr)
         return block;
     const auto started = nowMs();
+    deliverParameterSets (*d);
     d->plugin->flushPluginStateToValueTree();
     if (d->instance() != nullptr)
     {
@@ -972,6 +976,7 @@ void Project::deviceResetState (uint64_t id)
                     param->setNormalisedParameter (hosted->getDefaultValue(), juce::sendNotification);
                     d->known[pid] = param->getCurrentNormalisedValue();
                 }
+            d->setsPending = true;
             d->stateChanged = false;
             return;
         }
@@ -1016,6 +1021,111 @@ void Project::restoreState (Device& device, const void* data, size_t size)
     for (auto& [pid, param] : d->params)
         d->known[pid] = param->getCurrentNormalisedValue();
     d->stateChanged = false;
+}
+
+namespace
+{
+    /// What Tracktion keeps of a plugin's last initialisation (protected in te::Plugin).
+    struct PluginAccess : te::Plugin
+    {
+        static double rateOf (const te::Plugin& p) { return p.*(&PluginAccess::sampleRate); }
+        static int blockOf (const te::Plugin& p)   { return p.*(&PluginAccess::blockSizeSamples); }
+    };
+}
+
+/// A value set on an external plugin's parameter is passed to JUCE's parameter at once, on this
+/// thread, but the formats hand it to the plugin's processing side only with the next block
+/// (doc point 8): JUCE's VST3 host sends it to the edit controller at once and to the processor
+/// in process(); its LV2 host writes the control port (or the patch:Set message) in run(); our
+/// CLAP host sends a value event in process() or flush(). A state saved before that holds the
+/// old value (JUCE-built VST3 plugins excepted: their controller and processor share one
+/// AudioProcessor). So before a state read:
+///  - if the audio device is processing the plugin, wait until Tracktion's stream time has
+///    advanced twice: the second of those callbacks began after this call, so the plugin has
+///    had the value. Bounded (50 ms, or three blocks); the audio callback never waits for this
+///    thread, so the wait ends either way.
+///  - otherwise (no device, plugin bypassed or not in the playback graph, or the wait ran out
+///    while the device still ran), process one block here, through Tracktion's own
+///    ExternalPlugin::applyToBuffer, which holds the plugin's process lock: it never runs at the
+///    same time as an audio thread's block. Nothing hears it. A plugin that has never been
+///    prepared is prepared for it, as a render does.
+///  - if the device is open but its callback did not advance at all, the audio thread is stuck
+///    (perhaps inside this plugin, holding its lock): the plugin is left alone and the read may
+///    miss the last sets; the next read tries again.
+void Project::deliverParameterSets (Device& d)
+{
+    if (! d.setsPending)
+        return;
+    auto* ext = dynamic_cast<te::ExternalPlugin*> (d.plugin.get());
+    auto* pi = d.instance();
+    if (ext == nullptr || pi == nullptr)
+    {
+        d.setsPending = false;
+        return;
+    }
+
+    auto& dm = engine->getDeviceManager();
+    const auto started = nowMs();
+    juce::String how;
+    if (deviceRuns() && ! edit->isRendering() && ext->isEnabled() && ext->isBeingActivelyPlayed())
+    {
+        // Tracktion advances its stream time at the end of each callback that processed the
+        // graph. 50 ms, or three blocks with a larger buffer.
+        const double blockMs = dm.getSampleRate() > 0 ? 1000.0 * dm.getBlockSize() / dm.getSampleRate() : 0.0;
+        const double limit = juce::jlimit (50.0, 250.0, 3.0 * blockMs);
+        double last = dm.getCurrentStreamTime();
+        int advanced = 0;
+        while (advanced < 2 && nowMs() - started < limit)
+        {
+            juce::Thread::sleep (1);
+            if (const auto now = dm.getCurrentStreamTime(); now != last)
+            {
+                last = now;
+                ++advanced;
+            }
+        }
+        if (advanced >= 2)
+        {
+            d.setsPending = false;
+            if (traceOn())
+                trace ("device " + juce::String ((juce::int64) d.id) + ": parameter sets delivered by the audio thread in "
+                       + ms (nowMs() - started) + " ms");
+            return;
+        }
+        if (advanced == 0)
+        {
+            // The audio callback is stuck (inside this plugin, perhaps, holding its lock): do not
+            // touch the plugin. The state read may miss the last sets; the next read tries again.
+            juce::Logger::writeToLog ("device " + juce::String ((juce::int64) d.id)
+                                      + ": the audio device did not advance; state read without the last parameter sets");
+            return;
+        }
+        how = "after waiting " + ms (nowMs() - started) + " ms, ";
+    }
+
+    // Initialised with the rate and block size it had last (Tracktion keeps them), so that a
+    // plugin prepared before, by a render or by playback, is not prepared again.
+    const bool prepared = ! ext->baseClassNeedsInitialising();
+    if (! prepared)
+        ext->baseClassInitialise ({ timeOf (offlinePosition), PluginAccess::rateOf (*ext), PluginAccess::blockOf (*ext) });
+    const int channels = juce::jmax (1, pi->getTotalNumInputChannels(), pi->getTotalNumOutputChannels());
+    // CLAP: no samples, which our format turns into flush(). VST3 and LV2: one sample of
+    // silence. VST3's own way is a process call of 0 samples, but Dragonfly (DPF) and LSP ignore
+    // the parameters in one; a single sample is a block every plugin handles.
+    const int samples = pi->getPluginDescription().pluginFormatName == "CLAP" ? 0 : 1;
+    juce::AudioBuffer<float> buffer (channels, 1);
+    buffer.clear();
+    const auto at = timeOf (offlinePosition);
+    const te::PluginRenderContext block (&buffer, juce::AudioChannelSet::canonicalChannelSet (channels), 0, samples,
+                                         nullptr, 0.0, { at, at }, false, false, false, true);
+    ext->applyToBuffer (block);
+    if (! prepared)
+        ext->baseClassDeinitialise();
+    d.setsPending = false;
+    if (traceOn())
+        trace ("device " + juce::String ((juce::int64) d.id) + ": parameter sets delivered " + how + "by a block of "
+               + juce::String (samples) + " samples here in "
+               + ms (nowMs() - started) + " ms" + (prepared ? juce::String() : juce::String (" (prepared for it)")));
 }
 
 void Project::parameterMoved (Device& d, te::AutomatableParameter& p)

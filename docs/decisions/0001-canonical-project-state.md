@@ -60,8 +60,8 @@ the project.
   `TempoSequence`.
 - **Plugin state.** A device holds: format, plugin identifier, parameter values by the plugin's
   parameter ID, and an opaque state blob. Blobs above a small size go to the asset store and
-  the model holds the hash. State is read from the engine only after a processed block
-  (integration doc, point 8).
+  the model holds the hash. A value set reaches a plugin only with its next processed block;
+  the bridge hands pending sets over before it reads a state (integration doc, point 8).
 - **Assets.** Audio files are content-addressed blobs (the existing blob store). The bridge is
   handed a local file path once the blob is present.
 - **Not in the project.** Play/stop, playhead, loop range, selected device, window positions,

@@ -7,7 +7,7 @@
 //!
 //! One engine per process: one test.
 
-use mdaw_tracktion::{Config, Engine};
+use mdaw_tracktion::{Config, Engine, Event, built_scanner_path};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -27,6 +27,16 @@ fn peak_over(engine: &Engine, for_ms: u64) -> f32 {
 #[ignore = "opens the audio device and makes sound"]
 fn live_notes_are_heard_while_stopped_and_while_playing() {
     let scratch = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/bridge-scratch");
+    // The CLAP test plugin with a state (test/bad_clap.c), built next to the scanner.
+    let clap = scratch.join("live-clap");
+    let _ = std::fs::remove_dir_all(&clap);
+    std::fs::create_dir_all(&clap).expect("clap folder");
+    let built = built_scanner_path()
+        .and_then(Path::parent)
+        .expect("the native build made the scanner and the test plugins");
+    std::fs::copy(built.join("test-gui.clap"), clap.join("test-gui.clap")).expect("test-gui.clap");
+    // SAFETY: set before the engine (and any other thread of this binary) starts; one test.
+    unsafe { std::env::set_var("CLAP_PATH", &clap) };
     let mut config = Config::new("mdaw-live-test", scratch.join("live-settings"));
     config.open_audio_device = true;
     let engine = Engine::new(config).expect("engine");
@@ -111,4 +121,58 @@ fn live_notes_are_heard_while_stopped_and_while_playing() {
     }
     println!("RESULT live_note_to_meter_ms={delays:?}");
     assert_eq!(delays.len(), 5, "every note reached the meter");
+
+    state_read_right_after_a_set(&engine);
+}
+
+/// With the device processing the plugin, a state read at once after a parameter set holds
+/// the value (the bridge waits for the audio thread to hand it over), and the value stays. The
+/// client used to cover only the case without a device.
+fn state_read_right_after_a_set(engine: &Engine) {
+    engine.plugins_scan("CLAP").expect("scan CLAP");
+    engine
+        .device_add(1, 3, 2, "CLAP", "org.mdaw.test-gui")
+        .expect("add test-gui");
+    // Let the playback graph take the new device in.
+    std::thread::sleep(Duration::from_millis(500));
+    while engine.poll_event().is_some() {}
+    let mut stale = Vec::new();
+    let mut went_back = Vec::new();
+    let mut slowest = Duration::ZERO;
+    for round in 0..20 {
+        let wanted = if round % 2 == 0 { 0.2f64 } else { 0.7 };
+        engine.device_set_param(3, "0", wanted as f32).unwrap();
+        let started = Instant::now();
+        let state = engine.device_get_state(3);
+        slowest = slowest.max(started.elapsed());
+        // The plugin saves its one parameter, Level, as 8 raw bytes.
+        let saved = <[u8; 8]>::try_from(state.as_slice()).map(f64::from_ne_bytes);
+        if saved.is_err() || (saved.unwrap() - wanted).abs() > 1e-3 {
+            stale.push((round, saved));
+        }
+        std::thread::sleep(Duration::from_millis(30));
+        let value = engine.device_get_param(3, "0").unwrap();
+        if (f64::from(value) - wanted).abs() > 1e-3 {
+            went_back.push((round, value));
+        }
+    }
+    std::thread::sleep(Duration::from_millis(600));
+    let reports: Vec<Event> = std::iter::from_fn(|| engine.poll_event())
+        .filter(|e| matches!(e, Event::ParamChanged { .. }))
+        .collect();
+    println!(
+        "RESULT set_then_state_stale={stale:?} went_back={went_back:?} reports={} slowest_read_ms={:.1}",
+        reports.len(),
+        slowest.as_secs_f64() * 1000.0
+    );
+    assert!(
+        stale.is_empty(),
+        "every state read holds the value set just before it"
+    );
+    assert!(went_back.is_empty(), "the value set stays");
+    assert!(reports.is_empty(), "no change reported back: {reports:?}");
+    assert!(
+        slowest < Duration::from_millis(300),
+        "a state read waits a bounded time"
+    );
 }

@@ -309,8 +309,8 @@ PluginFormat = Clap | Vst3 | Lv2   // new formats are added at the end
   - On Tracktion Engine (client built with `tracktion`): the engine reports a parameter changed
     or a preset loaded in the plugin's window; a generic slider marks the device itself. 500 ms
     after the last change of a device, and at most 2 s after the first, the client reads the
-    plugin's state (without an audio device it first renders a moment, so the plugin has taken
-    the new values) and submits it if its hash differs from the state the document holds. A
+    plugin's state (the engine first makes sure every value set has reached the plugin) and
+    submits it if its hash differs from the state the document holds. A
     state that arrives from another client, or from undo, is given to the plugin; the engine does
     not report that as a change, and the client knows the plugin holds it, so it is not sent
     back.

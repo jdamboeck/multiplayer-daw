@@ -170,7 +170,35 @@ These were all found by running into them.
 7. **Drain the message loop before and after destroying an edit** (about 300 ms), or VST3
    teardown can crash.
 8. **A parameter reaches the plugin with the next processed block.** Set a value, save
-   immediately, and the saved state has the old value. Process (or render) before reading state.
+   immediately, and the saved state has the old value. Tracktion passes the value to JUCE's
+   parameter at once, on the message thread; what the format does with it then:
+   - VST3 (JUCE's host): `setValue` gives it to the edit controller at once and to the processor
+     in the next `process()`; the state is processor plus controller. Plugins built with JUCE
+     (vitOTT, Fasttracker II) share one AudioProcessor between the two and save the new value at
+     once; split ones (Dragonfly on DPF, LSP) save the old value until a block. They
+     also ignore parameters in a `process()` of 0 samples, VST3's own "parameter flush"; one
+     sample works.
+   - LV2 (JUCE's host): the value goes into a cache; the control port (or the patch:Set message)
+     is written in the next `run()`, and lilv saves the ports' values. ChowKick and Dexed save
+     the old value until a block; `run(0)` and `run(1)` both deliver it.
+   - CLAP (ours): an event in the next `process()` or `params.flush()`. Worse, reading the state
+     read the plugin's values back and took its old one as "changed by the plugin": the
+     parameter went back and the application was told so. ChowKick's CLAP build also brings the
+     value into its state only in a main-thread callback it asks for after the event.
+
+   Measured (2026-11-15, set then read at once, no device / device open): test-gui CLAP, ChowKick
+   CLAP and LV2, Dexed LV2, Dragonfly Plate and LSP Filter VST3 stale (CLAP also put back);
+   vitOTT and Fasttracker II (its only parameter, Bypass) VST3 fresh. The bridge now hands pending sets over before
+   every state read (`deliverParameterSets` in `project.cpp`): with the device processing the
+   plugin it waits for two device callbacks (at most 50 ms, or three blocks); otherwise it
+   processes one block itself through Tracktion's `ExternalPlugin::applyToBuffer`, which holds the
+   plugin's process lock, so it never overlaps an audio-thread block — 0 samples for CLAP (our
+   format turns that into `params.flush()`), 1 sample of silence for VST3 and LV2, preparing a
+   plugin that never was. The CLAP format also no longer takes back a value it has not sent,
+   drops unsent values when a state is loaded, flushes before saving when no audio ran in the
+   last 100 ms, and serves a pending `request_callback` before saving. After this every plugin
+   above saves the value set, with and without a device, and none goes back. A state read
+   waits 13–20 ms with the device open (44.1 kHz, 512), under 2 ms without.
 9. **Identify parameters by ID, never by name.** Tracktion adds its own "dry level" and "wet
    level" to every external plugin; Dragonfly has a "Dry Level" of its own.
 10. **Tracktion's clip path is not bit-transparent.** An audio clip rendered through an empty
@@ -494,10 +522,13 @@ save, a slow window and a window that fails.
 - A plugin call that hangs or is slow holds the message thread and the worker; nothing can
   interrupt it. A slow `getStateInformation` delays the next job by its length (once per look,
   no longer piling up).
-- A state read right after a parameter set, before the plugin has processed a block, gives the
-  old value (point 8), and the old value then wins. The client renders a moment before a look
-  when no audio device is open; with a device open a few milliseconds remain. To be fixed in
-  the bridge.
+- A state read right after a parameter set gave the old value, and the old value then won
+  (point 8). Fixed in the bridge and the CLAP format; the client's render before a look is gone.
+  Left (from the code, not tried): a bypassed LV2 plugin without an `lv2:enabled` port is not
+  run by JUCE's bypassed block, so its state lags until it is processed; a read while the audio callback is
+  stuck may miss the last sets. Dexed (LV2) puts its parameters back to its program's values
+  when it is prepared for the first time, which the bridge now does for a plugin never prepared
+  before (a render did the same).
 - Two scans on one engine queue on a mutex; written, not exercised.
 - The real first paint of a plugin's window, and behaviour under a real window manager, are
   checked by hand (`docs/manual-tests/plugin-windows.md`), not by the tests (Xvfb has no window

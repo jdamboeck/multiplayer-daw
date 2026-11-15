@@ -217,6 +217,9 @@ private:
     void startTransportIfWanted();
     void removeDevice (uint64_t id);
     void restoreState (Device&, const void* data, size_t size);
+    /// Makes sure every parameter value set on the device has reached its plugin, so that a
+    /// state read now holds it (see the definition).
+    void deliverParameterSets (Device&);
     /// The plugins that can be loaded now, each (format, own id) once: the first description
     /// in the known-plugin list wins.
     std::vector<std::pair<juce::PluginDescription, juce::String>> loadablePlugins();

@@ -413,6 +413,17 @@ public:
     void processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midi) override
     {
         const int n = buffer.getNumSamples();
+        if (n == 0)
+        {
+            // A block of no length hands over parameter changes, as a VST3 host does with a
+            // process call of 0 samples; CLAP's way of doing that without audio is flush().
+            // The message thread waits for a block in progress to end; it is one block.
+            const Busy hold (*this, onMainThread());
+            if (hold.got && loaded->params != nullptr)
+                flushParameters();
+            midi.clear();
+            return;
+        }
         const Busy hold (*this, false);
         const AudioRole role;
         if (! hold.got || ! active || n > maxBlock || (! processing && ! (processing = plugin->start_processing (plugin))))
@@ -424,6 +435,7 @@ public:
             return;
         }
         ++blocksProcessed;
+        lastBlockAt.store (juce::Time::getMillisecondCounter());
 
         // Inputs are copied out first: JUCE hands in and out the same channels, CLAP wants them apart.
         for (size_t port = 0; port < loaded->inputs.size(); ++port)
@@ -513,6 +525,20 @@ public:
     {
         dest.reset();
         if (loaded->state == nullptr) return;
+        // A value the host set reaches the plugin with the next process() or flush(); saved
+        // before that, the state would hold the old value. While audio runs the next block
+        // brings it (the host waits for that, see the bridge's deliverParameterSets); when
+        // none has run for a while, flush() now, which CLAP has for exactly this.
+        if (anySendToPlugin.load() && loaded->params != nullptr
+            && juce::Time::getMillisecondCounter() - lastBlockAt.load() > audioIdleMs)
+        {
+            const Busy hold (*this, true);
+            flushParameters();
+        }
+        // A plugin may take a value into what it saves only in the main-thread callback it asks
+        // for after the event (ChowKick's CLAP build does); give it that callback first.
+        if (onMainThread() && loaded->callbackWanted.exchange (false))
+            plugin->on_main_thread (plugin);
         clap_ostream_t stream {};
         stream.ctx = &dest;
         stream.write = [] (const clap_ostream_t* s, const void* data, uint64_t size) -> int64_t
@@ -537,6 +563,11 @@ public:
             return (int64_t) static_cast<juce::MemoryInputStream*> (s->ctx)->read (buffer, (int) juce::jmin<uint64_t> (wanted, 1u << 30));
         };
         const Busy hold (*this, true);
+        // The state replaces whatever the host set and had not handed over yet; sent after
+        // the load, those values would undo part of it.
+        anySendToPlugin.store (false);
+        for (auto* p : parameters)
+            p->sendToPlugin.store (false);
         if (loaded->state->load (plugin, &stream))
             readValuesFromPlugin();
     }
@@ -581,6 +612,20 @@ private:
         Instance& owner;
         bool got = false;
     };
+
+    /// Hands the parameter changes the host made to the plugin through flush(). The caller
+    /// holds Busy, so this never overlaps process().
+    void flushParameters()
+    {
+        flushEvents.events.clear();
+        std::swap (events.events, flushEvents.events);   // addParameterEvents() fills `events`
+        addParameterEvents();
+        std::swap (events.events, flushEvents.events);
+        // flush() belongs to the audio thread while the plugin is active, even when nothing
+        // is processing, and to the main thread otherwise.
+        if (active) { const AudioRole role; loaded->params->flush (plugin, &flushEvents.in, &out); }
+        else        loaded->params->flush (plugin, &flushEvents.in, &out);
+    }
 
     void addParameterEvents()
     {
@@ -637,6 +682,10 @@ private:
         if (loaded->params == nullptr) return;
         for (auto* p : parameters)
         {
+            // A value the host set and the plugin has not been sent yet is newer than the
+            // plugin's; taking the plugin's would put the parameter back.
+            if (p->sendToPlugin.load())
+                continue;
             double v = 0;
             if (loaded->params->get_value (plugin, p->info.id, &v))
             {
@@ -667,16 +716,7 @@ private:
         {
             const Busy hold (*this, false);
             if (hold.got)
-            {
-                flushEvents.events.clear();
-                std::swap (events.events, flushEvents.events);   // addParameterEvents() fills `events`
-                addParameterEvents();
-                std::swap (events.events, flushEvents.events);
-                // flush() belongs to the audio thread while the plugin is active, even when
-                // nothing is processing, and to the main thread otherwise.
-                if (active) { const AudioRole role; loaded->params->flush (plugin, &flushEvents.in, &out); }
-                else        loaded->params->flush (plugin, &flushEvents.in, &out);
-            }
+                flushParameters();
         }
 
         if (anyChangedByPlugin.exchange (false))
@@ -696,6 +736,10 @@ private:
     std::set<ClapParameter*> gestureOpen;
     std::atomic<bool> anySendToPlugin { false }, anyChangedByPlugin { false }, busy { false };
     std::atomic<uint32_t> blocksProcessed { 0 };
+    /// When the last block was processed (`Time::getMillisecondCounter`), and how long after
+    /// that audio counts as stopped for a state read.
+    std::atomic<juce::uint32> lastBlockAt { 0 };
+    static constexpr juce::uint32 audioIdleMs = 100;
     uint32_t blocksSeenByTimer = 0;
 
     bool active = false, processing = false;

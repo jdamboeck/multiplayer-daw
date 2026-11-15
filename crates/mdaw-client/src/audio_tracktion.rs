@@ -415,10 +415,8 @@ impl TracktionAudio {
             synced: None,
             blobs: HashMap::new(),
             output_gain: 1.0,
-            flush_path: options.settings_dir.join("flush.wav"),
             looks: HashMap::new(),
             applied: HashMap::new(),
-            unflushed: HashSet::new(),
         };
         let worker = std::thread::Builder::new()
             .name("mdaw-engine-worker".into())
@@ -1215,17 +1213,12 @@ struct Worker {
     /// Plugin states at hand: downloaded, or read from the plugins here.
     blobs: HashMap<BlobHash, Arc<[u8]>>,
     output_gain: f32,
-    /// Where the short render goes that lets the plugins take parameters without a device.
-    flush_path: PathBuf,
     /// What reading the settings of a plugin with an open window last gave, and a different
     /// reading seen once since: a change counts when two readings in a row agree on it, so a
     /// plugin that writes its settings a little differently each time sends nothing.
     looks: HashMap<DeviceId, (BlobHash, Option<BlobHash>)>,
     /// The number of the last set carried out per parameter (see [`Worker::read_params`]).
     applied: HashMap<(DeviceId, String), u64>,
-    /// Devices with parameters set that may not have reached the plugin yet (see
-    /// [`Worker::deliver_sets`]).
-    unflushed: HashSet<DeviceId>,
 }
 
 impl Worker {
@@ -1314,7 +1307,6 @@ impl Worker {
                     engine.device_set_param(raw_device(device), &param, value.clamp(0.0, 1.0)),
                 );
                 self.applied.insert((device, param), number);
-                self.unflushed.insert(device);
             }
             Job::Params(device) => self.read_params(device),
             Job::Editor { device, show, token } => {
@@ -1630,9 +1622,6 @@ impl Worker {
         if !lock(&self.shared).looked.contains(&device) || !self.engine.has(EntityKind::Device, raw) {
             return;
         }
-        if self.unflushed.contains(&device) {
-            self.deliver_sets(device);
-        }
         let started = Instant::now();
         let bytes = self.engine.device_get_state(raw);
         let took = started.elapsed();
@@ -1682,7 +1671,6 @@ impl Worker {
         if !is_plugin || !self.engine.has(EntityKind::Device, raw) {
             return;
         }
-        self.deliver_sets(device);
         let started = Instant::now();
         let bytes: Arc<[u8]> = self.engine.device_get_state(raw).into();
         let took = started.elapsed();
@@ -1722,21 +1710,6 @@ impl Worker {
             },
         );
         shared.captured.push(((track, device), (hash, bytes)));
-    }
-
-    /// A parameter reaches the plugin with the next block it processes. With a device open
-    /// blocks are processed all the time; without, a moment of render does it. It has to be
-    /// there before the plugin's settings are read: reading them before takes the plugin's old
-    /// value back into the engine (CLAP), and the set is lost.
-    fn deliver_sets(&mut self, device: DeviceId) {
-        self.unflushed.remove(&device);
-        if !self.engine.state().device_open
-            && let Err(e) = self.engine.render(&self.flush_path, 0, 1, RENDER_RATE)
-        {
-            self.notice(format!("Plugin settings may be read too early: {}", e.message));
-        }
-        // The render processed every plugin.
-        self.unflushed.clear();
     }
 
     fn blob(&mut self, hash: BlobHash, bytes: Arc<[u8]>) {
