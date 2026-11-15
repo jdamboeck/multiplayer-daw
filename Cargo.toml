@@ -1,9 +1,9 @@
 [workspace]
 resolver = "3"
-members = ["crates/*", "spikes/*", "xtask"]
+members = ["crates/*", "xtask"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.90"
 license = "GPL-3.0-only"
@@ -13,22 +13,20 @@ publish = false
 mdaw-model = { path = "crates/mdaw-model" }
 mdaw-proto = { path = "crates/mdaw-proto" }
 mdaw-sync = { path = "crates/mdaw-sync" }
-mdaw-dsp = { path = "crates/mdaw-dsp" }
-mdaw-engine = { path = "crates/mdaw-engine" }
 mdaw-net = { path = "crates/mdaw-net" }
 mdaw-server = { path = "crates/mdaw-server" }
-mdaw-plugin = { path = "crates/mdaw-plugin" }
+mdaw-tracktion-sys = { path = "crates/mdaw-tracktion-sys" }
+mdaw-tracktion = { path = "crates/mdaw-tracktion" }
+mdaw-test-plugin = { path = "crates/mdaw-test-plugin" }
 imbl = { version = "7", features = ["serde"] }
 serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
 postcard = { version = "1.1", features = ["use-std"] }
 proptest = "1.12"
 tempfile = "3"
-libm = "0.2"
-rtrb = "0.4"
 eframe = "0.37"
 egui = "0.37"
 egui_kittest = "0.37"
-cpal = "0.18"
 blake3 = "1.8"
 anyhow = "1"
 tokio = { version = "1.54", features = ["rt", "rt-multi-thread", "net", "sync", "time", "macros", "signal"] }
@@ -38,8 +36,6 @@ rcgen = "0.14"
 sha2 = "0.11"
 getrandom = "0.4"
 rusqlite = { version = "0.41", features = ["bundled"] }
-flacenc = { version = "0.5", default-features = false }
-claxon = "0.4"
 midir = "0.11"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
@@ -51,3 +47,7 @@ opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 2
+# File and line in backtraces, no locals: full debug info of the dependencies (egui, wgpu,
+# tokio, ...) made each client test binary hundreds of MB. Workspace crates keep full debug
+# info. Tests inherit this profile.
+debug = "line-tables-only"

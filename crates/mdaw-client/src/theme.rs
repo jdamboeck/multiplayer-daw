@@ -31,10 +31,6 @@ pub const METER_HOT: Color32 = Color32::from_rgb(230, 90, 80);
 /// Background of the armed record button.
 pub const REC: Color32 = Color32::from_rgb(150, 38, 38);
 pub const WARN: Color32 = Color32::from_rgb(226, 178, 84);
-/// Background of a control that belongs to someone else's checkout.
-pub const WARN_DIM: Color32 = Color32::from_rgb(92, 72, 34);
-/// Background of a control that belongs to this user's checkout.
-pub const ACCENT_DIM: Color32 = Color32::from_rgb(40, 70, 110);
 
 pub fn rgb(color: u32) -> Color32 {
     Color32::from_rgb((color >> 16) as u8, (color >> 8) as u8, color as u8)

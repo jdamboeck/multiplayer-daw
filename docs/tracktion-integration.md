@@ -1,0 +1,591 @@
+# Tracktion Engine integration
+
+Status: 2026-11-12; updated 2026-11-15, when the Rust engine was removed and Tracktion became
+the client's only engine (`docs/retire-rust-engine.md`). Everything stated as a result here was
+run on this machine; anything not run is listed under "Not tested yet".
+
+## Versions
+
+| What | Pin | Notes |
+|---|---|---|
+| Tracktion Engine | tag `v3.2.0`, commit `0a5f4e6a5f53d09c89b414a44386a12df7fa1ec6` | submodule `native/third_party/tracktion_engine`; `Engine::getVersion()` still says "v3.1.0" |
+| JUCE | 8.0.6, commit `19edd538429c93d277bf95b55aaa7e3eb545f951` | Tracktion's own submodule, `modules/juce` |
+| CLAP headers | tag `1.2.9`, commit `cd94482ba5941ae410809b6fbaed3bc851044270` | submodule `native/third_party/clap`, MIT |
+
+Nothing is fetched at build time and no branch is tracked. To move a pin, check out the new tag
+in the submodule and commit the submodule pointer.
+
+**Licences.** Tracktion Engine is GPLv3 or commercial. JUCE 8 is AGPLv3 or commercial. This
+project is GPL-3.0-only. A binary that links JUCE 8 without a commercial licence is distributed
+under AGPLv3 terms; the server does not link either and is unaffected. Decided 2026-11-12:
+the client is distributed under AGPLv3 terms. Done 2026-11-15: `mdaw-client`,
+`mdaw-tracktion` and `mdaw-tracktion-sys` are `AGPL-3.0-only`, the text is `LICENSE-AGPL`, and
+README says which licence applies to what.
+
+Test machine: CachyOS, Linux 7.3.1, PipeWire 1.6.10 with `pipewire-jack`, GCC 16.2.1,
+CMake 4.4.5, Ninja.
+
+## Build
+
+This is the normal build of the client: it links the bridge, so `cargo build` and `cargo test`
+build the native part too (see "The bridge"). Linux only so far.
+
+Packages (Arch / CachyOS):
+
+```sh
+sudo pacman -S --needed base-devel cmake ninja git \
+    alsa-lib pipewire-jack freetype2 fontconfig \
+    libx11 libxext libxrandr libxinerama libxcursor libxcomposite libxrender \
+    ladspa
+```
+
+On Ubuntu 24.04 (what CI installs, `.github/workflows/ci.yml`; the first line is for the Rust
+side, egui and the MIDI input):
+
+```sh
+sudo apt-get install build-essential cmake ninja-build pkg-config git \
+    libasound2-dev libjack-jackd2-dev libx11-dev libxcb1-dev libxkbcommon-dev libwayland-dev \
+    libxext-dev libxrandr-dev libxinerama-dev libxcursor-dev libxcomposite-dev libxrender-dev \
+    libfreetype-dev libfontconfig1-dev ladspa-sdk
+```
+
+`pipewire-jack` (or `jack2`) supplies the JACK headers and library; JUCE loads the JACK library
+at run time. X11 libraries are needed for plugin editor windows. `curl` and WebKit are switched
+off in the build. The window tests also need `xvfb-run` and `xprop` (Ubuntu: `xvfb`,
+`x11-utils`).
+
+Fetch the sources (the `-c` option is only needed if GitHub over SSH is not set up, because
+some nested submodules use SSH URLs):
+
+```sh
+git -c url."https://github.com/".insteadOf="git@github.com:" \
+    submodule update --init --recursive --depth 1
+```
+
+Then `cargo build`. The build script of `mdaw-tracktion-sys` configures `target/native` the first
+time (CMake, Ninja if it is there, `RelWithDebInfo` for every Cargo profile, so a release build
+shares the folder) and builds the bridge and the scanner in it; the first build takes about ten
+minutes. The same folder by hand, for the spike and the C tests:
+
+```sh
+cmake -S native -B target/native -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build target/native --target mdaw-te-spike
+```
+
+The spike binary is
+`target/native/spike/mdaw-te-spike_artefacts/RelWithDebInfo/mdaw-te-spike`.
+
+The native code is built with `-g1` (function names and line numbers for backtraces, no local
+variables), and Cargo builds dependencies with line tables only, so that the test binaries stay
+small. For full debug info of the native side, configure once with
+`cmake -S native -B target/native -DMDAW_NATIVE_FULL_DEBUG=ON` and build again (about ten
+minutes); `-DMDAW_NATIVE_FULL_DEBUG=OFF` goes back. While it is off, the project's
+RelWithDebInfo flags override any `CMAKE_C_FLAGS_RELWITHDEBINFO` or
+`CMAKE_CXX_FLAGS_RELWITHDEBINFO` given with `-D` or in the cache (which `ccmake` and
+`CMakeCache.txt` still show), so turn it on to use your own.
+
+`native/CMakeLists.txt` passes `-Wno-template-body`: GCC 15 and later reject the bundled
+`nanorange.hpp` without it. Older GCC ignores the unknown option (see the comment there). The
+build is C++20.
+
+Nothing here is Linux-only by design. The CLAP editor embedding (`XEmbedComponent`), the
+`dlopen` pinning and the plugin search paths are the Linux-specific parts and are small; but
+`mdaw-tracktion-sys`'s build script refuses other targets until the bridge has been built and
+tested there.
+
+## The spike
+
+`native/spike/` is a console program that drives Tracktion the way the bridge will. Every
+command prints `RESULT key=value` lines and exits non-zero if a check fails.
+
+```sh
+S=target/native/spike/mdaw-te-spike_artefacts/RelWithDebInfo/mdaw-te-spike
+$S devices                         # audio and MIDI devices per backend
+$S play [--type JACK] [--device <name>] [--rate <hz>] [--block <n>]   # play, stop, seek, edit while playing
+$S saveload                        # build an edit, save, reload, compare
+$S render --out demo.wav           # offline render, no device opened
+$S scan --format VST3|CLAP|LV2 [--oop]            # --oop: scan in a child process
+$S plugin  --file <path> --format <fmt> [--param <name>] [--list-params]
+$S latency --file <path> --format <fmt> [--set Name=value]   # e.g. Mix=0, so the plugin passes its input through
+$S editor  --file <path> --format <fmt> [--hold <ms>]
+```
+
+The demo for "MIDI playback and offline render": `play` plays an eight-second MIDI clip through
+Tracktion's built-in FourOsc synth on the default device; `render` writes the same edit to a
+wav file without opening a device.
+
+## Results: engine
+
+| Check | Result |
+|---|---|
+| Device discovery | ALSA and JACK backends listed with their devices and MIDI ports |
+| Playback on ALSA (→ PipeWire) | plays, position advances, 0 xruns |
+| Playback on JACK (PipeWire's JACK) | plays, position advances, 0 xruns |
+| Stop | playhead stays, output falls silent |
+| Seek, then play | position correct |
+| Edit while playing (add note; add track with instrument and clip) | playback continues, 0 restarts |
+| Save and reload | same tracks, clips, notes, plugin |
+| Offline render without a device | wav written, audible signal |
+
+## Results: plugins
+
+VST3, scan: 231 plugin types from 34 files, no failures; the out-of-process scan finds the same.
+
+VST3, hosting, 14 plugins (Vital, Odin2, OB-Xd, ChowKick, Replicant303, SID, vitalium, Geonkick,
+vitOTT, Dragonfly Hall Reverb, RF-76, RF-2A, SwankyAmp, LSP Compressor Stereo). For each: load,
+render (instrument from MIDI, effect on an audio clip), set a parameter, save, reload, compare
+state and parameter, add automation and compare the render.
+
+- 14 of 14 load, render, restore their parameter and respond to automation. Odin2 and SID need
+  a continuous parameter named for the check (`--param`): the first one the spike picks is
+  stepped without saying so and snaps.
+- Effects change the audio (difference from dry far above the repeat-render noise).
+- Vital and vitalium do not write bit-identical state twice; their parameters are restored.
+- chipsounds and chipsynth-C64 do not keep parameter values in their state. Their CLAP builds
+  behave the same, so this is the plugins, not the host.
+
+CLAP, through the format in `native/clap-format/` (see ADR 0002): scan finds 18 types in about
+70 ms. Hosting check on 9 plugins: Vital, ChowKick, RF-76, RF-2A, RF-EQ1-A and BIT LAYER pass
+everything; Odin2 passes with a continuous parameter named, as its VST3 build does. chipsounds
+and chipsynth-C64 fail only the parameter-restore step, as their VST3 builds do. RF-76 gives the same numbers as CLAP
+as it does as VST3. No plugin was activated off the main thread and no audio block was skipped.
+
+LV2 (JUCE's own host): scan finds 154 types. Dexed and DISTRHO a-reverb pass the hosting check;
+ChowKick's LV2 build loads and renders but does not restore the parameter.
+
+Latency compensation (RF-76 and RF-2A, VST3 and CLAP): the plugin reports 64 samples; measured
+on the bare instance, 64. On a track, the output lines up with a track that has no plugin, and
+two tracks (one with the plugin, one without) sum to twice one track within 8e-8 RMS — without
+compensation the error would be 0.24.
+
+Editor windows: VST3 (Vital, OB-Xd, RF-76, Dragonfly) and CLAP (ChowKick, Vital, RF-76, Odin2,
+chipsounds) open in a native window, close, open again and close, with no error; a parameter
+changed from the host side while the editor is open reaches the engine. Screenshots of the
+CLAP editors of ChowKick, Vital, RF-76 and Odin2 show their full interfaces. Turning a knob
+with the mouse is in the manual test.
+
+Misbehaving plugin, during live playback, using the repo's CLAP test synth (measured with the
+spike's `misbehave` command and a switch the test synth had then; both were removed on
+2026-11-15, so this cannot be run again as it stands):
+
+| Mode | What happened |
+|---|---|
+| none | plays normally, 0 blocks skipped |
+| fail (process returns an error) | playback continues |
+| slow (50 ms per block) | whole project slows to about a quarter speed, CPU meter at 100 % |
+| hang (never returns) | playhead frozen, all audio stops; UI thread stays responsive |
+| crash (abort) | the whole process dies |
+
+So Tracktion gives no protection against a plugin once it is processing. Scanning can run in a
+separate process; processing cannot. What we do about it is in ADR 0002.
+
+## What the bridge must do
+
+These were all found by running into them.
+
+1. **Everything goes through the JUCE message thread.** Tracktion's housekeeping (graph
+   rebuilds, device changes, plugin loading, timers) runs there. The bridge owns one thread
+   that runs the message loop; every C ABI call posts to it.
+2. **Keep a wanted transport state.** Any change to the device list — a MIDI device plugged in,
+   or Tracktion's own MIDI ports appearing just after the audio device opens — clears the
+   playback graph and stops the transport. Seen once after every device open. The bridge
+   remembers "should be playing" and starts again.
+3. **Own the settings file.** Tracktion writes the chosen backend to
+   `~/.config/<app>/Settings.xml` and reuses it. The bridge supplies its own storage and sets
+   the backend explicitly.
+4. **JACK decides rate and block size.** Requests are ignored (48000 / 192 here). The JACK
+   client is called "JUCEJack" unless `JUCE_JACK_CLIENT_NAME` is set.
+5. **A plugin must be in the known-plugin list before it can be loaded.**
+6. **Never unload a plugin library.** OB-Xd leaves a thread running after its last instance is
+   gone; when JUCE unloads the library the process crashes (5 of 5 runs). Loading each module
+   once with `RTLD_NODELETE` before use fixes it (5 of 5 pass).
+7. **Drain the message loop before and after destroying an edit** (about 300 ms), or VST3
+   teardown can crash. So the bridge's `mdaw_project_clear` takes about 600 ms, except on an
+   edit nothing has changed since it was made: that one it keeps. That saves the 600 ms only on
+   the first load on a new engine (and on a clear right after a clear): `mdaw-tracktion`'s
+   `load_project` sets the master gain after its clear, so every later clear or reload is a full
+   one.
+8. **A parameter reaches the plugin with the next processed block.** Set a value, save
+   immediately, and the saved state has the old value. Tracktion passes the value to JUCE's
+   parameter at once, on the message thread; what the format does with it then:
+   - VST3 (JUCE's host): `setValue` gives it to the edit controller at once and to the processor
+     in the next `process()`; the state is processor plus controller. Plugins built with JUCE
+     (vitOTT, Fasttracker II) share one AudioProcessor between the two and save the new value at
+     once; split ones (Dragonfly on DPF, LSP) save the old value until a block. They
+     also ignore parameters in a `process()` of 0 samples, VST3's own "parameter flush"; one
+     sample works.
+   - LV2 (JUCE's host): the value goes into a cache; the control port (or the patch:Set message)
+     is written in the next `run()`, and lilv saves the ports' values. ChowKick and Dexed save
+     the old value until a block; `run(0)` and `run(1)` both deliver it.
+   - CLAP (ours): an event in the next `process()` or `params.flush()`. Worse, reading the state
+     read the plugin's values back and took its old one as "changed by the plugin": the
+     parameter went back and the application was told so. ChowKick's CLAP build also brings the
+     value into its state only in a main-thread callback it asks for after the event.
+
+   Measured (2026-11-15, set then read at once, no device / device open): test-gui CLAP, ChowKick
+   CLAP and LV2, Dexed LV2, Dragonfly Plate and LSP Filter VST3 stale (CLAP also put back);
+   vitOTT and Fasttracker II (its only parameter, Bypass) VST3 fresh. The bridge now hands pending sets over before
+   every state read (`deliverParameterSets` in `project.cpp`): with the device processing the
+   plugin it waits for two device callbacks (at most 50 ms, or three blocks); otherwise it
+   processes one block itself through Tracktion's `ExternalPlugin::applyToBuffer`, which holds the
+   plugin's process lock, so it never overlaps an audio-thread block — 0 samples for CLAP (our
+   format turns that into `params.flush()`), 1 sample of silence for VST3 and LV2, preparing a
+   plugin that never was. The CLAP format also no longer takes back a value it has not sent,
+   drops unsent values when a state is loaded, flushes before saving when no audio ran in the
+   last 100 ms, and serves a pending `request_callback` before saving. After this every plugin
+   above saves the value set, with and without a device, and none goes back. A state read
+   waits 13–20 ms with the device open (44.1 kHz, 512), under 2 ms without.
+9. **Identify parameters by ID, never by name.** Tracktion adds its own "dry level" and "wet
+   level" to every external plugin; Dragonfly has a "Dry Level" of its own.
+10. **Tracktion's clip path is not bit-transparent.** An audio clip rendered through an empty
+    track comes out 2 samples late and about 3 dB down (0.708). Cause not investigated; likely
+    the default pan law. Tests compare against a rendered reference, not the source file.
+11. **Synths are not repeatable.** FourOsc, Vital, Odin2 and OB-Xd give different samples on
+    each render (free-running oscillators). Tests measure the repeat difference first and
+    require a change well above it.
+12. **Define the window-manager atoms before JUCE starts.** JUCE — ours, and the older JUCE
+    inside plugins such as Vital — looks up atoms like `_NET_WORKAREA` "only if they exist" and
+    uses some unchecked. On XWayland under niri, right after login, nine of them do not exist
+    and opening Vital's editor ends the process with `BadAtom (X_GetProperty)`. ChowKick's
+    editor opened on the same server, so it is the plugin's code that trips. Once any program
+    has defined the atoms the problem is gone until the X server restarts, which is why it
+    only showed after a reboot. `mdaw::defineWindowManagerAtoms()` (`native/clap-format/x11_atoms.cpp`)
+    defines them at startup.
+13. **A CLAP plugin may ask for timers and file descriptors while it is being initialised.**
+    Plugins built on a toolkit (ChowKick, on JUCE) run their whole event loop from the host's
+    timer. The host must accept the request from the first moment; ours first refused it until
+    its own object existed, and the editor window stayed black.
+
+### Found while building the bridge
+
+14. **Never run a JUCE dispatch loop from inside a message callback on Linux.** A nested
+    `runDispatchLoopUntil` empties the event list the outer loop is iterating; the outer loop
+    then sleeps for ever. The spike's `pump()` is only safe because `main` calls it. The bridge
+    splits such work into steps with timer gaps instead. Tracktion nests a loop itself in the
+    `PluginManager` destructor, so the engine is deleted only after the loop has ended.
+15. **Tracktion's `paramID` for a hosted plugin is the parameter's index as text.** The
+    plugin's real id is `HostedAudioProcessorParameter::getParameterID()`.
+16. **Without a running device the transport stops itself** and overwrites the position from a
+    playhead that never moves. The bridge keeps the wanted state and position itself.
+17. **Changing the tempo map does not always move clips** (`insertTempo`, `removeTempo` do not;
+    `setBpm` does). The bridge places every clip again from its ticks after any tempo change.
+    A tempo point's curve 0 means a ramp; steps need curve 1.
+18. **Renderer defaults to switch off:** `canRenderInMono` (a mono file when the graph is
+    mono) and `checkNodesForAudio` (rendering silence is an error).
+19. **Tracktion opens every MIDI port, hardware included,** shortly after the first edit, even
+    with no audio device.
+20. **An external parameter set by the host comes back** later as a change "by the plugin" with
+    the same value; the bridge filters it so the application sees no echo.
+21. **`Edit::Options::defaultMasterVolumedB` is -3 dB.** That is the 3 dB of point 10's level
+    difference; the bridge sets 0. `PluginList::insertPlugin` can refuse without an error.
+22. **JUCE's identifier string for a plugin contains a hash of its file path,** so it differs
+    between machines. A shared project needs the plugin's own id. For VST3, JUCE keeps only a
+    32-bit hash of the class id; the bridge reads the full id from the bundle's
+    `moduleinfo.json` when there is one, otherwise from the plugin's factory. On Windows the
+    first eight bytes are stored in a different order and are converted, so the text is the
+    same everywhere. The conversion is checked against the VST3 SDK's own code on Linux; the
+    Windows and macOS loading code has never run.
+23. **Examine plugin files in a child process.** `mdaw-plugin-scan` looks at one file and
+    writes what it found; the bridge runs it per file with a time limit (30 s), kills it if it
+    hangs, and remembers a file that crashed or hung until the file changes. With it, listing
+    plugins and adding a device never load a library just to look at it. Scanning this machine
+    that way: VST3 0.75 s (229 plugins), LV2 2.5 s (154), CLAP 0.1 s (17), the same plugins as
+    in-process, no failures; a repeat scan with nothing changed takes about 0.1 s.
+24. **LV2 dynamic manifests are loaded in the application** when the engine starts, scanner or
+    not: JUCE builds lilv with that (deprecated) extension on. None are installed here.
+25. **Do not ignore SIGCHLD in the application.** The bridge then cannot tell a scanner crash
+    from an empty result.
+26. **`File::createDirectory` fails when another process makes a parent folder at the same
+    moment** (two clients started together on fresh profiles). The bridge retries and the Rust
+    wrapper makes the folder first.
+27. **Tracktion logs every device and port to the terminal.** The bridge sends JUCE's log to
+    `engine.log` in the settings folder. lilv's own warnings ("Duplicate plugin", "Reloading
+    plugin") still go to stderr.
+28. **CLAP plugins may report a parameter back after the host set it, with an older value**
+    (Odin2: 9 of 61 steps of a host-driven drag). The CLAP host takes a value from the plugin
+    only inside the plugin's gesture, or when the host has not set that parameter in the last
+    500 ms; otherwise the report is an echo and is ignored. Measured after: 0 of 183.
+
+## The bridge
+
+`native/tracktion-bridge/`: the C header `include/mdaw_engine.h` is the whole interface; the
+implementation is a static library that carries JUCE and Tracktion inside it.
+
+```sh
+cmake --build target/native --target mdaw-bridge-test
+cargo build -p mdaw-test-plugin
+mkdir -p target/bridge-scratch/clap
+cp target/debug/libmdaw_test_plugin.so target/bridge-scratch/clap/mdaw-test-synth.clap
+CLAP_PATH=$PWD/target/bridge-scratch/clap target/native/tracktion-bridge/mdaw-bridge-test
+```
+
+The test is written in C, uses no audio device and ends with `RESULT ok=1`. It covers building
+a project by id, rendering, idempotent repeats, note updates, mute, gain, bypass, the tempo
+map, parameters and state for the built-in synth and a CLAP plugin, no echo of own changes,
+and creating the engine twice in one process.
+
+From Rust: `crates/mdaw-tracktion-sys` (hand-written declarations; its build script runs the
+CMake build in `target/native`, or in `MDAW_NATIVE_BUILD_DIR`) and `crates/mdaw-tracktion`
+(safe `Engine`, plus `load_project` and `apply_op`, which bring a canonical `mdaw_model`
+project into the engine whole or one operation at a time).
+
+```sh
+cargo test -p mdaw-tracktion-sys -p mdaw-tracktion
+```
+
+Since 2026-11-15 these two crates are part of every build (the client depends on them), and CI
+builds the native part, runs the C test, the Rust tests and the window tests (`ci.yml`). The
+integration test
+applies model operations to the model and the engine side by side, renders after each step,
+and checks that the incremental result matches a fresh load. After moving a submodule pin,
+run `cmake --build target/native` once: the build script does not watch third-party sources.
+
+ABI 2 and 3 closed the gaps found from the Rust side. Plugins are named by their own id, the same
+on every machine (CLAP id, LV2 URI, VST3 class id as 32 hex digits; see
+`src/plugin_ids.h`): JUCE's identifier string contains a hash of the file path. The ids of
+CLAP and VST3 plugins are read from their libraries once and kept in `plugin-ids.xml` in the
+settings folder. The list offers only plugins whose file is still there, each id once. CLAP
+parameters report their plain range, so the model's values (plain, by CLAP id) are applied,
+after the state. `mdaw_project_has`, `mdaw_clip_set_name`, `mdaw_device_reset_state` (back to
+the state captured when the device was made) and `mdaw_last_status` are new. The engine's
+tempo range (20–300 bpm) was narrower than the model's; the model now has the same limit.
+
+One VST3 and one LV2 instrument each were loaded and rendered through the bridge by hand
+(ChowKick and Vital as VST3; Dexed and String machine as LV2), not by the committed tests.
+
+**The built-in instrument.** On Tracktion the built-in instrument is a front for 4osc
+(`BuiltinKind::TwoOsc` in the model; users know it as "Pocket", like the old one): two
+oscillators (Sine, Square, Saw, Triangle, Noise; oscillator 2 also None) with tune, fine tune,
+level and pulse width; a sub oscillator, switched on or off, one or two octaves down, sine or
+square (4osc's oscillator 3); filter type (off, low-, high-, band-pass, notch), frequency,
+resonance, slope, key tracking, envelope amount and velocity, with its ADSR; the amp ADSR and
+velocity; voice mode (poly, mono, legato), glide and level. The table is
+`crates/mdaw-model/src/two_osc.rs`; values are 4osc's own units, so nothing is lost on the way.
+The mapping (`crates/mdaw-tracktion/src/two_osc.rs`) normalises them with 4osc's ranges and
+skews; wave shapes, filter type and slope and voice mode are properties of 4osc's state, not
+parameters, and are patched into it. Oscillator 4, unison, pan, the LFOs, modulation envelopes,
+modulation matrix and effects are not used (4osc's matrix starts empty and its effects off). A
+parameter change costs one `mdaw_device_set_param`, a change of a state setting a state read and
+write. Two free-running oscillators make the level of a note vary from play to play (accepted).
+The integration test checks every continuous value against the text 4osc shows for it.
+
+The old Rust engine's synth, also Pocket (`BuiltinKind::Pocket`), went with that engine on
+2026-11-15, and with it the table that played it through 4osc as an approximation
+(`POCKET_TO_FOUR_OSC`) and `mdaw-tracktion`'s dependency on `mdaw-dsp`. Projects that have it
+are not readable (protocol 11, store 7).
+
+The model's tempo limit is now 20–300 bpm, the range Tracktion plays.
+
+Open model question: after a parameter is put back to "default" in the model and the project
+is reloaded, the value in the plugin's stored state wins over the default.
+
+Built but not yet exercised by any test: plugin editor windows through the bridge; most of what
+needs an open audio device (device switching, xruns, loop, restart after a device-list change,
+the stalled-audio event; meters, live notes and playing are covered by the ignored test
+`crates/mdaw-tracktion/tests/live_device.rs`); parameter events from a plugin's own window; the
+resulting order after track and device moves; VST3 and LV2 through the bridge; calls from
+several threads at once. A hung plugin blocks every call: there is no timeout. (Since ABI 5
+plugin windows, scans from another thread and calls during a scan are tested; see the next
+sections. A plugin that hangs inside a call still blocks every call after it.)
+
+## ABI 4 and the client on Tracktion
+
+Added 2026-11-13 for the client (then behind its feature `tracktion`; since 2026-11-15 the
+client's only engine).
+
+- `mdaw_track_live_note(engine, track, pitch, velocity)`: a note on the track's devices at once
+  (velocity 0 ends it), for the computer keyboard, a MIDI input and auditioning. Tracktion's
+  `AudioTrack::injectLiveMidiMessage` must be called on the message thread (its listener list is
+  not thread-safe), so the call posts there and returns without waiting: a note is never held
+  up behind a call in progress on another thread, nor holds its caller. Measured with no device:
+  a call that waits for the message thread takes 3.4 µs at the median (8.6 µs p99) when nothing
+  else runs; the live-note call 0.8 µs. With the device (ALSA → PipeWire, 44.1 kHz, 512 frames),
+  from the call to sound in the master meter: 19–21 ms (the meter is read every 33 ms), plus the
+  device's output latency (reported 46 ms). Every audio track carries Tracktion's
+  `LiveMidiInjectingNode`, also without clips, so the note is heard on any track.
+- The bridge now keeps a playback context whenever a device runs (Tracktion makes one only on
+  play): without it, live notes went unheard and the meter stood while the transport was
+  stopped.
+- `mdaw_engine_state` gained `position_age_seconds` (the position is taken 30 times a second)
+  and `output_latency_seconds` (device latency plus one block), so the client can tell when a
+  position is heard, for recording.
+- **MIDI inputs (point 19).** Tracktion opens every MIDI input port (seen: "Midi Through", and a
+  Launchkey on this machine), but a port reaches a track only through an input destination
+  assigned to it (`InputDeviceInstance::setTarget`; `createLiveInputsNode` takes only inputs
+  whose targets contain the track), and the bridge assigns none. So notes from a MIDI device are
+  not played twice: the client reads the port itself (midir, `mdaw-client`'s `midi`) and plays the
+  notes with `mdaw_track_live_note`. Not done: closing Tracktion's ports. On Linux (ALSA
+  sequencer) several readers of one port are fine; on Windows a port opened by Tracktion would
+  be busy for the client.
+
+`mdaw_tracktion::sync_project(engine, before, after, blobs)` brings the engine from one state of
+the project to another by their difference, whatever caused it (own edit, server event, rebase,
+rollback, snapshot). It skips whatever the two states share (`imbl` maps and `Arc`s compared by
+pointer, `OrdMap::diff` skipping shared nodes), so one changed note costs one `mdaw_notes_put`
+call (checked by `Engine::call_count` in `tests/engine.rs`: 1 call, about 15 µs); tracks,
+clips, notes in batches, devices, tempo and master gain are covered, with moves of tracks and
+devices. The test syncs edit sequences step by step (additions, removals, moves, undo back to an
+earlier state, a jump back to the start and forward again) and compares each end with a fresh
+`load_project` of the same state: same sound windows and the same level within 2 % (with
+Pocket's oscillator mix at 0, 4osc's level repeats to 0.1 %; with two oscillators it varies
+by up to 3 dB from render to render).
+
+In the client (`crates/mdaw-client/src/audio_tracktion.rs`) every engine call that changes
+something or may take long runs on a worker thread; the UI thread only reads the engine's state
+and events. The view is synced at most once per frame (requests coalesce). Since ABI 5 the
+worker takes its jobs from a scheduler and plugins are scanned on a thread of their own (next
+section).
+
+## ABI 5: plugin windows, scanning and the worker
+
+Added 2026-11-15, after plugin windows opened late and engine work piled up behind polling.
+
+**What was wrong (measured on 340b477, `test/editor_bench.c` and
+`crates/mdaw-client/tests/editor_latency.rs`).**
+
+- A scan held the engine's message thread for its whole length: `runChild` waited for each
+  scanner child (up to 30 s per file) inside a message-thread call. Every other call waited — a
+  call issued 300 ms into a scan with one hanging file (limit 4 s) returned after 3.7 s — and so
+  did everything the message loop drives: the bridge's 30 Hz timer (position age 4.0 s), JUCE's
+  60 Hz LV2 UI idle timer, CLAP timers and file descriptors, VST3 run loops.
+- In the client the scan was the first job on the worker: the first sync, and any window
+  request, waited for the whole scan (5.6 s with a 5 s hang limit), and the catalog stayed empty
+  until it ended although the engine knew the plugins from earlier runs.
+- The worker's queue was an unbounded channel. A look at the settings of each plugin with an open
+  window every 500 ms, and a parameter read every 150 ms per shown device, were queued whether or
+  not the last one had run. With a plugin that saves its state in 800 ms, 8 s of frames left
+  17.6 s of work queued.
+- Each state read made the plugin save twice or more: Tracktion's
+  `flushPluginStateToValueTree` already calls `getStateInformation`, the bridge called it again,
+  and a state over 1 KB was read again for the Rust wrapper's second, larger buffer.
+- Windows: the client marked a window open before the engine had made it (a failed open stayed
+  "open"); a window the user had just closed and that was opened again before the bridge's timer
+  ran was then deleted by the timer; removing a device or clearing the project closed its window
+  without telling the client; a CLAP plugin whose `gui.create` failed got an empty black window;
+  showing a window for a device that does not exist returned OK.
+
+Opening a plugin's window itself was never the problem: 5–75 ms for the plugins measured
+(ChowKick VST3/LV2/CLAP 70 ms, vitOTT 62 ms, Fasttracker II 20–45 ms, Dexed LV2 4 ms), 10–20 ms
+to show one again. That is plugin and window-system work on the message thread, and stays there:
+JUCE 8.0.6's VST3 and LV2 formats require the message thread for instance and editor creation
+(`requiresUnblockedMessageThreadDuringCreation` returns false; the VST3 code asserts it).
+
+**The scan.** `mdaw_plugins_scan` still returns when the scan is done, but the message thread
+only does short steps: list the candidates; decide, 16 candidates per call, which need
+examining (LV2 stamps come from lilv and stay on the message thread); for each candidate run the
+scanner child and parse its result on the *calling* thread; merge each result into the
+known-plugin list, the id cache and the scan records in one short message-thread call; save.
+`KnownPluginList`, `PluginIds`, `ScanRecords` and the project are only ever touched on the message
+thread. One scan at a time per engine. Plugins known from earlier scans stay loadable throughout.
+The in-process scan (no scanner configured) is still done entirely on the message thread.
+`mdaw_plugins_scan_cancel` (any thread, sticky for the engine's life, meant for shutdown) kills
+the running child's process group and makes the scan return `MDAW_ERR_CANCELLED`; a cancelled
+file is not recorded. Measured with one hanging file (limit 4 s): calls during the scan return in
+under 1 ms, opening a window during it takes 0.7 ms, the position age stays at 33 ms.
+
+**The client's scan thread.** `TracktionAudio::new` starts a thread `mdaw-plugin-scan`. It first
+publishes the catalog the engine knows from earlier runs, then scans format by format and
+publishes after each; each time the worker gets a coalesced "catalog changed" job that retries
+devices missing from the engine. Dropping `TracktionAudio` cancels the scan and joins the thread
+(1 s while a hanging file is being examined).
+
+**The worker's scheduler** (`crates/mdaw-client/src/engine_queue.rs`, engine-free and
+unit-tested). Producers (UI thread, network thread, scan thread) take a mutex briefly and never
+wait for the worker.
+
+- Classes: *interactive* (window open/close, parameter sets, transport, output gain), *normal*
+  (sync, capture, downloaded state, retry, render, flush, catalog changed) and *background*
+  (one look or parameter read per device).
+- Ordered jobs name what they touch: everything (sync, downloaded state, render, flush, catalog),
+  one device (window, parameter set, capture, retry) or the transport. The next job is the
+  earliest interactive one that touches nothing an earlier waiting job touches — so a window
+  never opens before the sync that made its device, and a set never overtakes a capture of its
+  device — unless the oldest normal job has waited 1 s (then plain order). Otherwise the oldest
+  ordered job. Background jobs run only when no ordered job waits.
+- Coalescing: a parameter set replaces a waiting set of the same parameter (if nothing touching
+  its device was queued after it); a window request replaces the device's waiting one; output
+  gain likewise; a capture, retry or catalog job is dropped if the same one waits; one sync waits
+  at most. Background: one waiting job per (kind, device), plus one follow-up while that one
+  runs; closing a window drops the device's waiting look.
+- A flush first runs the waiting background jobs, then answers.
+- Nothing is preempted: a job that has started (a plugin loading, a slow state save) runs to its
+  end, and whatever comes next waits for it. The scheduler only decides what starts next.
+- A parameter read keeps the shown value of a parameter whose last set had not been carried out
+  when the read began (the worker records the last set it carried out per parameter).
+
+Measured: 8 s of frames with an 800 ms state save leave 313 ms of work (17.6 s before); a sync
+during a scan with a hanging file is done in 0.6 s, the plugin load itself (5.6 s before).
+
+**Window lifecycle.** `mdaw_device_show_editor(engine, device, show, token)`: the client hands a
+token with each open; the window keeps the token of the last open; `MDAW_EVENT_EDITOR_CLOSED`
+carries it. The event is sent when the user or the window manager closed the window, and when
+the bridge deleted it for another reason than a close request (device or track removed, project
+cleared). Opening a window that exists, also one the user has just closed, shows it again and
+brings it to the front; never two windows for one device. A failed open (no device, no editor,
+the plugin made none) leaves no window. In the client a device's window is *Closed*, *Opening*,
+*Open* or *Closing*; it is Open only once the worker has carried out the open without error.
+Answers and events whose token is not the device's current one are ignored, so an old answer or
+the close of an earlier window cannot close a newer one. The answers are taken before the
+events are read in a frame, because a close event about a window can only have been queued after
+the answer about that window. The device tab shows "Opening…" and "Closing…".
+
+**Timing.** With `MDAW_TRACE=1` the bridge writes `mdaw-trace … engine …` lines next to the
+client's: every labelled call with its wait for the message thread and its run time, the steps of
+opening a window (`hasEditor`, `createEditorIfNeeded`, window and `setVisible`, and the "first
+loop turn after show" — the next free turn of the message loop, the closest JUCE lets us come to
+the first paint of a native plugin window), device creation, state reads, each scanned file and
+each format's totals with the time spent on the message thread. The client traces each job's
+wait and run time with the queue depths, the scan flag and the number of open windows (jobs over
+50 ms, all window jobs, and every job over 250 ms as "slow"), and a window's way from the click
+to the worker, the bridge and the frame that shows it open. Without tracing, every message-thread
+call that waited or ran 100 ms or more is written to `engine.log` in the settings folder.
+
+**Tests.** `test/bridge_test.c`: calls, adding a device and the 30 Hz timer during a scan with a
+hanging file; cancel; one plugin save per state read; and, on a virtual display
+(`test/run_gui_tests.sh`, which runs Xvfb with the X atoms JUCE expects), the window lifecycle:
+open twice, close twice, a failing and a slow plugin window, the user's close, 20 closes each
+followed at once by an open, two windows, a device removed and the project cleared with a window
+open. `crates/mdaw-tracktion/tests/scan_concurrency.rs`: the same from Rust.
+`crates/mdaw-client`: the scheduler's unit tests; `tests/engine_scheduling.rs` (catalog from the
+cache before the scan ends, sync and `wait_idle` during a scan, bounded polling with a slow
+plugin, repeated parameter reads, a window that cannot open, drop during a scan);
+`tests/editor_gui.rs` (ignored; run with `native/tracktion-bridge/test/run_gui_tests.sh cargo test -p
+mdaw-client --test editor_gui -- --ignored`, which sets `MDAW_TEST_GUI=1`). Benchmarks:
+`native/tracktion-bridge/test/run_editor_bench.sh` and `tests/editor_latency.rs` (ignored). The
+fixture `test-gui.clap` (`test/bad_clap.c`) has a window and a state, with settings for a slow
+save, a slow window and a window that fails.
+
+**Still open.**
+
+- A plugin call that hangs or is slow holds the message thread and the worker; nothing can
+  interrupt it. A slow `getStateInformation` delays the next job by its length (once per look,
+  no longer piling up).
+- A state read right after a parameter set gave the old value, and the old value then won
+  (point 8). Fixed in the bridge and the CLAP format; the client's render before a look is gone.
+  Left (from the code, not tried): a bypassed LV2 plugin without an `lv2:enabled` port is not
+  run by JUCE's bypassed block, so its state lags until it is processed; a read while the audio callback is
+  stuck may miss the last sets. Dexed (LV2) puts its parameters back to its program's values
+  when it is prepared for the first time, which the bridge now does for a plugin never prepared
+  before (a render did the same).
+- Two scans on one engine queue on a mutex; written, not exercised.
+- The real first paint of a plugin's window, and behaviour under a real window manager, are
+  checked by hand (`docs/manual-tests/plugin-windows.md`), not by the tests (Xvfb has no window
+  manager).
+- Windows: the scanner child's cancel waits in 20 ms slices; written, never compiled or tested
+  (the bridge builds on Linux only).
+- Destroying the engine takes about 1 s (the teardown gaps of point 7).
+
+## Not tested yet
+
+- Sample-rate and buffer-size changes on the ALSA backend while running; several output
+  devices; selecting a device other than the default.
+- MIDI input from a hardware device (discovery is tested; receiving notes is not).
+- Recording.
+- Plugin editors: mouse gestures, resizing; first paint; behaviour under a real window manager
+  (hand test only).
+- Out-of-process scanning for the CLAP format (in-process scan only).
+- Plugins with side-chain or multiple output buses in use (extra buses are disabled).
+- Windows and macOS.
+- The build and the tests on Ubuntu with its GCC (13 on 24.04) and in GitHub Actions: the
+  workflows are written (2026-11-15) and each CI command was run on this machine, but CI has not
+  run them yet.

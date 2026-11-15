@@ -13,7 +13,6 @@ workspace = true
 [dependencies]
 mdaw-model.workspace = true
 mdaw-proto.workspace = true
-imbl.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

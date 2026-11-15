@@ -1,16 +1,17 @@
 use crate::doc::*;
 use crate::ids::*;
 use crate::time::{MAX_MILLI_BPM, MAX_TICK, MIN_MILLI_BPM, TempoPoint, Tick};
+use crate::two_osc;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// One property-level edit addressed to stable IDs.
 ///
 /// Ops never fail: an op whose target is missing, or an add whose ID already exists, does nothing
-/// on every replica. Locks and permissions are checked by the server before it sequences an op.
+/// on every replica. The server checks ranges, limits and blobs before it sequences an op.
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub enum Op {
-    // Project scope: always live.
+    // Project.
     ProjectSetName {
         name: String,
     },
@@ -40,13 +41,11 @@ pub enum Op {
         id: TrackId,
         prop: ShellProp,
     },
-
-    // Track structure: needs the track live or checked out by the sender.
     TrackRemove {
         id: TrackId,
     },
 
-    // Track content: locked by a checkout.
+    // Track content.
     TrackSetMix {
         track: TrackId,
         prop: MixProp,
@@ -144,14 +143,6 @@ pub enum NoteProp {
     Vel(u8),
 }
 
-/// What the server has to check before sequencing an op.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Scope {
-    Project,
-    TrackStructure(TrackId),
-    TrackContent(TrackId),
-}
-
 /// Addresses one entity. Also used for presence ("X is editing this clip").
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 pub enum EntityRef {
@@ -214,32 +205,6 @@ pub enum PropKey {
 }
 
 impl Op {
-    pub fn scope(&self) -> Scope {
-        match self {
-            Op::ProjectSetName { .. }
-            | Op::MasterSetGain { .. }
-            | Op::TempoPut { .. }
-            | Op::TempoRemove { .. }
-            | Op::TrackAdd { .. }
-            | Op::TrackMove { .. }
-            | Op::TrackSetShell { .. } => Scope::Project,
-            Op::TrackRemove { id } => Scope::TrackStructure(*id),
-            Op::TrackSetMix { track, .. }
-            | Op::ClipAdd { track, .. }
-            | Op::ClipRemove { track, .. }
-            | Op::ClipSet { track, .. }
-            | Op::NoteAdd { track, .. }
-            | Op::NoteRemove { track, .. }
-            | Op::NoteSet { track, .. }
-            | Op::DeviceAdd { track, .. }
-            | Op::DeviceRemove { track, .. }
-            | Op::DeviceMove { track, .. }
-            | Op::DeviceSetParam { track, .. }
-            | Op::DeviceSetBypass { track, .. }
-            | Op::DeviceSetState { track, .. } => Scope::TrackContent(*track),
-        }
-    }
-
     /// The entity this op writes to.
     pub fn entity(&self) -> EntityRef {
         match self {
@@ -319,15 +284,6 @@ impl Op {
         )
     }
 
-    /// True when the op would put a plugin on a track. Only commits may do that.
-    pub fn adds_plugin(&self) -> bool {
-        match self {
-            Op::DeviceAdd { device, .. } => matches!(device.kind, DeviceKind::Plugin { .. }),
-            Op::TrackAdd { content, .. } => content.has_plugin(),
-            _ => false,
-        }
-    }
-
     /// Blobs the op refers to. The server requires them to be stored before it accepts the op.
     pub fn blobs(&self) -> Vec<BlobHash> {
         fn of_device(device: &Device) -> Option<BlobHash> {
@@ -346,9 +302,28 @@ impl Op {
 
     /// Whether applying this op to `project` keeps it within the size limits. [`Op::validate`]
     /// checks what an op carries; this checks what it adds to what is there, so that many small
-    /// ops cannot grow a clip or a track without end.
+    /// ops cannot grow a clip or a track without end. It also checks a parameter value set on a
+    /// built-in device whose parameters have ranges (`BuiltinKind::TwoOsc`, see
+    /// [`crate::two_osc`]): the op does not say what kind of device it addresses.
     pub fn fits(&self, project: &Project) -> Result<(), Invalid> {
         let content = |track: &TrackId| project.track(*track).map(|t| &t.content);
+        if let Op::DeviceSetParam {
+            track,
+            id,
+            param,
+            value: Some(value),
+        } = self
+            && let Some(device) = content(track).and_then(|c| c.device(*id))
+            && matches!(
+                device.kind,
+                DeviceKind::Builtin {
+                    kind: BuiltinKind::TwoOsc,
+                    ..
+                }
+            )
+        {
+            two_osc::check(*param, *value)?;
+        }
         let full = match self {
             Op::TrackAdd { id, .. } => !project.tracks.contains_key(id) && project.tracks.len() >= MAX_TRACKS,
             Op::TempoPut { id, .. } => {
@@ -544,19 +519,33 @@ fn check_clip(clip: &Clip) -> Result<(), Invalid> {
 }
 
 fn check_device(device: &Device) -> Result<(), Invalid> {
-    if let DeviceKind::Plugin { id: plugin_id, .. } = &device.kind
-        && (plugin_id.is_empty() || plugin_id.len() > MAX_PLUGIN_ID_BYTES)
+    if let DeviceKind::Plugin {
+        id: plugin_id, name, ..
+    } = &device.kind
     {
-        return Err(Invalid("bad plugin id"));
+        if plugin_id.is_empty() || plugin_id.len() > MAX_PLUGIN_ID_BYTES {
+            return Err(Invalid("bad plugin id"));
+        }
+        if name.len() > MAX_NAME_BYTES {
+            return Err(Invalid("plugin name too long"));
+        }
     }
     if device.params.len() > MAX_PARAMS_PER_DEVICE {
         return Err(Invalid("too many parameters"));
     }
-    if device.params.values().all(|v| v.is_finite()) {
-        Ok(())
-    } else {
-        Err(Invalid("parameter value is not finite"))
+    if !device.params.values().all(|v| v.is_finite()) {
+        return Err(Invalid("parameter value is not finite"));
     }
+    if let DeviceKind::Builtin {
+        kind: BuiltinKind::TwoOsc,
+        ..
+    } = &device.kind
+    {
+        for (param, value) in &device.params {
+            two_osc::check(*param, *value)?;
+        }
+    }
+    Ok(())
 }
 
 fn check_content(content: &TrackContent) -> Result<(), Invalid> {

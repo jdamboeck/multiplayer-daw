@@ -51,50 +51,14 @@ impl Project {
             .max()
             .unwrap_or_default()
     }
-
-    /// Marks a track as checked out. Driven by `Checkout` events, not by ops.
-    pub fn set_checkout(&mut self, track: TrackId, checkout: Option<Checkout>) -> bool {
-        match self.tracks.get_mut(&track) {
-            Some(t) if t.checkout != checkout => {
-                Arc::make_mut(t).checkout = checkout;
-                true
-            }
-            _ => false,
-        }
-    }
-
-    /// Replaces a track's contents wholesale. Used for the private view of a checkout, never on
-    /// the shared document.
-    pub fn set_content(&mut self, track: TrackId, content: Arc<TrackContent>) -> bool {
-        match self.tracks.get_mut(&track) {
-            Some(t) if !Arc::ptr_eq(&t.content, &content) => {
-                Arc::make_mut(t).content = content;
-                true
-            }
-            _ => false,
-        }
-    }
-
-    /// Replaces a track's stem. Driven by `Commit` events.
-    pub fn set_stem(&mut self, track: TrackId, stem: Option<Stem>) -> bool {
-        match self.tracks.get_mut(&track) {
-            Some(t) if t.stem != stem => {
-                Arc::make_mut(t).stem = stem;
-                true
-            }
-            _ => false,
-        }
-    }
 }
 
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct Track {
-    /// Project-level, always live.
+    /// Name and colour.
     pub shell: TrackShell,
-    /// Locked while the track is checked out.
+    /// Mix, clips and devices.
     pub content: Arc<TrackContent>,
-    pub checkout: Option<Checkout>,
-    pub stem: Option<Stem>,
 }
 
 impl Track {
@@ -102,8 +66,6 @@ impl Track {
         Self {
             shell,
             content: Arc::new(content),
-            checkout: None,
-            stem: None,
         }
     }
 }
@@ -113,24 +75,6 @@ pub struct TrackShell {
     pub name: String,
     /// 0xRRGGBB.
     pub color: u32,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
-pub struct Checkout {
-    pub user: UserId,
-    /// Server sequence number of the `Checkout` event.
-    pub base_seq: u64,
-}
-
-/// Rendered audio of a committed track, for clients that cannot render it themselves.
-#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
-pub struct Stem {
-    pub blob: BlobHash,
-    /// `TempoMap::hash` at render time; a mismatch marks the stem stale.
-    pub tempo_hash: u64,
-    pub len_samples: u64,
-    /// Multiply decoded samples by this to undo the peak scaling applied before encoding.
-    pub gain: f32,
 }
 
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
@@ -157,14 +101,6 @@ impl Default for TrackContent {
 impl TrackContent {
     pub fn device(&self, id: DeviceId) -> Option<&Device> {
         self.devices.iter().find(|d| d.id == id)
-    }
-
-    /// Whether a device of the track is a plugin: then only a checkout edits it, and its
-    /// commits carry a stem.
-    pub fn has_plugin(&self) -> bool {
-        self.devices
-            .iter()
-            .any(|d| matches!(d.kind, DeviceKind::Plugin { .. }))
     }
 
     /// From the start of the first clip to the end of the last.
@@ -221,33 +157,52 @@ impl Device {
 pub enum DeviceKind {
     /// Deterministic built-in: only params are synced and every client renders it.
     Builtin { kind: BuiltinKind, dsp_version: u16 },
-    /// A plugin installed on the client's machine: its state is an opaque blob, and others who
-    /// lack the plugin hear the track through its stem.
+    /// A plugin installed on the client's machine: its state is an opaque blob. A client that
+    /// lacks the plugin gets no sound from the device.
     Plugin {
         format: PluginFormat,
         /// The plugin's own identifier within its format, compared as an opaque string.
         id: String,
+        /// The plugin's name as the client that put it on the track saw it, so that every
+        /// client shows the same name, those without the plugin too. Never used to find it.
+        name: String,
         state: Option<BlobHash>,
     },
 }
 
-/// The plugin standards a device can come from. Only CLAP is hosted so far; another format
-/// is a new variant here and a new backend in `mdaw-plugin`, and nothing else in the document
-/// changes.
+/// The plugin standards a device can come from. The device's `id` is the plugin's own id in its
+/// format, the same on every machine: for CLAP the plugin id, for VST3 the class id as 32 hex
+/// digits, for LV2 the plugin URI. A client that cannot host a format treats its devices as not
+/// installed. New variants go at the end: the wire and store formats number them.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 pub enum PluginFormat {
     Clap,
+    Vst3,
+    Lv2,
 }
 
 impl PluginFormat {
+    pub const ALL: [PluginFormat; 3] = [PluginFormat::Clap, PluginFormat::Vst3, PluginFormat::Lv2];
+
+    /// The format's usual name, which is also how the audio engine names it.
     pub fn name(self) -> &'static str {
         match self {
             PluginFormat::Clap => "CLAP",
+            PluginFormat::Vst3 => "VST3",
+            PluginFormat::Lv2 => "LV2",
         }
+    }
+
+    /// The format with this [`name`](Self::name).
+    pub fn from_name(name: &str) -> Option<PluginFormat> {
+        Self::ALL.into_iter().find(|f| f.name() == name)
     }
 }
 
+/// The built-in devices. New variants go at the end: the wire and store formats number them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum BuiltinKind {
-    Pocket,
+    /// The built-in instrument, a front for Tracktion's 4OSC: two oscillators and a sub
+    /// oscillator. Users know it as "Pocket". Parameters in [`crate::two_osc`].
+    TwoOsc,
 }

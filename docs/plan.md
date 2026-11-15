@@ -1,5 +1,12 @@
 # Multiplayer DAW: Prototype Implementation Plan
 
+Status: history. This is the plan for the prototype (M0–M6), carried out up to M6. Since then
+(branch `tracktion-integration`) the shared transport and clock, live MIDI over the network,
+checkout and commit with changelog samples, and stems were removed (2026-11-13), and so was the
+Rust audio engine — `mdaw-dsp`, `mdaw-engine`, `mdaw-plugin`, cpal, the old Pocket synth — on
+2026-11-15: the client plays through Tracktion Engine, hosts VST3, LV2 and CLAP, and builds on
+Linux only. Where things stand: `docs/architecture.md`; what went: `docs/migration-checklist.md`.
+
 ## Context
 
 The pre-plan (`13ae8541-pre-plan.md`) fixes the product model: a server/client DAW for collaborative editing, with per-track live and async (checkout/commit) modes, a changelog with listening samples, live MIDI, and deterministic built-ins next to local CLAP plugins. It leaves the sync protocol, op format and UI technology open.
@@ -208,7 +215,7 @@ Each milestone ends with a demo and its tests green on Linux; CI also builds and
 - Stem bounce on commit (full track, pre-fader, 24-bit FLAC, peak-scaled to -1 dBFS at most with the factor stored as `stem.gain`, rendered in a fresh offline instance), download and cached decode on other clients, resampling (linear for now) when device rates differ, stale badge when `tempo_hash` differs.
 - Clients that have the same plugin render it live from the state blob; others play the stem.
 - `mdaw-test-plugin` drives headless host tests in CI.
-- **Demo:** A adds Vital to a track through checkout and commits. B, started with plugins disabled (`--no-plugins`, also `--no-clap`), hears the stem; started normally, B renders Vital itself.
+- **Demo:** A adds Vital to a track through checkout and commits. B, started with plugins disabled (`--no-plugins`), hears the stem; started normally, B renders Vital itself.
 
 ## Verification
 

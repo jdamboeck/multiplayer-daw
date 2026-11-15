@@ -62,28 +62,39 @@ fn clip() -> impl Strategy<Value = Clip> {
         })
 }
 
+/// The parameters the generated ops use: ids and whole values the built-in instrument takes
+/// (`two_osc::check`), so that a device carrying them is valid whatever its kind.
+fn param() -> impl Strategy<Value = (u32, f64)> {
+    use two_osc::id;
+    (
+        prop::sample::select(&[id::OSC1_TUNE, id::OSC1_FINE, id::OSC2_TUNE, id::OSC2_FINE][..]),
+        (-2i32..=2).prop_map(f64::from),
+    )
+}
+
 fn device() -> impl Strategy<Value = Device> {
     let kind = prop_oneof![
         Just(DeviceKind::Builtin {
-            kind: BuiltinKind::Pocket,
-            dsp_version: 1
+            kind: BuiltinKind::TwoOsc,
+            dsp_version: mdaw_model::two_osc::DSP_VERSION
         }),
         prop::option::of(any::<[u8; 32]>().prop_map(BlobHash)).prop_map(|state| DeviceKind::Plugin {
             format: PluginFormat::Clap,
             id: "test.plugin".into(),
+            name: "Synth".into(),
             state
         }),
     ];
     (
         device_id(),
         kind,
-        prop::collection::vec((0u32..4, -2i32..=2), 0..3),
+        prop::collection::vec(param(), 0..3),
         any::<bool>(),
     )
         .prop_map(|(id, kind, params, bypass)| Device {
             id,
             kind,
-            params: params.into_iter().map(|(k, v)| (k, v as f64 * 0.5)).collect(),
+            params: params.into_iter().collect(),
             bypass,
         })
 }
@@ -114,7 +125,7 @@ fn content() -> impl Strategy<Value = TrackContent> {
 
 fn op() -> impl Strategy<Value = Op> {
     let shell = (name(), 0u32..4).prop_map(|(name, color)| TrackShell { name, color });
-    let tempo_point = (tick(), 20u32..=400).prop_map(|(tick, bpm)| TempoPoint {
+    let tempo_point = (tick(), 20u32..=300).prop_map(|(tick, bpm)| TempoPoint {
         tick,
         milli_bpm: bpm * 1000,
     });
@@ -158,8 +169,8 @@ fn op() -> impl Strategy<Value = Op> {
         3 => (track_id(), device_id()).prop_map(|(track, id)| Op::DeviceRemove { track, id }),
         8 => (track_id(), device_id(), prop::option::of(device_id()))
             .prop_map(|(track, id, after)| Op::DeviceMove { track, id, after }),
-        6 => (track_id(), device_id(), 0u32..4, prop::option::of(-2i32..=2)).prop_map(
-            |(track, id, param, v)| Op::DeviceSetParam { track, id, param, value: v.map(|v| v as f64 * 0.5) }
+        6 => (track_id(), device_id(), param(), any::<bool>()).prop_map(
+            |(track, id, (param, v), set)| Op::DeviceSetParam { track, id, param, value: set.then_some(v) }
         ),
         4 => (track_id(), device_id(), any::<bool>())
             .prop_map(|(track, id, bypass)| Op::DeviceSetBypass { track, id, bypass }),
@@ -255,35 +266,7 @@ proptest! {
     #[test]
     fn generated_ops_are_valid(op in op()) {
         prop_assert_eq!(op.validate(), Ok(()));
-        let entity = op.entity();
-        match op.scope() {
-            Scope::Project => {}
-            Scope::TrackStructure(t) | Scope::TrackContent(t) => prop_assert_eq!(entity.track(), Some(t)),
-        }
-        let _ = (op.prop(), op.is_removal(), op.adds_plugin(), op.blobs());
-    }
-
-    /// The diff reports exactly the tracks whose content changed.
-    #[test]
-    fn affected_ranges_match_changed_tracks(setup in ops(30), txn in ops(10)) {
-        let before = build(&setup);
-        let mut after = before.clone();
-        apply_all(&mut after, &txn);
-        let affected = affected_ranges(&before, &txn);
-
-        let mut seen = std::collections::BTreeSet::new();
-        for a in &affected {
-            prop_assert!(seen.insert(a.track), "track listed twice");
-            if let Some(r) = a.range { prop_assert!(!r.is_empty()); }
-        }
-        let ids: std::collections::BTreeSet<TrackId> =
-            before.tracks.keys().chain(after.tracks.keys()).copied().collect();
-        for id in ids {
-            let content = |p: &Project| p.track(id).map(|t| t.content.clone());
-            if content(&before) != content(&after) {
-                prop_assert!(seen.contains(&id), "{:?} changed but was not reported", id);
-            }
-        }
+        let _ = (op.entity(), op.prop(), op.is_removal(), op.blobs());
     }
 }
 
@@ -420,30 +403,6 @@ fn removing_a_clip_and_undoing_brings_back_its_notes() {
     assert!(p.track(track).unwrap().content.clips.is_empty());
     apply_all(&mut p, &undo);
     assert_eq!(p, with_note);
-
-    // The diff of adding that note is the note's absolute span.
-    let before = build(&setup[..2]);
-    let affected = affected_ranges(&before, &setup[2..]);
-    let start = Tick::bars(2) + Tick::beats(1);
-    assert_eq!(
-        affected,
-        [Affected {
-            track,
-            range: Some(TickRange::new(start, start + Tick::beats(1)))
-        }]
-    );
-    // ... and the sample covers the bar around it.
-    let listen = listening_range(&p.track(track).unwrap().content, affected[0].range).unwrap();
-    assert_eq!(listen, TickRange::new(Tick::bars(2), Tick::bars(3)));
-    // A mix change has no range; the sample starts at the first bar with notes.
-    let mix = [Op::TrackSetMix {
-        track,
-        prop: MixProp::Gain(0.5),
-    }];
-    let affected = affected_ranges(&p, &mix);
-    assert_eq!(affected, [Affected { track, range: None }]);
-    let listen = listening_range(&p.track(track).unwrap().content, None).unwrap();
-    assert_eq!(listen, TickRange::new(Tick::bars(2), Tick::bars(6)));
 }
 
 #[test]

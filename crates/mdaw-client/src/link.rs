@@ -4,11 +4,9 @@
 //! queues what it wants sent. When the connection breaks, the thread reconnects with growing
 //! pauses and asks the server to resume where it left off.
 
-use crate::live::{self, Live};
-use mdaw_engine::clock;
 use mdaw_model::BlobHash;
-use mdaw_net::{ClockEstimate, ClockSync, JoinInfo};
-use mdaw_proto::{ClientMsg, Datagram, Hello, PROTO_VERSION, RefuseReason, Resume, ServerMsg, Welcome};
+use mdaw_net::JoinInfo;
+use mdaw_proto::{ClientMsg, Hello, PROTO_VERSION, RefuseReason, Resume, ServerMsg, Welcome};
 use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
 use std::thread::JoinHandle;
@@ -18,11 +16,6 @@ use tokio::sync::{mpsc, watch};
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const RETRY_MIN: Duration = Duration::from_millis(250);
 const RETRY_MAX: Duration = Duration::from_secs(4);
-/// A new connection measures the server's clock with a quick burst of pings, then keeps the
-/// estimate fresh at a slower pace.
-const PING_BURST: u32 = 5;
-const PING_BURST_EVERY: Duration = Duration::from_millis(20);
-const PING_EVERY: Duration = Duration::from_secs(1);
 /// How long leaving waits for the goodbye to reach the wire.
 const CLOSE_TIMEOUT: Duration = Duration::from_millis(150);
 
@@ -42,31 +35,49 @@ pub enum LinkEvent {
     Welcome { epoch: u64, welcome: Box<Welcome> },
     /// From the connection of the last `Welcome`, in the order the server sent them.
     Msg(ServerMsg),
-    /// A better estimate of the server's clock on the connection of the last `Welcome`,
-    /// against [`mdaw_engine::clock::now_micros`]. The first follows the welcome within
-    /// moments.
-    Clock(ClockEstimate),
     /// The connection broke, or could not be made. Another attempt follows.
     Down(String),
     /// The server turned this client away. No further attempt follows.
     Refused(RefuseReason),
-    /// The answer to [`Link::put`]: whether the server holds the blob now.
-    Stored { hash: BlobHash, ok: bool },
-    /// The answer to [`Link::get`]: the blob, or `None` if the server lacks it or the
-    /// download failed.
-    Fetched {
-        hash: BlobHash,
-        bytes: Option<Arc<[u8]>>,
-    },
+    /// The answer to [`Link::put`].
+    Stored { hash: BlobHash, outcome: Upload },
     /// A message too large for the server to accept; it was not sent.
     TooLarge(ClientMsg),
 }
+
+/// How an upload ended.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Upload {
+    /// The server holds the blob now.
+    Stored,
+    /// The server turned it down (too large, or the bytes are not what the hash says). Trying
+    /// again would not change that.
+    Refused,
+    /// The connection failed on the way. It goes again with the next one.
+    Failed,
+}
+
+/// What to do with a blob a [`Fetcher`] downloaded, or `None` if it could not be had. Called on
+/// the network thread.
+pub type Fetched = Box<dyn FnOnce(Option<Arc<[u8]>>) + Send>;
 
 enum Out {
     Msg(u64, ClientMsg),
     Rejoin,
     Put(BlobHash, Arc<[u8]>),
-    Get(BlobHash),
+    GetThen(BlobHash, Fetched),
+}
+
+/// Downloads blobs for another thread, which gets them without going through [`Link::poll`]
+/// (and so without waiting for the thread that polls). A download asked for while there is no
+/// connection waits for the next one.
+#[derive(Clone)]
+pub struct Fetcher(mpsc::UnboundedSender<Out>);
+
+impl Fetcher {
+    pub fn fetch(&self, hash: BlobHash, then: Fetched) {
+        let _ = self.0.send(Out::GetThen(hash, then));
+    }
 }
 
 pub struct Link {
@@ -78,8 +89,7 @@ pub struct Link {
 
 impl Link {
     /// Starts connecting. The outcome arrives through [`Link::poll`].
-    /// Live notes go out and come in through `live`.
-    pub fn connect(join: JoinInfo, who: Who, waker: Waker, live: Live) -> std::io::Result<Self> {
+    pub fn connect(join: JoinInfo, who: Who, waker: Waker) -> std::io::Result<Self> {
         let (events_tx, events) = std_mpsc::channel();
         let (out, out_rx) = mpsc::unbounded_channel();
         let (stop, stop_rx) = watch::channel(false);
@@ -95,7 +105,6 @@ impl Link {
             stop: stop_rx,
             resume: None,
             epoch: 0,
-            live,
         };
         let thread = std::thread::Builder::new()
             .name("mdaw-link".into())
@@ -130,9 +139,9 @@ impl Link {
         let _ = self.out.send(Out::Put(hash, bytes));
     }
 
-    /// Downloads a blob. The outcome arrives as [`LinkEvent::Fetched`].
-    pub fn get(&self, hash: BlobHash) {
-        let _ = self.out.send(Out::Get(hash));
+    /// A handle to download blobs from another thread.
+    pub fn fetcher(&self) -> Fetcher {
+        Fetcher(self.out.clone())
     }
 
     /// Drops the connection and joins again from scratch, to receive the whole document.
@@ -161,7 +170,6 @@ struct Task {
     resume: Option<Resume>,
     /// Counts the connections that got as far as a welcome.
     epoch: u64,
-    live: Live,
 }
 
 /// How one connection ended.
@@ -224,7 +232,6 @@ impl Task {
             _ = stopped(&mut self.stop) => return End::Stop,
         };
         let end = self.talk(&connection).await;
-        self.live.set_connection(None);
         let _ = tokio::time::timeout(CLOSE_TIMEOUT, mdaw_net::close(&endpoint, &connection)).await;
         end
     }
@@ -270,14 +277,12 @@ impl Task {
             return End::Stop;
         }
 
-        self.live.set_connection(Some(connection.clone()));
         let Task {
             events,
             waker,
             out,
             stop,
             resume,
-            live,
             ..
         } = self;
         let (events, waker) = (&*events, &*waker);
@@ -323,18 +328,20 @@ impl Task {
                     Some(Out::Put(hash, bytes)) => {
                         let (connection, events, waker) = (connection.clone(), events.clone(), waker.clone());
                         tokio::spawn(async move {
-                            let ok = matches!(mdaw_net::put_blob(&connection, hash, &bytes).await, Ok(true));
-                            let _ = events.send(LinkEvent::Stored { hash, ok });
+                            let outcome = match mdaw_net::put_blob(&connection, hash, &bytes).await {
+                                Ok(true) => Upload::Stored,
+                                Ok(false) => Upload::Refused,
+                                Err(_) => Upload::Failed,
+                            };
+                            let _ = events.send(LinkEvent::Stored { hash, outcome });
                             waker();
                         });
                     }
-                    Some(Out::Get(hash)) => {
-                        let (connection, events, waker) = (connection.clone(), events.clone(), waker.clone());
+                    Some(Out::GetThen(hash, then)) => {
+                        let connection = connection.clone();
                         tokio::spawn(async move {
                             let bytes = mdaw_net::get_blob(&connection, hash).await.ok().flatten();
-                            let bytes = bytes.map(Arc::from);
-                            let _ = events.send(LinkEvent::Fetched { hash, bytes });
-                            waker();
+                            then(bytes.map(Arc::from));
                         });
                     }
                     Some(Out::Rejoin) => return End::Rejoin,
@@ -342,54 +349,10 @@ impl Task {
                 }
             }
         };
-        // Datagrams get lost, so the two halves of the clock exchange do not wait for each
-        // other. Neither ever ends: a dead connection is the reading loop's to report.
-        let pinging = async {
-            let mut sent = 0;
-            loop {
-                let t0 = clock::now_micros();
-                mdaw_net::send_datagram(connection, &Datagram::Ping { t0 });
-                sent += 1;
-                let pause = if sent < PING_BURST {
-                    PING_BURST_EVERY
-                } else {
-                    PING_EVERY
-                };
-                tokio::time::sleep(pause).await;
-            }
-        };
-        let timing = async {
-            let mut sync = ClockSync::new();
-            loop {
-                match mdaw_net::read_datagram(connection).await {
-                    Ok(Some(Datagram::Pong { t0, server_micros })) => {
-                        if let Some(estimate) = sync.on_pong(t0, server_micros, clock::now_micros()) {
-                            let _ = events.send(LinkEvent::Clock(estimate));
-                            waker();
-                        }
-                    }
-                    // Straight to the engine, without waiting for the UI.
-                    Ok(Some(Datagram::Midi(packet))) => live.receive(&packet),
-                    Ok(_) => {}
-                    Err(_) => std::future::pending().await,
-                }
-            }
-        };
-        let live_notes = async {
-            let mut every = tokio::time::interval(live::TICK);
-            every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                every.tick().await;
-                live.tick();
-            }
-        };
         tokio::select! {
             end = reading => end,
             end = writing => end,
             _ = stopped(stop) => End::Stop,
-            () = pinging => unreachable!(),
-            () = timing => unreachable!(),
-            () = live_notes => unreachable!(),
         }
     }
 }

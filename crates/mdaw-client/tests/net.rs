@@ -1,11 +1,10 @@
 //! A real server and real clients in one process, talking QUIC over loopback. Only the audio
-//! device and the window are missing.
+//! device and the window are missing: the clients run on `SilentAudio`.
 
-use mdaw_client::{Session, Status, Who};
-use mdaw_engine::Engine;
+use mdaw_client::{Session, SilentAudio, Status, Who};
 use mdaw_model::{
-    Clip, ClipId, ClipProp, EntityRef, MixProp, Note, NoteId, NoteProp, Op, Project, Tick, TrackContent,
-    TrackId, TrackShell,
+    BuiltinKind, Clip, ClipId, ClipProp, Device, DeviceKind, EntityRef, MixProp, Note, NoteId, NoteProp, Op,
+    PluginFormat, Project, ShellProp, Tick, TrackContent, TrackId, TrackShell,
 };
 use mdaw_server::{Config, Server};
 use std::net::SocketAddr;
@@ -32,8 +31,28 @@ fn who(name: &str) -> Who {
 }
 
 fn join(server: &Server, name: &str) -> Session {
-    let engine = Engine::manual(48_000, false);
+    let engine = SilentAudio::manual();
     Session::join(server.join_info().clone(), who(name), engine, Arc::new(|| {})).unwrap()
+}
+
+/// A client that keeps its unconfirmed edits in an outbox under `profile`, as the app does.
+fn join_kept(server: &Server, name: &str, profile: &Path) -> Session {
+    let engine = SilentAudio::manual();
+    let outbox = mdaw_client::outbox::Outbox::dir_for(profile, server.join_info());
+    Session::join_with_outbox(
+        server.join_info().clone(),
+        who(name),
+        &outbox,
+        engine,
+        Arc::new(|| {}),
+    )
+    .unwrap()
+}
+
+/// The transactions in a client's outbox on disk.
+fn outbox_len(server: &Server, profile: &Path) -> usize {
+    let dir = mdaw_client::outbox::Outbox::dir_for(profile, server.join_info());
+    mdaw_client::outbox::Outbox::open(&dir).unwrap().1.txns.len()
 }
 
 /// Runs frames on all sessions until `done`, as their windows would.
@@ -245,13 +264,18 @@ fn a_refused_edit_is_taken_back_with_a_notice() {
     let bass = add_track(&mut ann, "Bass");
     settle(&mut [&mut ann, &mut ben]);
 
-    // Ben takes the bass out of live editing. Ann has not heard of that yet when she edits it,
-    // together with the lead: the server turns down the whole edit.
-    ben.check_out(bass.0);
-    until(&mut [&mut ben], "ben's checkout is in the log", |s| {
-        s[0].workspace(bass.0).is_some()
-    });
+    // Ann edits the lead and, in the same edit, gives the bass a plugin whose settings the
+    // server never got: the server turns down the whole edit.
     let (track, clip, id) = at;
+    let plugin = Device::new(
+        ann.ids().device(),
+        DeviceKind::Plugin {
+            format: PluginFormat::Clap,
+            id: "org.example.synth".into(),
+            name: "Synth".into(),
+            state: Some(mdaw_proto::blob_hash(b"never uploaded")),
+        },
+    );
     assert!(ann.edit(vec![
         Op::NoteSet {
             track,
@@ -259,11 +283,10 @@ fn a_refused_edit_is_taken_back_with_a_notice() {
             id,
             prop: NoteProp::Pitch(90)
         },
-        Op::NoteSet {
+        Op::DeviceAdd {
             track: bass.0,
-            clip: bass.1,
-            id: bass.2,
-            prop: NoteProp::Pitch(90)
+            device: plugin,
+            after: None,
         },
     ]));
     assert_eq!(pitch(ann.project(), at), Some(90));
@@ -281,7 +304,7 @@ fn a_refused_edit_is_taken_back_with_a_notice() {
         Some(60),
         "nothing of the refused edit stays"
     );
-    assert_eq!(pitch(ann.project(), bass), Some(60));
+    assert!(ann.project().track(bass.0).unwrap().content.devices.is_empty());
     assert_eq!(
         ben.project().track(track).unwrap().content.clips[&clip].notes[&id].vel,
         33
@@ -445,7 +468,7 @@ fn what_one_drags_is_locked_for_the_others() {
 fn joining_fails_with_a_reason() {
     let dir = tempfile::tempdir().unwrap();
     let server = serve(dir.path(), "127.0.0.1:0");
-    let engine = || Engine::manual(48_000, false);
+    let engine = || SilentAudio::manual();
 
     let mut wrong_token = server.join_info().clone();
     wrong_token.token = "0".repeat(32);
@@ -539,7 +562,7 @@ fn joining_a_server_that_is_not_there_gives_up_with_a_reason() {
     let info = server.join_info().clone();
     server.stop();
     let started = Instant::now();
-    let error = Session::join(info, who("zed"), Engine::manual(48_000, false), Arc::new(|| {}))
+    let error = Session::join(info, who("zed"), SilentAudio::manual(), Arc::new(|| {}))
         .err()
         .expect("nobody answers");
     assert!(error.to_string().contains("could not join"), "{error}");
@@ -578,4 +601,257 @@ fn a_huge_first_message_is_turned_away_before_the_token_is_checked() {
     // And the server goes on as before.
     let mut ann = join(&server, "ann");
     settle(&mut [&mut ann]);
+}
+
+#[test]
+fn an_edit_too_large_to_send_is_taken_back_and_the_connection_stays() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = serve(dir.path(), "127.0.0.1:0");
+    let (mut ann, mut ben) = (join(&server, "ann"), join(&server, "ben"));
+    // A track of 40 full clips: over 16 MiB once encoded, but within every limit of the model.
+    let ids = ann.ids();
+    let track = ids.track();
+    let mut content = TrackContent::default();
+    for c in 0..40 {
+        let notes = (0..50_000)
+            .map(|n| {
+                let note = Note {
+                    start: Tick(n),
+                    dur: Tick(1_000_000),
+                    pitch: 127,
+                    vel: 127,
+                };
+                (ids.note(), note)
+            })
+            .collect();
+        let clip = Clip {
+            start: Tick::bars(c),
+            length: Tick::bars(1),
+            name: String::new(),
+            notes,
+        };
+        content.clips.insert(ids.clip(), Arc::new(clip));
+    }
+    let shell = TrackShell {
+        name: "huge".into(),
+        color: 0,
+    };
+    assert!(ann.edit(vec![Op::TrackAdd {
+        id: track,
+        shell,
+        content,
+        after: None,
+    }]));
+    until(&mut [&mut ann, &mut ben], "the edit is taken back", |s| {
+        s[0].project().tracks.is_empty() && s[0].unconfirmed() == 0
+    });
+    assert!(ann.notices().iter().any(|n| n.contains("too large")));
+    assert_eq!(ann.status(), Status::Online, "the connection is still up");
+
+    // And it still works.
+    add_track(&mut ann, "Lead");
+    settle(&mut [&mut ann, &mut ben]);
+    assert_eq!(ben.project().tracks.len(), 1);
+}
+
+#[test]
+fn an_edit_past_the_limits_is_refused_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = serve(dir.path(), "127.0.0.1:0");
+    let (mut ann, mut ben) = (join(&server, "ann"), join(&server, "ben"));
+    let (track, _, _) = add_track(&mut ann, "Lead");
+    settle(&mut [&mut ann, &mut ben]);
+
+    // 32 devices fill the track, the next is one too many.
+    let device = |ann: &mut Session| {
+        let kind = DeviceKind::Builtin {
+            kind: BuiltinKind::TwoOsc,
+            dsp_version: mdaw_model::two_osc::DSP_VERSION,
+        };
+        Op::DeviceAdd {
+            track,
+            device: Device::new(ann.ids().device(), kind),
+            after: None,
+        }
+    };
+    for _ in 0..32 {
+        let op = device(&mut ann);
+        assert!(ann.edit(vec![op]));
+    }
+    let op = device(&mut ann);
+    assert!(!ann.edit(vec![op]), "refused here, before the server");
+    assert!(ann.notices().iter().any(|n| n.contains("cannot be made")));
+    settle(&mut [&mut ann, &mut ben]);
+    assert_eq!(ben.project().track(track).unwrap().content.devices.len(), 32);
+
+    // An op out of range is refused with a word too, where a debug build used to stop.
+    let prop = ShellProp::Name("x".repeat(200));
+    assert!(!ann.edit(vec![Op::TrackSetShell { id: track, prop }]));
+}
+
+#[test]
+fn edits_made_offline_survive_a_crash_of_the_client() {
+    let dir = tempfile::tempdir().unwrap();
+    let profile = tempfile::tempdir().unwrap();
+    let server = serve(dir.path(), "127.0.0.1:0");
+    let addr: SocketAddr = server.local_addr().unwrap();
+    let (mut ann, mut ben) = (join_kept(&server, "ann", profile.path()), join(&server, "ben"));
+    let at = add_track(&mut ann, "Lead");
+    settle(&mut [&mut ann, &mut ben]);
+    let before = ann.seq();
+
+    server.stop();
+    until(&mut [&mut ann, &mut ben], "both notice the server is gone", |s| {
+        s.iter().all(|s| s.status() == Status::Reconnecting)
+    });
+    assert!(set_pitch(&mut ann, at, 67));
+    let offline = add_track(&mut ann, "Made offline");
+    assert_eq!(ann.unconfirmed(), 2);
+    // The client dies. Nothing is written on the way out: a session has no exit handler that
+    // saves anything, so dropping it leaves the disk as a crash would.
+    drop(ann);
+
+    let server = serve(dir.path(), &addr.to_string());
+    let mut ann = join_kept(&server, "ann", profile.path());
+    assert_eq!(ann.unconfirmed(), 2, "the edits are back");
+    assert_eq!(pitch(ann.project(), at), Some(67), "and shown at once");
+    assert_eq!(pitch(ann.project(), offline), Some(60));
+    settle(&mut [&mut ann, &mut ben]);
+    assert_eq!(pitch(ben.project(), at), Some(67));
+    assert_eq!(pitch(ben.project(), offline), Some(60));
+    assert_eq!(ben.seq(), before + 2, "each arrived exactly once");
+    until(&mut [&mut ann], "the outbox is emptied", |_| {
+        outbox_len(&server, profile.path()) == 0
+    });
+}
+
+#[test]
+fn an_edit_the_server_took_before_the_client_died_is_not_made_twice() {
+    let dir = tempfile::tempdir().unwrap();
+    let profile = tempfile::tempdir().unwrap();
+    let server = serve(dir.path(), "127.0.0.1:0");
+    let (mut ann, mut ben) = (join_kept(&server, "ann", profile.path()), join(&server, "ben"));
+    let at = add_track(&mut ann, "Lead");
+    settle(&mut [&mut ann, &mut ben]);
+    let before = ben.seq();
+
+    // Ann's edit reaches the server and Ben; Ann dies before she reads the event.
+    assert!(set_pitch(&mut ann, at, 72));
+    until(&mut [&mut ben], "ben has ann's edit", |s| {
+        pitch(s[0].project(), at) == Some(72)
+    });
+    assert_eq!(ann.unconfirmed(), 1);
+    drop(ann);
+    // Ben changes it again meanwhile: made twice, Ann's edit would undo his.
+    assert!(set_pitch(&mut ben, at, 50));
+    settle(&mut [&mut ben]);
+
+    let mut ann = join_kept(&server, "ann", profile.path());
+    assert_eq!(
+        ann.unconfirmed(),
+        1,
+        "still in the outbox, and in the snapshot as well"
+    );
+    settle(&mut [&mut ann, &mut ben]);
+    assert_eq!(pitch(ann.project(), at), Some(50));
+    assert_eq!(pitch(ben.project(), at), Some(50));
+    assert_eq!(ann.seq(), before + 2, "the server answered from its receipt");
+    assert!(ann.notices().is_empty(), "{:?}", ann.notices());
+    until(&mut [&mut ann], "the outbox is emptied", |_| {
+        outbox_len(&server, profile.path()) == 0
+    });
+}
+
+#[test]
+fn an_upload_the_server_refuses_takes_back_its_edit_and_blocks_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let profile = tempfile::tempdir().unwrap();
+    let server = serve(dir.path(), "127.0.0.1:0");
+    let (mut ann, mut ben) = (join_kept(&server, "ann", profile.path()), join(&server, "ben"));
+    let at = add_track(&mut ann, "Lead");
+    settle(&mut [&mut ann, &mut ben]);
+
+    // Settings whose bytes are not what their hash says: the server turns the upload down.
+    let state = mdaw_proto::blob_hash(b"the settings the edit names");
+    ann.put_blob_unchecked(state, Arc::from(&b"other bytes"[..]));
+    let device = Device::new(
+        ann.ids().device(),
+        DeviceKind::Plugin {
+            format: PluginFormat::Clap,
+            id: "org.example.synth".into(),
+            name: "Synth".into(),
+            state: Some(state),
+        },
+    );
+    assert!(ann.edit(vec![Op::DeviceAdd {
+        track: at.0,
+        device,
+        after: None,
+    }]));
+    // An edit behind it, which used to wait for the upload for ever.
+    assert!(set_pitch(&mut ann, at, 70));
+
+    settle(&mut [&mut ann, &mut ben]);
+    assert_eq!(pitch(ben.project(), at), Some(70));
+    assert!(ben.project().track(at.0).unwrap().content.devices.is_empty());
+    assert!(
+        ann.project().track(at.0).unwrap().content.devices.is_empty(),
+        "taken back"
+    );
+    assert!(
+        ann.notices().iter().any(|n| n.contains("taken back")),
+        "{:?}",
+        ann.notices()
+    );
+    until(&mut [&mut ann], "the outbox is emptied", |_| {
+        outbox_len(&server, profile.path()) == 0
+    });
+}
+
+/// Settings the server never got are refused, and taken back where they were made; the device
+/// keeps the settings it had for everyone. (Was part of the old `tests/plugins.rs`.)
+#[test]
+fn settings_the_server_never_got_are_refused_and_taken_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = serve(dir.path(), "127.0.0.1:0");
+    let (mut ann, mut ben) = (join(&server, "ann"), join(&server, "ben"));
+    let (track, _, _) = add_track(&mut ann, "Lead");
+    let device = ann.ids().device();
+    let plugin = Device::new(
+        device,
+        DeviceKind::Plugin {
+            format: PluginFormat::Clap,
+            id: "org.example.synth".into(),
+            name: "Synth".into(),
+            state: None,
+        },
+    );
+    assert!(ann.edit(vec![Op::DeviceAdd {
+        track,
+        device: plugin,
+        after: None,
+    }]));
+    settle(&mut [&mut ann, &mut ben]);
+
+    let nowhere = mdaw_proto::blob_hash(b"never uploaded");
+    assert!(ben.edit(vec![Op::DeviceSetState {
+        track,
+        id: device,
+        state: Some(nowhere),
+    }]));
+    until(&mut [&mut ann, &mut ben], "the edit is refused", |s| {
+        s[1].notices().iter().any(|n| n.contains("not accepted"))
+    });
+    settle(&mut [&mut ann, &mut ben]);
+    for session in [&ann, &ben] {
+        let kind = &session
+            .project()
+            .track(track)
+            .unwrap()
+            .content
+            .device(device)
+            .unwrap()
+            .kind;
+        assert!(matches!(kind, DeviceKind::Plugin { state: None, .. }), "{kind:?}");
+    }
 }

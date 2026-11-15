@@ -1,5 +1,7 @@
 # Spike S1: hosting CLAP plugins from Rust
 
+History: written for the Rust engine, removed 2026-11-15; see `docs/retire-rust-engine.md`.
+
 Date: 2026-11-10. Code: `spikes/clap-host` (throwaway, excluded from CI lint and tests).
 
 ## Decision

@@ -1,7 +1,8 @@
 //! "mdaw Test Synth": a CLAP instrument small enough to reason about, for tests of the plugin
 //! host. One sine voice per note with a short linear attack and release, a stereo output, two
 //! parameters and a state that holds them. Its output depends only on its input, so two
-//! instances with the same state render the same samples.
+//! instances with the same state render the same samples. Tests load it as a `.clap` file
+//! ([`clap_folder`]); a state that is not its own it refuses.
 
 use clack_extensions::audio_ports::{
     AudioPortFlags, AudioPortInfo, AudioPortInfoWriter, AudioPortType, PluginAudioPorts, PluginAudioPortsImpl,
@@ -29,26 +30,11 @@ pub const NAME: &str = "mdaw Test Synth";
 pub const LEVEL: u32 = 0;
 /// Parameter: balance, -1 (left only) to 1 (right only).
 pub const BALANCE: u32 = 1;
-/// Parameter: how the plugin misbehaves on a note of [`CRASH_PITCH`], as a broken plugin would,
-/// for tests of hosts that must survive that. 0, the default: not at all. 1: its processing
-/// fails from then on. 2: it crashes the process. 3: it is slow. 4: it hangs.
-pub const MISBEHAVE: u32 = 2;
-pub const FAIL: f64 = 1.0;
-pub const CRASH: f64 = 2.0;
-/// Each block takes 50 ms from then on, as a plugin overloading the machine.
-pub const SLOW: f64 = 3.0;
-/// Its processing never returns, as a plugin caught in a loop.
-pub const HANG: f64 = 4.0;
-/// The note that sets off what [`MISBEHAVE`] asks for.
-pub const CRASH_PITCH: u8 = 0;
 const DEFAULT_LEVEL: f64 = 0.5;
 const VOICES: usize = 16;
 const ATTACK_SECONDS: f64 = 0.005;
 const RELEASE_SECONDS: f64 = 0.05;
 const STATE_MAGIC: &[u8; 4] = b"MDTS";
-
-/// The entry to load the plugin in-process with.
-pub type Entry = SinglePluginEntry<TestSynth>;
 
 pub struct TestSynth;
 
@@ -56,7 +42,6 @@ pub struct TestSynth;
 pub struct Shared {
     level: AtomicU32,
     balance: AtomicU32,
-    misbehave: AtomicU32,
 }
 
 impl Shared {
@@ -64,7 +49,6 @@ impl Shared {
         let cell = match id {
             LEVEL => &self.level,
             BALANCE => &self.balance,
-            MISBEHAVE => &self.misbehave,
             _ => return None,
         };
         Some(f32::from_bits(cell.load(Relaxed)) as f64)
@@ -74,7 +58,6 @@ impl Shared {
         let (cell, value) = match id {
             LEVEL => (&self.level, value.clamp(0.0, 1.0)),
             BALANCE => (&self.balance, value.clamp(-1.0, 1.0)),
-            MISBEHAVE => (&self.misbehave, value.round().clamp(0.0, 4.0)),
             _ => return,
         };
         cell.store((value as f32).to_bits(), Relaxed);
@@ -116,7 +99,6 @@ impl DefaultPluginFactory for TestSynth {
         Ok(Shared {
             level: AtomicU32::new((DEFAULT_LEVEL as f32).to_bits()),
             balance: AtomicU32::new(0.0f32.to_bits()),
-            misbehave: AtomicU32::new(0.0f32.to_bits()),
         })
     }
 
@@ -143,8 +125,6 @@ struct Voice {
 
 pub struct Processor<'a> {
     shared: &'a Shared,
-    /// Told to be slow, and the note came.
-    slow: bool,
     sample_rate: f64,
     voices: [Option<Voice>; VOICES],
 }
@@ -158,7 +138,6 @@ impl<'a> PluginAudioProcessor<'a, Shared, MainThread<'a>> for Processor<'a> {
     ) -> Result<Self, PluginError> {
         Ok(Self {
             shared,
-            slow: false,
             sample_rate: config.sample_rate,
             voices: [None; VOICES],
         })
@@ -195,17 +174,6 @@ impl<'a> PluginAudioProcessor<'a, Shared, MainThread<'a>> for Processor<'a> {
             }
             match event.as_core_event() {
                 Some(CoreEventSpace::NoteOn(e)) => {
-                    if e.key() == Match::Specific(CRASH_PITCH as u16) {
-                        match self.shared.get(MISBEHAVE).unwrap_or(0.0) {
-                            m if m >= HANG => loop {
-                                std::thread::sleep(std::time::Duration::from_secs(1));
-                            },
-                            m if m >= SLOW => self.slow = true,
-                            m if m >= CRASH => std::process::abort(),
-                            m if m >= FAIL => return Err(PluginError::Message("told to fail")),
-                            _ => {}
-                        }
-                    }
                     self.start(e.key(), e.note_id(), e.channel(), e.velocity())
                 }
                 Some(CoreEventSpace::NoteOff(e)) => self.stop(e.key(), e.note_id(), e.channel()),
@@ -219,9 +187,6 @@ impl<'a> PluginAudioProcessor<'a, Shared, MainThread<'a>> for Processor<'a> {
         }
         if done < frames {
             self.render(left, right, done, frames);
-        }
-        if self.slow {
-            std::thread::sleep(std::time::Duration::from_millis(50));
         }
         Ok(ProcessStatus::ContinueIfNotQuiet)
     }
@@ -345,24 +310,18 @@ impl PluginAudioProcessorParams for Processor<'_> {
 
 impl PluginMainThreadParams for MainThread<'_> {
     fn count(&self) -> u32 {
-        3
+        2
     }
 
     fn get_info(&self, index: u32, info: &mut ParamInfoWriter) {
         let (id, name, min, max, default): (u32, &[u8], f64, f64, f64) = match index {
             0 => (LEVEL, b"Level", 0.0, 1.0, DEFAULT_LEVEL),
             1 => (BALANCE, b"Balance", -1.0, 1.0, 0.0),
-            2 => (MISBEHAVE, b"Misbehave on lowest note", 0.0, 4.0, 0.0),
             _ => return,
-        };
-        let flags = if id == MISBEHAVE {
-            ParamInfoFlags::IS_STEPPED
-        } else {
-            ParamInfoFlags::IS_AUTOMATABLE
         };
         info.set(&ParamInfo {
             id: ClapId::new(id),
-            flags,
+            flags: ParamInfoFlags::IS_AUTOMATABLE,
             cookie: Default::default(),
             name,
             module: b"",
@@ -411,8 +370,6 @@ impl PluginStateImpl for MainThread<'_> {
         output.write_all(STATE_MAGIC)?;
         output.write_all(&level.to_le_bytes())?;
         output.write_all(&balance.to_le_bytes())?;
-        let misbehave = self.shared.get(MISBEHAVE).unwrap_or(0.0) as f32;
-        output.write_all(&misbehave.to_le_bytes())?;
         Ok(())
     }
 
@@ -425,13 +382,7 @@ impl PluginStateImpl for MainThread<'_> {
         let float = |at: usize| f32::from_le_bytes(bytes[at..at + 4].try_into().expect("four bytes")) as f64;
         self.shared.set(LEVEL, float(4));
         self.shared.set(BALANCE, float(8));
-        // Older states end here.
-        let mut more = [0u8; 4];
-        let misbehave = match input.read_exact(&mut more) {
-            Ok(()) => f32::from_le_bytes(more) as f64,
-            Err(_) => 0.0,
-        };
-        self.shared.set(MISBEHAVE, misbehave);
+        // States saved by older builds have a third value after these, no longer read.
         Ok(())
     }
 }
@@ -473,3 +424,52 @@ impl PluginNotePortsImpl for MainThread<'_> {
 }
 
 clack_export_entry!(SinglePluginEntry<TestSynth>);
+
+/// Copies the test synth, as built for this workspace, into `dir` as `mdaw-test-synth.clap`, and
+/// returns `dir`: a folder for `CLAP_PATH`. For tests: it finds the library next to the running
+/// executable (`target/<profile>/deps/libmdaw_test_plugin.so`, or one folder up). A test that
+/// has this crate as a dev-dependency got it built with itself; only if it is missing is it
+/// built here, since a second cargo build during a test run would overwrite the rlib (a
+/// `cdylib` crate's files carry no hash) under the feet of the run. Tests copying at once are
+/// safe: each copies to a name of its own and renames.
+pub fn clap_folder(dir: &std::path::Path) -> std::path::PathBuf {
+    use std::path::PathBuf;
+    let exe = std::env::current_exe().expect("the running executable");
+    let mut profile: PathBuf = exe.parent().expect("the executable's folder").into();
+    if profile.ends_with("deps") {
+        profile.pop();
+    }
+    let name = format!(
+        "{}mdaw_test_plugin{}",
+        std::env::consts::DLL_PREFIX,
+        std::env::consts::DLL_SUFFIX
+    );
+    let candidates = [profile.join("deps").join(&name), profile.join(&name)];
+    let built = match candidates.iter().find(|p| p.is_file()) {
+        Some(built) => built.clone(),
+        None => {
+            let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+            let mut build = std::process::Command::new(cargo);
+            build.args(["build", "-p", "mdaw-test-plugin"]);
+            if profile.ends_with("release") {
+                build.arg("--release");
+            }
+            let status = build.status().expect("run cargo");
+            assert!(status.success(), "building the test plugin");
+            candidates[1].clone()
+        }
+    };
+    std::fs::create_dir_all(dir).unwrap_or_else(|e| panic!("create {}: {e}", dir.display()));
+    let file = dir.join("mdaw-test-synth.clap");
+    let bytes = std::fs::read(&built).unwrap_or_else(|e| panic!("read {}: {e}", built.display()));
+    if std::fs::read(&file).ok().as_deref() != Some(&bytes[..]) {
+        let part = dir.join(format!(
+            "mdaw-test-synth.clap.{}.{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&part, &bytes).unwrap_or_else(|e| panic!("write {}: {e}", part.display()));
+        std::fs::rename(&part, &file).unwrap_or_else(|e| panic!("rename to {}: {e}", file.display()));
+    }
+    dir.to_path_buf()
+}

@@ -1,14 +1,21 @@
-//! Replicas against the hub, with messages delayed and connections cut and resumed at random.
-//! Whatever happens on the way, once everything is delivered every replica holds the server's
-//! document.
+//! Replicas against the hub, with messages delayed, transactions sent twice, connections cut
+//! (acknowledgements lost with them) and resumed by catch-up or by snapshot, and the server
+//! restarted, all at random. Whatever happens on the way, once everything is delivered every
+//! replica holds the server's document, the log holds every transaction of a user at most once,
+//! and every transaction a client made is in the log exactly once or was refused.
 
 use mdaw_model::*;
 use mdaw_proto::*;
 use mdaw_server::{Blobs, Hub, Sink, Store};
 use mdaw_sync::Replica;
 use proptest::prelude::*;
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+
+/// A client this far behind gets a snapshot rather than the events; small, so schedules reach
+/// that path often.
+const CATCH_UP_LIMIT: u64 = 6;
 
 type Queue = Arc<Mutex<VecDeque<ServerMsg>>>;
 
@@ -24,20 +31,25 @@ struct Conn {
 
 struct Client {
     key: u8,
+    user: UserId,
     replica: Replica,
     secret: u64,
     conn: Option<Conn>,
+    /// Every transaction this client made, in order.
+    created: Vec<Txn>,
+    /// Those the server refused.
+    rejected: HashSet<TxnId>,
 }
 
 struct World {
     hub: Hub,
+    /// Where the project lives, so the server can be restarted on it.
+    _dir: tempfile::TempDir,
+    path: PathBuf,
+    blobs: Blobs,
     clients: Vec<Client>,
     /// The server's document after each event, by sequence number.
     history: Vec<Project>,
-    /// Everything the server sent to a connection that only listens.
-    observer: Queue,
-    /// A client has sent its pending edits again without knowing which the server already had.
-    resent_blindly: bool,
 }
 
 fn sink(queue: &Queue) -> Sink {
@@ -48,19 +60,21 @@ fn sink(queue: &Queue) -> Sink {
     })
 }
 
+fn open(path: &std::path::Path, blobs: &Blobs) -> Hub {
+    Hub::open(Store::open(path).unwrap(), blobs.clone())
+        .unwrap()
+        .with_catch_up_limit(CATCH_UP_LIMIT)
+}
+
 impl World {
     fn new(clients: u8) -> Self {
-        let mut hub = Hub::open(Store::in_memory().unwrap(), Blobs::in_memory()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("project.db");
+        let blobs = Blobs::in_memory();
+        let mut hub = open(&path, &blobs);
+        // The one plugin state every client has uploaded.
+        assert!(hub.blobs().put(&stored(), STORED).unwrap());
         let history = vec![hub.doc().clone()];
-        let observer = Queue::default();
-        let hello = Hello {
-            proto_version: PROTO_VERSION,
-            token: hub.token().to_string(),
-            user_key: [0xff; 16],
-            name: "observer".into(),
-            resume: None,
-        };
-        hub.join(hello, sink(&observer)).unwrap();
         let clients = (0..clients)
             .map(|key| {
                 let down = Queue::default();
@@ -80,6 +94,7 @@ impl World {
                 };
                 Client {
                     key,
+                    user: welcome.user,
                     replica: Replica::new(actor, project, welcome.head_seq),
                     secret: welcome.session_secret,
                     conn: Some(Conn {
@@ -88,24 +103,54 @@ impl World {
                         up: VecDeque::new(),
                         welcomed: true,
                     }),
+                    created: Vec::new(),
+                    rejected: HashSet::new(),
                 }
             })
             .collect();
         Self {
             hub,
+            _dir: dir,
+            path,
+            blobs,
             clients,
             history,
-            observer,
-            resent_blindly: false,
         }
     }
 
     fn send(&mut self, client: usize, txn: Option<Txn>) {
+        let Some(txn) = txn else { return };
+        let c = &mut self.clients[client];
+        c.created.push(txn.clone());
         // Offline edits wait in the replica's pending queue.
-        if let (Some(txn), Some(conn)) = (txn, &mut self.clients[client].conn)
+        if let Some(conn) = &mut c.conn
             && conn.welcomed
         {
             conn.up.push_back(ClientMsg::Submit(txn));
+        }
+    }
+
+    /// The client sends one of its transactions once more, as it is, whatever became of it.
+    fn duplicate(&mut self, client: usize, which: usize) {
+        let c = &mut self.clients[client];
+        if let Some(conn) = &mut c.conn
+            && conn.welcomed
+            && !c.created.is_empty()
+        {
+            let txn = c.created[which % c.created.len()].clone();
+            conn.up.push_back(ClientMsg::Submit(txn));
+        }
+    }
+
+    /// The server goes down and comes back on the same data. Every connection is lost, with
+    /// whatever was under way on it.
+    fn restart(&mut self) {
+        let doc = self.hub.doc().clone();
+        let head = self.hub.head();
+        self.hub = open(&self.path, &self.blobs);
+        assert_eq!((self.hub.head(), self.hub.doc()), (head, &doc), "nothing lost");
+        for c in &mut self.clients {
+            c.conn = None;
         }
     }
 
@@ -135,21 +180,25 @@ impl World {
             ServerMsg::Welcome(welcome) => {
                 assert!(!conn.welcomed);
                 assert_eq!(welcome.actor, conn.actor);
+                assert_eq!(welcome.user, c.user);
                 let resend = c
                     .replica
-                    .resync(welcome.actor, welcome.head_seq, welcome.sync, welcome.acked)
+                    .resync(welcome.actor, welcome.head_seq, welcome.sync)
                     .expect("the welcome continues where the replica is");
                 conn.up.extend(resend.into_iter().map(ClientMsg::Submit));
                 conn.welcomed = true;
                 c.secret = welcome.session_secret;
             }
             ServerMsg::Event(event) => c.replica.on_event(&event).expect("events arrive in order"),
-            ServerMsg::Rejected { client_txn_id, .. } => c.replica.on_rejected(client_txn_id),
-            ServerMsg::Peers(_)
-            | ServerMsg::Presence { .. }
-            | ServerMsg::Transport { .. }
-            | ServerMsg::Stale(_) => {}
-            ServerMsg::Denied { request, reason } => panic!("{request:?} denied: {reason}"),
+            ServerMsg::Rejected { txn, .. } => {
+                c.replica.on_rejected(txn);
+                c.rejected.insert(txn);
+            }
+            ServerMsg::Accepted { txn, seq } => {
+                assert!(seq <= self.hub.head());
+                c.replica.on_accepted(txn, seq);
+            }
+            ServerMsg::Peers(_) | ServerMsg::Presence { .. } => {}
             ServerMsg::Refused(reason) => panic!("refused: {reason}"),
         }
         assert_eq!(
@@ -202,7 +251,6 @@ impl World {
             up: VecDeque::new(),
             welcomed: false,
         });
-        self.resent_blindly |= forget;
     }
 
     fn edit(&mut self, client: usize, kind: u8, a: usize, b: u8) {
@@ -236,6 +284,8 @@ impl World {
                 noticed,
             } => self.cut(client, flush, noticed),
             Action::Connect { client, forget } => self.connect(client, forget),
+            Action::Duplicate { client, which } => self.duplicate(client, which),
+            Action::Restart => self.restart(),
         }
     }
 
@@ -255,6 +305,11 @@ impl World {
         }
     }
 
+    /// Delivers everything between the server and one client.
+    fn settle_client(&mut self, client: usize) {
+        while self.up(client) | self.down(client) {}
+    }
+
     fn assert_converged(&self) {
         for (n, c) in self.clients.iter().enumerate() {
             assert_eq!(
@@ -271,24 +326,36 @@ impl World {
             self.clients.len()
         );
 
-        // The log the observer saw is the log, and no edit is in it twice.
+        // The log on disk folds into the document, and no transaction is in it twice.
+        let log = Store::open(&self.path)
+            .unwrap()
+            .events_after(0, u64::MAX >> 1)
+            .unwrap();
         let mut doc = self.history[0].clone();
-        let mut seen = std::collections::HashSet::new();
-        let mut events = 0;
-        for msg in self.observer.lock().unwrap().iter() {
-            let ServerMsg::Event(event) = msg else { continue };
-            events += 1;
-            assert_eq!(event.seq, events);
+        let mut times: HashMap<(UserId, TxnId), usize> = HashMap::new();
+        for (n, event) in log.iter().enumerate() {
+            assert_eq!(event.seq, n as u64 + 1);
             apply_event(&mut doc, event);
-            let first = seen.insert((event.user, event.client_txn_id()));
-            assert!(
-                first || self.resent_blindly,
-                "event {} repeats an edit already in the log",
-                event.seq
-            );
+            *times.entry((event.user, event.txn)).or_default() += 1;
         }
-        assert_eq!(events, self.hub.head());
+        assert_eq!(log.len() as u64, self.hub.head());
         assert_eq!(&doc, self.hub.doc());
+        for (&(user, txn), &n) in &times {
+            assert_eq!(n, 1, "transaction {txn} of {user:?} is in the log {n} times");
+        }
+
+        // Every transaction a client made either landed once or was refused, not both.
+        for (n, c) in self.clients.iter().enumerate() {
+            for txn in &c.created {
+                let landed = times.contains_key(&(c.user, txn.id));
+                let refused = c.rejected.contains(&txn.id);
+                assert!(
+                    landed != refused,
+                    "client {n}'s transaction {}: in the log {landed}, refused {refused}",
+                    txn.id
+                );
+            }
+        }
     }
 
     fn is_live(&self, actor: ActorId) -> bool {
@@ -320,6 +387,37 @@ fn notes(project: &Project) -> Vec<(TrackId, ClipId, NoteId)> {
     found
 }
 
+fn plugins(project: &Project) -> Vec<(TrackId, DeviceId)> {
+    let mut found = Vec::new();
+    for (track, t) in project.ordered_tracks() {
+        let plugins = t.content.devices.iter();
+        let plugins = plugins.filter(|d| matches!(d.kind, DeviceKind::Plugin { .. }));
+        found.extend(plugins.map(|d| (track, d.id)));
+    }
+    found
+}
+
+/// Bytes of a plugin state that is on the server, and the hash of one that is not.
+const STORED: &[u8] = b"plugin state";
+fn stored() -> BlobHash {
+    blob_hash(STORED)
+}
+fn missing() -> BlobHash {
+    blob_hash(b"never uploaded")
+}
+
+fn plugin(ids: &mut IdGen, state: Option<BlobHash>) -> Device {
+    Device::new(
+        ids.device(),
+        DeviceKind::Plugin {
+            format: PluginFormat::Clap,
+            id: "com.example".into(),
+            name: "Synth".into(),
+            state,
+        },
+    )
+}
+
 fn pick<T: Copy>(from: &[T], a: usize) -> Option<T> {
     (!from.is_empty()).then(|| from[a % from.len()])
 }
@@ -329,7 +427,8 @@ fn edit(view: &Project, ids: &mut IdGen, kind: u8, a: usize, b: u8) -> Vec<Op> {
     let track = pick(&tracks(view), a);
     let clip = pick(&clips(view), a);
     let note = pick(&notes(view), a);
-    let op = match kind % 14 {
+    let device = pick(&plugins(view), a);
+    let op = match kind % 17 {
         0 => Some(Op::TrackAdd {
             id: ids.track(),
             shell: TrackShell {
@@ -382,7 +481,8 @@ fn edit(view: &Project, ids: &mut IdGen, kind: u8, a: usize, b: u8) -> Vec<Op> {
             id,
             point: TempoPoint {
                 tick: Tick::ZERO,
-                milli_bpm: 60_000 + u32::from(b) * 1000,
+                // 60..=300 bpm: the model's (and the audio engine's) range.
+                milli_bpm: 60_000 + u32::from(b % 241) * 1000,
             },
         }),
         11 => track.map(|id| Op::TrackMove {
@@ -392,16 +492,27 @@ fn edit(view: &Project, ids: &mut IdGen, kind: u8, a: usize, b: u8) -> Vec<Op> {
         12 => Some(Op::ProjectSetName {
             name: format!("song {b}"),
         }),
-        // The server refuses plugin devices outside a commit, and with them the whole edit.
+        // A plugin, with or without settings, is an ordinary edit.
+        14 => track.map(|track| Op::DeviceAdd {
+            track,
+            device: plugin(ids, b.is_multiple_of(2).then(stored)),
+            after: None,
+        }),
+        15 => device.map(|(track, id)| Op::DeviceSetState {
+            track,
+            id,
+            state: (!b.is_multiple_of(3)).then(stored),
+        }),
+        16 => device.map(|(track, id)| Op::DeviceSetParam {
+            track,
+            id,
+            param: u32::from(b % 4),
+            value: Some(f64::from(b)),
+        }),
+        // A plugin whose settings never reached the server is refused, and with it the whole
+        // edit.
         _ => {
-            let device = Device::new(
-                ids.device(),
-                DeviceKind::Plugin {
-                    format: PluginFormat::Clap,
-                    id: "com.example".into(),
-                    state: None,
-                },
-            );
+            let device = plugin(ids, Some(missing()));
             let add = track.map(|track| Op::DeviceAdd {
                 track,
                 device,
@@ -447,6 +558,12 @@ enum Action {
         client: usize,
         forget: bool,
     },
+    /// The client sends one of the transactions it made again, unchanged.
+    Duplicate {
+        client: usize,
+        which: usize,
+    },
+    Restart,
 }
 
 const CLIENTS: usize = 3;
@@ -462,7 +579,9 @@ fn action() -> impl Strategy<Value = Action> {
         5 => client.clone().prop_map(|client| Action::Down { client }),
         1 => (client.clone(), 0..4usize, any::<bool>())
             .prop_map(|(client, flush, noticed)| Action::Cut { client, flush, noticed }),
-        2 => (client, prop::bool::weighted(0.15)).prop_map(|(client, forget)| Action::Connect { client, forget }),
+        2 => (client.clone(), prop::bool::weighted(0.15)).prop_map(|(client, forget)| Action::Connect { client, forget }),
+        1 => (client, any::<usize>()).prop_map(|(client, which)| Action::Duplicate { client, which }),
+        1 => Just(Action::Restart),
     ]
 }
 
@@ -515,6 +634,85 @@ fn an_edit_confirmed_while_the_client_was_away_is_not_made_twice() {
     world.settle();
     world.assert_converged();
     assert_eq!(world.hub.head(), before + 1);
+}
+
+#[test]
+fn an_edit_confirmed_while_the_client_was_away_is_not_made_twice_after_a_snapshot() {
+    let mut world = seeded();
+    let before = world.hub.head();
+    world.edit(1, 12, 0, 7);
+    world.cut(1, 1, false);
+    // Others edit meanwhile, past what a catch-up covers.
+    for b in 0..CATCH_UP_LIMIT as u8 + 1 {
+        world.edit(0, 9, 0, b);
+    }
+    world.settle_client(0);
+    world.connect(1, false);
+    let Some(ServerMsg::Welcome(welcome)) = world.clients[1]
+        .conn
+        .as_ref()
+        .unwrap()
+        .down
+        .lock()
+        .unwrap()
+        .front()
+        .cloned()
+    else {
+        panic!("no welcome")
+    };
+    assert!(matches!(welcome.sync, SyncData::Snapshot(_)), "the snapshot path");
+    world.settle();
+    world.assert_converged();
+    assert_eq!(world.hub.head(), before + 1 + CATCH_UP_LIMIT + 1);
+    assert_eq!(world.hub.doc().name, "song 7");
+}
+
+#[test]
+fn an_edit_taken_just_before_the_server_restarts_is_not_made_twice() {
+    let mut world = seeded();
+    let before = world.hub.head();
+    world.edit(1, 12, 0, 7);
+    world.up(1);
+    world.edit(1, 12, 0, 8);
+    // The server takes the first, and goes down before anyone hears of it.
+    world.restart();
+    world.settle();
+    world.assert_converged();
+    assert_eq!(world.hub.head(), before + 2);
+    assert_eq!(world.hub.doc().name, "song 8");
+}
+
+/// Two clients change the same track, which has a plugin, at the same time: its notes, its
+/// mix and the plugin's settings. Nobody holds a lock; everyone ends with the server's document.
+#[test]
+fn concurrent_edits_of_a_track_with_a_plugin_converge() {
+    let mut world = seeded();
+    // With its settings.
+    world.edit(0, 14, 0, 0);
+    world.settle();
+    world.assert_converged();
+    let (track, device) = plugins(world.hub.doc())[0];
+    assert_eq!(Some(track), world.hub.doc().track_order.front().copied());
+    // Clients 1 and 2 edit without seeing each other's edits.
+    for (client, b) in [(1, 5), (2, 9)] {
+        world.edit(client, 16, 0, b);
+        world.edit(client, 6, 0, b);
+        world.edit(client, 9, 0, b);
+        // Client 1 keeps the settings as they are, which sends nothing; client 2 clears them.
+        world.edit(client, 15, 0, b);
+    }
+    world.settle();
+    world.assert_converged();
+    let doc = world.hub.doc();
+    let content = &doc.track(track).unwrap().content;
+    let plugin = content.device(device).unwrap();
+    // Each pair of edits writes the same property; the later one (client 2's) wins each.
+    assert!(matches!(&plugin.kind, DeviceKind::Plugin { .. }));
+    assert_eq!(plugin.params.get(&1), Some(&9.0));
+    assert!(matches!(plugin.kind, DeviceKind::Plugin { state: None, .. }));
+    assert_eq!(content.gain, 1.0 / 8.0);
+    let (_, clip, note) = notes(doc)[0];
+    assert_eq!(content.clips[&clip].notes[&note].pitch, 36 + 9);
 }
 
 #[test]

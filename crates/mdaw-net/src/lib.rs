@@ -1,17 +1,15 @@
 //! The transport under the protocol: QUIC with a pinned server certificate, frames on streams,
-//! datagrams and the clock estimate built on them. Message types live in `mdaw-proto`.
+//! and blobs on streams of their own. Message types live in `mdaw-proto`.
 
-mod clock;
 mod join;
 mod tls;
 
-pub use clock::{ClockEstimate, ClockSync};
 pub use join::JoinInfo;
 pub use tls::Identity;
 
 use anyhow::{Context, Result, bail};
 use mdaw_model::BlobHash;
-use mdaw_proto::{ALPN, BlobAnswer, BlobRequest, Datagram, Framed, MAX_BLOB, payload_len};
+use mdaw_proto::{ALPN, BlobAnswer, BlobRequest, Framed, MAX_BLOB, payload_len};
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{Connection, Endpoint, RecvStream, SendStream, TransportConfig, VarInt};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -129,8 +127,6 @@ pub async fn read_frame_sized<T: Framed>(stream: &mut RecvStream) -> Result<Opti
     Ok(Some((mdaw_proto::decode(&payload)?, payload.len())))
 }
 
-/// Sends a datagram. It may never arrive; that it could not even be queued is not reported
-/// either, since the next one makes up for it.
 /// Uploads a blob on a stream of its own. True once the server holds it.
 pub async fn put_blob(connection: &Connection, hash: BlobHash, bytes: &[u8]) -> Result<bool> {
     let (mut send, mut recv) = connection.open_bi().await?;
@@ -165,18 +161,6 @@ pub async fn get_blob(connection: &Connection, hash: BlobHash) -> Result<Option<
         bail!("a download from the server arrived damaged");
     }
     Ok(Some(bytes))
-}
-
-pub fn send_datagram(connection: &Connection, datagram: &Datagram) {
-    let _ = connection.send_datagram(datagram.encode().into());
-}
-
-/// Waits for the next datagram. `None` for one this version does not understand.
-///
-/// Cancel safe: a datagram is either returned or still waiting.
-pub async fn read_datagram(connection: &Connection) -> Result<Option<Datagram>> {
-    let bytes = connection.read_datagram().await?;
-    Ok(Datagram::decode(&bytes).ok())
 }
 
 /// The ALPN list both sides configure.

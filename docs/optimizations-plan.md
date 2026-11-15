@@ -1,5 +1,10 @@
 # Slice 2: Optimizations
 
+History. This plan is about the Rust audio engine (`mdaw-engine`, `mdaw-dsp`, `mdaw-plugin`: its
+processors, the real-time thread and the plugin helper), which was removed on 2026-11-15
+(`docs/retire-rust-engine.md`). It is kept as it was written, not rewritten: the files, types
+and measurements it names are those of that engine.
+
 ## Context
 
 The first slice (`docs/plan.md`, milestones M0 to M6) is built. Two reviews on 2026-11-11 checked

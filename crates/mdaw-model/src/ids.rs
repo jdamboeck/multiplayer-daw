@@ -6,7 +6,7 @@ use std::fmt;
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 pub struct ActorId(pub u32);
 
-/// One client install. Survives reconnects; checkouts are owned by a user, not an actor.
+/// One client install. Survives reconnects.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 pub struct UserId(pub u32);
 

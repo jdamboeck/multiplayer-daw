@@ -5,16 +5,24 @@
 //! real server (M2 on).
 
 mod app;
-pub mod checkout;
+pub mod audio;
+pub mod audio_silent;
+pub mod audio_tracktion;
+pub mod clock;
+pub mod engine_queue;
 mod link;
 pub mod live;
-pub mod plugins;
+pub mod midi;
+pub mod outbox;
 pub mod profile;
 mod record;
 mod session;
 mod theme;
+pub mod trace;
 pub mod ui;
 
 pub use app::{DawApp, Focus, Selection, Tab};
-pub use link::{Waker, Who};
-pub use session::{CommitState, Displaced, LogEntry, Logged, Session, Status, Timing};
+pub use audio::{Audio, DeviceStatus, EditorState, ParamEntry, PluginEntry, TrackSound};
+pub use audio_silent::SilentAudio;
+pub use link::{Fetched, Fetcher, Upload, Waker, Who};
+pub use session::{Displaced, Session, Status, builtin_kind};

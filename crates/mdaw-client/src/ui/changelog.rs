@@ -1,13 +1,11 @@
-//! The changelog: checkouts and commits with their samples, edits that lost against someone
-//! else's concurrent edit with a way back, and forks of checkouts that were ended.
+//! The changelog: edits that lost against someone else's concurrent edit, with a way back.
 
 use egui::{Button, RichText, Ui};
-use mdaw_model::{ClipProp, EntityRef, MixProp, NoteProp, Op, Project, PropKey, ShellProp, TrackId};
-use mdaw_proto::{ReleaseReason, Superseded};
+use mdaw_model::{ClipProp, EntityRef, MixProp, NoteProp, Op, Project, PropKey, ShellProp};
+use mdaw_proto::Superseded;
 
-use super::checkout::sample_button;
 use super::{format_position, gain_to_db};
-use crate::session::{Displaced, LogEntry, Logged};
+use crate::session::Displaced;
 use crate::{DawApp, theme};
 
 pub fn toolbar(app: &mut DawApp, ui: &mut Ui) {
@@ -15,7 +13,7 @@ pub fn toolbar(app: &mut DawApp, ui: &mut Ui) {
         .on_hover_text("Only what happened to the track selected in the arrangement");
     ui.selectable_value(&mut app.changelog_all, true, "Whole project");
     ui.separator();
-    let text = match rows(app).len() + forks(app).len() {
+    let text = match rows(app).len() {
         0 => "Nothing yet".to_string(),
         1 => "1 entry".to_string(),
         n => format!("{n} entries"),
@@ -23,54 +21,20 @@ pub fn toolbar(app: &mut DawApp, ui: &mut Ui) {
     ui.label(RichText::new(text).color(theme::TEXT_DIM));
 }
 
-/// One line of the changelog.
-enum Row {
-    Log(LogEntry),
-    Displaced(Displaced),
-}
-
-impl Row {
-    fn seq(&self) -> u64 {
-        match self {
-            Row::Log(entry) => entry.seq,
-            Row::Displaced(entry) => entry.seq,
-        }
-    }
-
-    fn wall_ts(&self) -> u64 {
-        match self {
-            Row::Log(entry) => entry.wall_ts,
-            Row::Displaced(entry) => entry.wall_ts,
-        }
-    }
-
-    /// The track the line is about; `None` for the tempo and other project settings.
-    fn track(&self) -> Option<TrackId> {
-        match self {
-            Row::Log(entry) => Some(entry.what.track()),
-            Row::Displaced(entry) => entry.lost.entity.track(),
-        }
-    }
-}
-
 /// The lines to show, newest first; within one event, in the order recorded.
-fn rows(app: &DawApp) -> Vec<Row> {
-    let mut rows: Vec<Row> = app.session.log().iter().cloned().map(Row::Log).collect();
-    rows.extend(app.session.displaced().iter().cloned().map(Row::Displaced));
+fn rows(app: &DawApp) -> Vec<Displaced> {
+    let mut rows: Vec<Displaced> = app.session.displaced().to_vec();
     if !app.changelog_all {
-        rows.retain(|row| row.track().is_some_and(|track| Some(track) == app.sel.track));
+        rows.retain(|row| {
+            row.lost
+                .entity
+                .track()
+                .is_some_and(|track| Some(track) == app.sel.track)
+        });
     }
     rows.reverse();
-    rows.sort_by_key(|row| std::cmp::Reverse(row.seq()));
+    rows.sort_by_key(|row| std::cmp::Reverse(row.seq));
     rows
-}
-
-/// Forks of ended checkouts to show, with their place in the session's list.
-fn forks(app: &DawApp) -> Vec<(usize, crate::checkout::Fork)> {
-    let forks = app.session.forks().iter().cloned().enumerate();
-    forks
-        .filter(|(_, fork)| app.changelog_all || Some(fork.track) == app.sel.track)
-        .collect()
 }
 
 /// When something happened, in local time: the time of day for today, the date as well before.
@@ -94,20 +58,17 @@ pub fn when(wall_ts: u64) -> (String, String) {
 const TIME_WIDTH: f32 = 130.0;
 
 pub fn show(app: &mut DawApp, ui: &mut Ui) {
-    let forks = forks(app);
     let rows = rows(app);
-    if rows.is_empty() && forks.is_empty() {
+    if rows.is_empty() {
         let project = app.session.project();
         let hint = match app.sel.track.and_then(|id| project.track(id)) {
             _ if app.changelog_all => {
-                "Commits of checked-out tracks are listed here, with samples to listen to.\n\
-                 When two people change the same thing at the same moment, the last change wins;\n\
-                 the one that lost is listed here too and can be brought back."
+                "When two people change the same thing at the same moment, the last change \
+                                       wins;\nthe one that lost is listed here and can be brought back."
                     .to_string()
             }
             Some(track) => format!(
-                "Nothing has happened to \"{}\" yet.\nCommits, checkouts and edits that lost against \
-                 someone else's are listed here.",
+                "Nothing has happened to \"{}\" yet.\nEdits that lost against someone else's are listed here.",
                 track.shell.name
             ),
             None => "Select a track to see what happened to it, or show the whole project.".to_string(),
@@ -120,40 +81,14 @@ pub fn show(app: &mut DawApp, ui: &mut Ui) {
     let project = app.session.project().clone();
 
     let mut restore = None;
-    let mut play = None;
-    let mut fork_action = None;
     egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
         ui.add_space(4.0);
-        for (index, fork) in &forks {
-            let index = *index;
-            ui.horizontal(|ui| {
-                if ui
-                    .button("Restore as new track")
-                    .on_hover_text("Adds the track as you had made it in your checkout")
-                    .clicked()
-                {
-                    fork_action = Some((index, true));
-                }
-                if ui.button("Discard").clicked() {
-                    fork_action = Some((index, false));
-                }
-                let text = format!(
-                    "Your changes to \"{}\", kept when your checkout was ended",
-                    fork.shell.name
-                );
-                ui.label(RichText::new(text).color(theme::WARN));
-            });
-        }
-        if !forks.is_empty() {
-            ui.separator();
-        }
         let mut last_seq = None;
-        for row in &rows {
-            // Samples belong to an event; show them with its first line only.
-            let first = last_seq != Some(row.seq());
-            last_seq = Some(row.seq());
+        for entry in &rows {
+            let first = last_seq != Some(entry.seq);
+            last_seq = Some(entry.seq);
             ui.horizontal_wrapped(|ui| {
-                let (short, long) = when(row.wall_ts());
+                let (short, long) = when(entry.wall_ts);
                 // Lines of one event share its time; show it once.
                 let shown = if first { short } else { String::new() };
                 let size = egui::vec2(TIME_WIDTH, ui.spacing().interact_size.y);
@@ -163,86 +98,26 @@ pub fn show(app: &mut DawApp, ui: &mut Ui) {
                     let text = RichText::new(shown).monospace().color(theme::TEXT_DIM);
                     ui.label(text).on_hover_text(long);
                 });
-                match row {
-                    Row::Displaced(entry) => {
-                        let possible = app.session.can_restore(&entry.lost);
-                        let hint = if possible {
-                            "Make this change again, as your own edit."
-                        } else {
-                            "Nothing to restore: the project already has this value, or what it applied to is gone."
-                        };
-                        if ui
-                            .add_enabled(possible, Button::new("Restore"))
-                            .on_hover_text(hint)
-                            .on_disabled_hover_text(hint)
-                            .clicked()
-                        {
-                            restore = Some(entry.lost.clone());
-                        }
-                        ui.label(describe(app, &project, entry));
-                    }
-                    Row::Log(entry) => {
-                        ui.label(describe_log(app, &project, entry));
-                    }
+                let possible = app.session.can_restore(&entry.lost);
+                let hint = if possible {
+                    "Make this change again, as your own edit."
+                } else {
+                    "Nothing to restore: the project already has this value, or what it applied to is gone."
+                };
+                if ui
+                    .add_enabled(possible, Button::new("Restore"))
+                    .on_hover_text(hint)
+                    .on_disabled_hover_text(hint)
+                    .clicked()
+                {
+                    restore = Some(entry.lost.clone());
                 }
-                if first {
-                    for sample in crate::checkout::distinct(app.session.samples(row.seq())) {
-                        if sample_button(app, ui, &sample).clicked() {
-                            play = Some(sample);
-                        }
-                    }
-                }
+                ui.label(describe(app, &project, entry));
             });
         }
     });
     if let Some(lost) = restore {
         app.session.restore(&lost);
-    }
-    if let Some(sample) = play {
-        app.session.play_sample(&sample);
-    }
-    match fork_action {
-        Some((index, true)) => {
-            app.session.restore_fork(index);
-        }
-        Some((index, false)) => app.session.discard_fork(index),
-        None => {}
-    }
-}
-
-/// One line about a checkout, commit or release.
-fn describe_log(app: &DawApp, project: &Project, entry: &LogEntry) -> String {
-    let who = app.session.user_name(entry.by);
-    let track = |id: &mdaw_model::TrackId| match project.track(*id) {
-        Some(track) => format!("\"{}\"", track.shell.name),
-        None => "a removed track".into(),
-    };
-    match &entry.what {
-        Logged::Checkout { track: id } => format!("{who} checked out {}", track(id)),
-        Logged::Commit {
-            track: id, summary, ..
-        } => {
-            if summary.is_empty() {
-                format!("{who} committed {}", track(id))
-            } else {
-                format!("{who} committed {}: {summary}", track(id))
-            }
-        }
-        Logged::Release {
-            track: id,
-            reason: ReleaseReason::Abandoned,
-        } => format!("{who} dropped the checkout of {}", track(id)),
-        Logged::Release {
-            track: id,
-            reason: ReleaseReason::Forced { owner },
-        } => {
-            let whose = if *owner == app.session.user() {
-                "your".to_string()
-            } else {
-                format!("{}'s", app.session.user_name(*owner))
-            };
-            format!("{who} ended {whose} checkout of {}", track(id))
-        }
     }
 }
 

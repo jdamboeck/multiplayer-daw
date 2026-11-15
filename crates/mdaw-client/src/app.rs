@@ -7,7 +7,7 @@ use mdaw_model::{ClipId, EntityRef, NoteId, Op, Tick, TickRange, TrackId};
 
 use crate::live::MidiWatch;
 use crate::session::{Session, new_track};
-use crate::ui::{arrange, changelog, checkout, devices, live, piano_roll, transport};
+use crate::ui::{arrange, changelog, devices, live, piano_roll, transport};
 
 /// The view that keyboard commands such as Delete act on: the one clicked last.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -47,13 +47,11 @@ pub struct DawApp {
     pub(crate) rename: Option<(TrackId, String, bool)>,
     /// What the user is dragging in this frame; the views set it, the session shares it.
     pub(crate) editing: Option<EntityRef>,
-    /// The commit dialog, while open.
-    pub commit: Option<checkout::CommitDialog>,
-    /// A track whose checkout by someone else the user asked to end, awaiting confirmation.
-    pub confirm_force: Option<TrackId>,
     /// The changelog lists the whole project rather than the selected track.
     pub changelog_all: bool,
     pub live: live::LiveState,
+    /// [`DawApp::logic`] ran the session's frame for the frame being drawn.
+    logic_ran: bool,
 }
 
 impl DawApp {
@@ -74,11 +72,19 @@ impl DawApp {
             gestures: crate::ui::Gestures::default(),
             rename: None,
             editing: None,
-            commit: None,
-            confirm_force: None,
             changelog_all: false,
             live: live::LiveState::default(),
+            logic_ran: false,
         }
+    }
+
+    /// The session's share of a frame: what arrived from the server, the engine, plugins'
+    /// settings to save. The window calls this also while it is hidden (on Wayland a window that
+    /// is not shown may get no frames to draw for as long as it stays so), so that the project
+    /// keeps up with the others. [`DawApp::ui`] calls it itself when it was not called before.
+    pub fn logic(&mut self) {
+        self.session.frame();
+        self.logic_ran = true;
     }
 
     /// Starts looking for MIDI inputs, so the user can pick one.
@@ -99,11 +105,8 @@ impl DawApp {
 
     /// Runs one frame.
     pub fn ui(&mut self, ui: &mut egui::Ui) {
-        self.session.frame();
-        // The loop belongs to the transport, which others may have moved.
-        match self.session.loop_range() {
-            Some(range) => (self.loop_on, self.loop_range) = (true, range),
-            None => self.loop_on = false,
+        if !std::mem::take(&mut self.logic_ran) {
+            self.session.frame();
         }
         self.drop_stale_selection();
         self.session.live().set_target(live::target(self));
@@ -138,7 +141,6 @@ impl DawApp {
                 }
             });
         egui::CentralPanel::no_frame().show(ui, |ui| arrange::show(self, ui));
-        checkout::dialogs(self, ui.ctx());
 
         let editing = self.editing.take();
         self.session.set_editing(editing);
@@ -171,21 +173,11 @@ impl DawApp {
         self.session.set_loop(range);
     }
 
-    /// Opens the commit dialog for this user's checkout of `track`, which stops edits to it
-    /// while the samples render.
-    pub fn open_commit(&mut self, track: TrackId) {
-        if self.session.commit_state().is_none() && !self.session.start_commit(track) {
-            return;
-        }
-        if self.commit.is_none() {
-            self.commit = Some(checkout::CommitDialog::default());
-        }
-    }
-
     pub fn add_track(&mut self) {
         let project = self.session.project();
         let (count, last) = (project.track_order.len(), project.track_order.last().copied());
-        let op = new_track(self.session.ids(), count, last);
+        let instrument = self.session.default_instrument();
+        let op = new_track(self.session.ids(), count, last, instrument);
         let Op::TrackAdd { id, .. } = &op else { return };
         let id = *id;
         if self.session.edit(vec![op]) {
@@ -194,7 +186,7 @@ impl DawApp {
     }
 
     pub fn remove_track(&mut self, id: TrackId) {
-        self.session.engine_mut().note_off(id, piano_roll::PREVIEW_KEY);
+        piano_roll::stop_preview_on(self, id);
         self.session.edit(vec![Op::TrackRemove { id }]);
     }
 

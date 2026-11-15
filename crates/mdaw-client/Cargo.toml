@@ -4,7 +4,8 @@ description = "Desktop client."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+# Links JUCE 8 (AGPLv3) through the Tracktion bridge; see README, "License".
+license = "AGPL-3.0-only"
 publish.workspace = true
 
 [lints]
@@ -14,25 +15,23 @@ workspace = true
 mdaw-model.workspace = true
 mdaw-proto.workspace = true
 mdaw-sync.workspace = true
-mdaw-dsp.workspace = true
-mdaw-engine.workspace = true
 mdaw-net.workspace = true
-mdaw-plugin.workspace = true
 anyhow.workspace = true
 getrandom.workspace = true
 imbl.workspace = true
 postcard.workspace = true
-serde.workspace = true
 quinn.workspace = true
 tokio.workspace = true
 eframe.workspace = true
 egui.workspace = true
 chrono.workspace = true
+midir.workspace = true
+mdaw-tracktion.workspace = true
 
 [dev-dependencies]
 egui_kittest = { workspace = true, features = ["wgpu"] }
 mdaw-server.workspace = true
-mdaw-test-plugin = { path = "../mdaw-test-plugin" }
+mdaw-test-plugin.workspace = true
 tempfile.workspace = true
 
 [lib]
@@ -42,3 +41,20 @@ path = "src/lib.rs"
 [[bin]]
 name = "mdaw"
 path = "src/main.rs"
+
+# Drives a session on Tracktion without a window, for the tests of the collaborative slice.
+[[bin]]
+name = "mdaw-slice"
+path = "src/bin/mdaw-slice.rs"
+
+# A benchmark of the engine worker behind plugin windows; ignored, run by hand (see the file).
+[[test]]
+name = "editor_latency"
+
+# How the engine worker schedules its jobs: scan, slow state reads, windows that fail, shutdown.
+[[test]]
+name = "engine_scheduling"
+
+# Plugin windows with a display; ignored, run by hand on a virtual one (see the file).
+[[test]]
+name = "editor_gui"

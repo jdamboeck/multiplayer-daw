@@ -1,0 +1,6 @@
+[submodule "native/third_party/tracktion_engine"]
+	path = native/third_party/tracktion_engine
+	url = https://github.com/Tracktion/tracktion_engine
+[submodule "native/third_party/clap"]
+	path = native/third_party/clap
+	url = https://github.com/free-audio/clap.git

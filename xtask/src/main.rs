@@ -19,8 +19,9 @@ Options:
   --fresh           Forget the demo project and all profiles first (demo, server).
   --listen <addr>   Where the server listens (default: 127.0.0.1:7464).
   --release         Use optimised builds.
-  --no-plugins      Clients load no plugins and play tracks with plugins from their stems.
-  --test-synth      Clients also offer the built-in test synth.
+  --no-plugins      Clients load no plugins; tracks with plugins are silent in them.
+  --test-synth      Clients also offer the test synth (mdaw-test-plugin as a CLAP file, put
+                    first on the clients' CLAP_PATH).
 
 The pieces can be mixed: `cargo xtask server` in one terminal and `cargo xtask client Ann` in
 others gives the same setup as `demo`, with a server that can be stopped and started alone.
@@ -52,9 +53,13 @@ fn main() -> ExitCode {
     };
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "-h" | "--help" => {
+                print!("{USAGE}");
+                return ExitCode::SUCCESS;
+            }
             "--fresh" => options.fresh = true,
             "--release" => options.release = true,
-            "--no-plugins" | "--no-clap" => options.no_plugins = true,
+            "--no-plugins" => options.no_plugins = true,
             "--test-synth" => options.test_synth = true,
             "--listen" => match args.next() {
                 Some(addr) => options.listen = addr,
@@ -92,7 +97,7 @@ fn demo(mut options: Options) -> Result<()> {
     if options.names.is_empty() {
         options.names = vec!["Ann".into(), "Ben".into()];
     }
-    build(options.release)?;
+    build(&options)?;
     let (mut server, join) = start_server(&options)?;
     let clients: Result<Vec<Child>> = options
         .names
@@ -119,7 +124,7 @@ fn server(options: Options) -> Result<()> {
     if !options.names.is_empty() {
         return Err("server takes no names".into());
     }
-    build(options.release)?;
+    build(&options)?;
     let (mut server, join) = start_server(&options)?;
     println!("{join}");
     eprintln!("xtask: in another terminal: cargo xtask client <name>");
@@ -143,7 +148,7 @@ fn client(options: Options) -> Result<()> {
     let path = demo_dir().join("join.txt");
     let join = std::fs::read_to_string(&path)
         .map_err(|_| format!("no {}; start `cargo xtask server` first", path.display()))?;
-    build(options.release)?;
+    build(&options)?;
     let status = start_client(name, join.trim(), &options)?
         .wait()
         .map_err(|err| format!("waiting for the client: {err}"))?;
@@ -179,18 +184,16 @@ fn binary(name: &str, release: bool) -> PathBuf {
         .join(format!("{name}{}", std::env::consts::EXE_SUFFIX))
 }
 
-fn build(release: bool) -> Result<()> {
+fn build(options: &Options) -> Result<()> {
+    let release = options.release;
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let mut command = Command::new(cargo);
-    command.current_dir(root()).args([
-        "build",
-        "-p",
-        "mdaw-server",
-        "-p",
-        "mdaw-client",
-        "-p",
-        "mdaw-plugin",
-    ]);
+    command
+        .current_dir(root())
+        .args(["build", "-p", "mdaw-server", "-p", "mdaw-client"]);
+    if options.test_synth {
+        command.args(["-p", "mdaw-test-plugin"]);
+    }
     // Cargo describes xtask itself to this process. Passed on, that description makes build
     // scripts that watch it (ring's does) rebuild on every switch between xtask and plain cargo.
     for (name, _) in std::env::vars_os() {
@@ -212,10 +215,52 @@ fn build(release: bool) -> Result<()> {
         command.arg("--release");
     }
     match command.status() {
-        Ok(status) if status.success() => Ok(()),
-        Ok(status) => Err(format!("the build failed with {status}")),
-        Err(err) => Err(format!("could not run cargo: {err}")),
+        Ok(status) if status.success() => {}
+        Ok(status) => return Err(format!("the build failed with {status}")),
+        Err(err) => return Err(format!("could not run cargo: {err}")),
     }
+    copy_scanner(release)?;
+    if options.test_synth {
+        copy_test_synth(release)?;
+    }
+    Ok(())
+}
+
+/// The folder the clients find the test synth in, as a CLAP file. Not in the demo folder,
+/// which `--fresh` clears after the build.
+fn test_synth_dir() -> PathBuf {
+    target_dir().join("demo-clap")
+}
+
+/// Puts the test synth the build made into [`test_synth_dir`] as `mdaw-test-synth.clap`.
+fn copy_test_synth(release: bool) -> Result<()> {
+    let profile = if release { "release" } else { "debug" };
+    let from = target_dir()
+        .join(profile)
+        .join(format!("libmdaw_test_plugin{}", std::env::consts::DLL_SUFFIX));
+    let dir = test_synth_dir();
+    std::fs::create_dir_all(&dir).map_err(|err| format!("creating {}: {err}", dir.display()))?;
+    let to = dir.join("mdaw-test-synth.clap");
+    std::fs::copy(&from, &to)
+        .map(|_| ())
+        .map_err(|err| format!("copying {} to {}: {err}", from.display(), to.display()))
+}
+
+/// Puts the plugin scanner the native build made next to the client, where a package has it,
+/// so that the demo finds it the way an installed client does and not by the build path
+/// compiled into it.
+fn copy_scanner(release: bool) -> Result<()> {
+    let name = format!("mdaw-plugin-scan{}", std::env::consts::EXE_SUFFIX);
+    // The native build folder, as `mdaw-tracktion-sys/build.rs` chooses it.
+    let native = match std::env::var_os("MDAW_NATIVE_BUILD_DIR") {
+        Some(dir) if !dir.is_empty() => root().join(dir),
+        _ => root().join("target").join("native"),
+    };
+    let from = native.join("tracktion-bridge").join(&name);
+    let to = binary(&name, release);
+    std::fs::copy(&from, &to)
+        .map(|_| ())
+        .map_err(|err| format!("copying {} to {}: {err}", from.display(), to.display()))
 }
 
 /// Starts the server and waits for its join string, which is also left in `join.txt`.
@@ -258,7 +303,12 @@ fn start_client(name: &str, join: &str, options: &Options) -> Result<Child> {
         command.arg("--no-plugins");
     }
     if options.test_synth {
-        command.arg("--test-synth");
+        let mut path = vec![test_synth_dir()];
+        if let Some(more) = std::env::var_os("CLAP_PATH") {
+            path.extend(std::env::split_paths(&more));
+        }
+        let path = std::env::join_paths(path).map_err(|err| format!("CLAP_PATH: {err}"))?;
+        command.env("CLAP_PATH", path);
     }
     command
         .spawn()

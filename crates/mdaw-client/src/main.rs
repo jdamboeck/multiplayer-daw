@@ -3,17 +3,11 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
 
-use mdaw_client::checkout::Files;
-use mdaw_client::{DawApp, Session, Waker, profile};
-use mdaw_engine::Engine;
+use mdaw_client::audio_tracktion::{TracktionAudio, TracktionOptions};
+use mdaw_client::outbox::Outbox;
+use mdaw_client::{Audio, DawApp, Session, SilentAudio, Waker, profile};
 use mdaw_net::JoinInfo;
-
-// Debug builds stop on any allocation made inside the audio callback.
-#[cfg(debug_assertions)]
-#[global_allocator]
-static ALLOC: mdaw_engine::alloc_guard::GuardedAlloc = mdaw_engine::alloc_guard::GuardedAlloc;
 
 const USAGE: &str = "\
 mdaw, a collaborative DAW (prototype)
@@ -23,18 +17,15 @@ Usage: mdaw [--join <mdaw://...>] [--name <name>] [--profile <dir>] [--no-plugin
   --join <string>   Join the project on a server. The server prints the join string when it starts.
                     Without it, mdaw opens a local project that is not saved.
   --name <name>     The name others see. Remembered in the profile.
-  --profile <dir>   Where this install keeps its identity. Use different directories to run
-                    several clients as different people on one machine.
-  --no-plugins      Load no plugins (also --no-clap). Tracks with plugins play their stems:
-                    how they sounded at their last commit.
-  --test-synth      Also offer the built-in test synth, a plugin for trying things out that
-                    can be told to fail or crash.
+  --profile <dir>   Where this install keeps its identity, and the edits a server has not
+                    confirmed yet. Use different directories to run several clients as
+                    different people on one machine.
+  --no-plugins      Load no plugins. Tracks with plugins are silent.
   -h, --help        Show this text.
 
-Plugins are looked for in the usual CLAP folders and in CLAP_PATH.
-
-With MDAW_SYNC_LOG=1 in the environment, a joined client prints once a second where its
-playhead is against the server's clock.
+mdaw plays through Tracktion Engine, which hosts VST3, LV2 and CLAP plugins. They are looked
+for in the usual folders (CLAP also in CLAP_PATH). If the engine does not start, mdaw says why
+and runs without sound.
 ";
 
 #[derive(Default)]
@@ -43,7 +34,6 @@ struct Args {
     name: Option<String>,
     profile: Option<PathBuf>,
     no_plugins: bool,
-    test_synth: bool,
 }
 
 /// `Ok(None)` means help was asked for.
@@ -59,8 +49,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Option<Args>, String>
             }
             "--name" => parsed.name = Some(value("a name")?),
             "--profile" => parsed.profile = Some(value("a directory")?.into()),
-            "--no-plugins" | "--no-clap" => parsed.no_plugins = true,
-            "--test-synth" => parsed.test_synth = true,
+            "--no-plugins" => parsed.no_plugins = true,
             other => return Err(format!("unknown argument {other}")),
         }
     }
@@ -69,14 +58,13 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Option<Args>, String>
 
 struct Shell {
     app: DawApp,
-    /// When the sync log last wrote a line, if it is switched on.
-    sync_logged: Option<Instant>,
 }
 
 impl eframe::App for Shell {
-    /// Runs before every frame, and also while the window is hidden or covered.
+    /// Runs before every frame, and also while the window is hidden or covered: the session's
+    /// work happens here, so it goes on while nothing is drawn.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.app.session.pump_plugins();
+        self.app.logic();
         if let Some(wait) = self.app.session.next_frame_in() {
             ctx.request_repaint_after(wait);
         }
@@ -84,37 +72,7 @@ impl eframe::App for Shell {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.app.ui(ui);
-        if let Some(last) = &mut self.sync_logged
-            && last.elapsed() >= Duration::from_secs(1)
-        {
-            *last = Instant::now();
-            log_sync(&self.app.session);
-        }
-        if self.sync_logged.is_some() {
-            // A window with nothing to draw sleeps; the log goes on.
-            ui.ctx().request_repaint_after(Duration::from_secs(1));
-        }
     }
-}
-
-/// One line on where this client is in the shared transport. Lines of several clients are
-/// compared by their server time.
-fn log_sync(session: &Session) {
-    let Some(timing) = session.timing() else {
-        return;
-    };
-    let ms = |micros: i64| micros as f64 / 1000.0;
-    let drift = match timing.drift_micros {
-        Some(drift) => format!("audio {:+.2} ms off the shared playhead", ms(drift)),
-        None => "stopped".into(),
-    };
-    eprintln!(
-        "sync: server time {:.3} s, playhead at tick {:.0}, {drift}, clock known to ±{:.2} ms, {} resyncs",
-        timing.server_micros as f64 / 1e6,
-        session.position(),
-        ms(timing.rtt_micros) / 2.0,
-        timing.resyncs,
-    );
 }
 
 fn main() -> ExitCode {
@@ -130,21 +88,24 @@ fn main() -> ExitCode {
         }
     };
 
-    #[cfg(debug_assertions)]
-    mdaw_engine::alloc_guard::set_abort(true);
-
-    let engine = Engine::open().unwrap_or_else(|err| {
-        eprintln!("mdaw: no audio output ({err}); running without sound");
-        Engine::manual(48_000, true)
+    let profile_dir = args.profile.clone().or_else(profile::default_dir);
+    let Some(engine_dir) = profile_dir.as_ref().map(|dir| dir.join("engine")) else {
+        eprintln!("mdaw: no place for the profile; pass --profile <dir>");
+        return ExitCode::FAILURE;
+    };
+    let audio = tracktion_audio(&engine_dir, !args.no_plugins).unwrap_or_else(|err| {
+        eprintln!("mdaw: {err}; running without sound");
+        Box::new(SilentAudio::new())
     });
+    let engine_failed = audio.as_any().is::<SilentAudio>();
 
     // The network thread wakes the UI through this once the window exists.
     let ctx: Arc<OnceLock<egui::Context>> = Arc::default();
     let mut title = "mdaw".to_string();
     let session = match args.join {
-        None => Session::starter(engine),
+        None => Session::starter(audio),
         Some(join) => {
-            let Some(dir) = args.profile.or_else(profile::default_dir) else {
+            let Some(dir) = profile_dir else {
                 eprintln!("mdaw: no place for the profile; pass --profile <dir>");
                 return ExitCode::FAILURE;
             };
@@ -156,6 +117,7 @@ fn main() -> ExitCode {
                 }
             };
             title = format!("mdaw - {} @ {}:{}", who.name, join.host, join.port);
+            mdaw_client::trace::set_name(&who.name);
             let waker: Waker = {
                 let ctx = ctx.clone();
                 Arc::new(move || {
@@ -164,14 +126,9 @@ fn main() -> ExitCode {
                     }
                 })
             };
-            // Checkouts and forks are kept per server, inside the profile.
-            let server: String = join.fingerprint[..8].iter().map(|b| format!("{b:02x}")).collect();
-            let files = Files::new(dir.join("projects").join(server));
-            match Session::join(join, who, engine, waker) {
-                Ok(mut session) => {
-                    session.set_files(files);
-                    session
-                }
+            let outbox = Outbox::dir_for(&dir, &join);
+            match Session::join_with_outbox(join, who, &outbox, audio, waker) {
+                Ok(session) => session,
                 Err(err) => {
                     eprintln!("mdaw: {err:#}");
                     return ExitCode::FAILURE;
@@ -181,8 +138,8 @@ fn main() -> ExitCode {
     };
 
     let mut session = session;
-    if !args.no_plugins {
-        session.enable_plugins(mdaw_plugin::Host::standard(args.test_synth));
+    if engine_failed {
+        session.notify("The audio engine did not start, so mdaw plays nothing; see the terminal for why.");
     }
 
     let options = eframe::NativeOptions {
@@ -197,13 +154,9 @@ fn main() -> ExitCode {
         Box::new(move |cc| {
             DawApp::setup(&cc.egui_ctx);
             let _ = ctx.set(cc.egui_ctx.clone());
-            let sync_log = std::env::var_os("MDAW_SYNC_LOG").is_some_and(|value| value != "0");
             let mut app = DawApp::new(session);
             app.enable_midi();
-            Ok(Box::new(Shell {
-                app,
-                sync_logged: sync_log.then(Instant::now),
-            }))
+            Ok(Box::new(Shell { app }))
         }),
     );
     match run {
@@ -213,4 +166,23 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Tracktion Engine on the default audio device, its settings in `dir`. Plugins are looked
+/// for on a thread of the engine's while the window opens.
+fn tracktion_audio(dir: &std::path::Path, plugins: bool) -> Result<Box<dyn Audio>, String> {
+    let mut options = TracktionOptions::new(dir);
+    options.open_audio_device = true;
+    options.enable_plugins = plugins;
+    let audio = TracktionAudio::new(options).map_err(|e| format!("the audio engine did not start: {e}"))?;
+    let state = audio.engine().state();
+    if state.device_open {
+        eprintln!(
+            "mdaw: Tracktion Engine, audio device open at {} Hz, {} frames",
+            state.sample_rate, state.block_size
+        );
+    } else {
+        eprintln!("mdaw: Tracktion Engine, no audio device opened; running without sound");
+    }
+    Ok(Box::new(audio))
 }

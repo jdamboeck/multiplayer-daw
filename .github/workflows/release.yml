@@ -7,50 +7,69 @@ on:
 permissions:
   contents: write
 
+# Linux only, as CI: the Tracktion bridge builds on Linux only so far.
 jobs:
   build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: linux-x86_64
-            exe: ""
-          - os: windows-latest
-            target: windows-x86_64
-            exe: ".exe"
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
+    env:
+      TARGET: linux-x86_64
     steps:
       - uses: actions/checkout@v4
+      - name: Submodules
+        run: git -c url."https://github.com/".insteadOf="git@github.com:" submodule update --init --recursive --depth 1
       - uses: dtolnay/rust-toolchain@1.97.1
       - uses: Swatinem/rust-cache@v2
         with:
           key: release
-      - name: Linux audio and windowing headers
-        if: runner.os == 'Linux'
+      - name: System packages
         run: |
           sudo apt-get update
-          sudo apt-get install -y libasound2-dev libjack-jackd2-dev libpipewire-0.3-dev libclang-dev libx11-dev libxcb1-dev libxkbcommon-dev libwayland-dev
-      - run: cargo build --release --locked -p mdaw-client -p mdaw-server -p mdaw-plugin
-      - name: Package
-        shell: bash
+          sudo apt-get install -y cmake ninja-build pkg-config \
+            libasound2-dev libjack-jackd2-dev libx11-dev libxcb1-dev libxkbcommon-dev libwayland-dev \
+            libxext-dev libxrandr-dev libxinerama-dev libxcursor-dev libxcomposite-dev libxrender-dev \
+            libfreetype-dev libfontconfig1-dev ladspa-sdk
+      # The native build folder is the same for every Cargo profile (target/native, CMake build
+      # type RelWithDebInfo): the release build links what CI built. Restored only, as in CI's
+      # key; on a miss it is built here (about ten minutes). See ci.yml for the source times.
+      - name: Native cache key
+        id: native-key
         run: |
-          name="mdaw-${GITHUB_REF_NAME}-${{ matrix.target }}"
-          mkdir "$name"
-          cp "target/release/mdaw${{ matrix.exe }}" "target/release/mdaw-server${{ matrix.exe }}" README.md "$name/"
-          # The helper that runs each plugin in a process of its own (Linux).
-          if [ "$RUNNER_OS" = "Linux" ]; then cp target/release/mdaw-plugin-host "$name/"; fi
-          cp LICENSE* "$name/" 2>/dev/null || true
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            7z a "$name.zip" "$name" > /dev/null
-            echo "ASSET=$name.zip" >> "$GITHUB_ENV"
-          else
-            tar czf "$name.tar.gz" "$name"
-            echo "ASSET=$name.tar.gz" >> "$GITHUB_ENV"
+          modules=$(git submodule status --recursive | sha256sum | cut -c1-16)
+          sources=$(git ls-files -s -- native | sha256sum | cut -c1-16)
+          echo "prefix=native-$ImageOS-$modules-" >> "$GITHUB_OUTPUT"
+          echo "key=native-$ImageOS-$modules-$sources" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache/restore@v4
+        id: native-cache
+        with:
+          path: target/native
+          key: ${{ steps.native-key.outputs.key }}
+          restore-keys: ${{ steps.native-key.outputs.prefix }}
+      - name: Native source times
+        run: |
+          [ -f target/native/CMakeCache.txt ] || exit 0
+          git submodule foreach --recursive --quiet 'git ls-files -z | xargs -0 -r touch -h -d 2000-01-01T00:00:00Z'
+          if [ "${{ steps.native-cache.outputs.cache-hit }}" = "true" ]; then
+            git ls-files -z -- native | xargs -0 -r touch -h -d 2000-01-01T00:00:00Z
           fi
+      # mdaw-tracktion-sys's build script builds the plugin scanner too, into
+      # target/native/tracktion-bridge/.
+      - run: cargo build --release --locked -p mdaw-client -p mdaw-server
+      # The scanner goes next to `mdaw`, where the client looks for it
+      # (mdaw_tracktion::scanner_path). The native parts carry debug information
+      # (RelWithDebInfo); it is stripped from the packaged copies.
+      - name: Package
+        run: |
+          name="mdaw-${GITHUB_REF_NAME}-${TARGET}"
+          mkdir "$name"
+          cp target/release/mdaw target/release/mdaw-server \
+            target/native/tracktion-bridge/mdaw-plugin-scan "$name/"
+          strip "$name/mdaw" "$name/mdaw-server" "$name/mdaw-plugin-scan"
+          cp README.md LICENSE* "$name/"
+          tar czf "$name.tar.gz" "$name"
+          echo "ASSET=$name.tar.gz" >> "$GITHUB_ENV"
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.target }}
+          name: ${{ env.TARGET }}
           path: ${{ env.ASSET }}
 
   release:
@@ -58,6 +77,10 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
+      # Only for the release notes, docs/releases/<version>.md (tag v0.2.0 -> 0.2.0.md).
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: docs/releases
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -66,7 +89,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          notes="docs/releases/${GITHUB_REF_NAME#v}.md"
+          if [ ! -f "$notes" ]; then
+            echo "no release notes: $notes is missing" >&2
+            exit 1
+          fi
           gh release create "$GITHUB_REF_NAME" dist/* \
             --repo "$GITHUB_REPOSITORY" \
             --title "mdaw ${GITHUB_REF_NAME#v}" \
-            --notes "Prototype build after milestone M5: live editing, shared transport, checkout and commit with changelog samples, and live MIDI. Unzip and run \`mdaw-server\`, then \`mdaw --join '<join string>' --name <you>\`. The Linux build needs PipeWire and ALSA libraries."
+            --notes-file "$notes"

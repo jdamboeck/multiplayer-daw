@@ -1,18 +1,15 @@
 //! The project server. One process serves one project: it orders the clients' edits into a log,
-//! stores the log, and sends every client every event. It also keeps what is shared but not stored:
-//! who is there, and the transport with the clock it runs on.
+//! stores the log, and sends every client every event. It also passes on what is shared but not
+//! stored: who is there and what they are busy with.
 
 mod blobs;
-mod clock;
 mod hub;
-mod relay;
 mod sequencer;
 mod server;
 mod store;
 
 pub use blobs::Blobs;
-pub use clock::Clock;
 pub use hub::{Hub, Sink};
-pub use sequencer::Sequencer;
+pub use sequencer::{Prepared, Sequencer};
 pub use server::{Config, Server};
-pub use store::Store;
+pub use store::{Receipt, Store};

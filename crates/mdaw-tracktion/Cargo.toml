@@ -1,0 +1,24 @@
+[package]
+name = "mdaw-tracktion"
+description = "Safe Rust API to the Tracktion Engine bridge, and the mapping from the canonical project model to it."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+# Links JUCE 8 (AGPLv3) through the Tracktion bridge; see README, "License".
+license = "AGPL-3.0-only"
+publish.workspace = true
+build = "build.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+mdaw-tracktion-sys.workspace = true
+mdaw-model.workspace = true
+imbl.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+mdaw-test-plugin.workspace = true
+tempfile.workspace = true

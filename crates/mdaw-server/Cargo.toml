@@ -1,6 +1,6 @@
 [package]
 name = "mdaw-server"
-description = "Project server: sequencing, persistence, blob store and relays."
+description = "Project server: sequencing, persistence, blob store and presence."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

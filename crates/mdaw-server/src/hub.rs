@@ -1,18 +1,19 @@
 //! One project and everyone connected to it. Runs on a single thread: whatever order commands
 //! arrive in is the order of the log.
+//!
+//! A transaction is decided, then written to disk, and only then applied and told to anyone
+//! (see [`Hub::submit`]): no client ever hears of an event the disk does not have.
 
 use crate::blobs::Blobs;
-use crate::clock::Clock;
 use crate::sequencer::Sequencer;
-use crate::store::Run;
-use crate::store::Store;
+use crate::store::{Receipt, Run, Store};
 use anyhow::{Context, Result};
-use mdaw_model::{ActorId, DEFAULT_MILLI_BPM, IdGen, Op, Project, TempoPoint, Tick, TrackId, UserId, apply};
+use mdaw_model::{ActorId, DEFAULT_MILLI_BPM, IdGen, Op, Project, TempoPoint, Tick, UserId, apply};
 use mdaw_proto::{
-    ClientMsg, CommitRequest, Event, Hello, LEASE_STALE_SECS, PROTO_VERSION, Peer, Presence, RefuseReason,
-    RejectReason, Request, Sample, ServerMsg, SyncData, TransportState, Txn, Welcome, apply_event,
+    ClientMsg, Event, Hello, PROTO_VERSION, Peer, Presence, RefuseReason, ServerMsg, SyncData, Txn, Welcome,
+    apply_event,
 };
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// A snapshot of the document is stored every this many events, so opening a project does not
@@ -22,7 +23,7 @@ const SNAPSHOT_EVERY: u64 = 1000;
 /// A client missing more events than this gets the whole document instead.
 const CATCH_UP_LIMIT: u64 = 5000;
 
-/// Changelog entries a new client gets with the document.
+/// History entries a new client gets with the document.
 const HISTORY: usize = 200;
 /// A catch-up of more bytes than this is sent as a snapshot instead.
 const CATCH_UP_BYTES: usize = 64 << 20;
@@ -40,8 +41,6 @@ struct Session {
     user: UserId,
     name: String,
     sink: Sink,
-    /// The highest transaction ID of this connection sequenced or rejected so far.
-    last_txn: Option<u64>,
 }
 
 pub struct Hub {
@@ -50,19 +49,12 @@ pub struct Hub {
     token: String,
     key: [u8; 32],
     sessions: BTreeMap<ActorId, Session>,
-    /// `last_txn` of connections that have ended, for when their clients resume.
-    departed: HashMap<ActorId, Option<u64>>,
     snapshot_seq: u64,
+    /// A client missing more events than this gets the whole document instead.
+    catch_up_limit: u64,
     /// Every start of the server, oldest first.
     runs: Vec<Run>,
-    clock: Clock,
-    /// The shared transport. Lives as long as the process.
-    transport: TransportState,
     blobs: Blobs,
-    /// When the owner of each checkout last renewed its lease, on `clock`.
-    leases: BTreeMap<TrackId, i64>,
-    /// The checkouts last announced as stale.
-    stale: Vec<TrackId>,
 }
 
 impl Hub {
@@ -72,7 +64,7 @@ impl Hub {
             Some(token) => String::from_utf8(token).context("stored token")?,
             None => {
                 let token = hex(&random::<16>()?);
-                store.set_meta_durably("token", token.as_bytes())?;
+                store.set_meta("token", token.as_bytes())?;
                 token
             }
         };
@@ -80,7 +72,7 @@ impl Hub {
             Some(key) => key.as_slice().try_into().ok().context("stored session key")?,
             None => {
                 let key = random::<32>()?;
-                store.set_meta_durably("session_key", &key)?;
+                store.set_meta("session_key", &key)?;
                 key
             }
         };
@@ -104,29 +96,24 @@ impl Hub {
         }
         let recent = store.events_after(head.saturating_sub(4096), 4096)?;
         let runs = store.start_run(head)?;
-        let clock = Clock::new();
-        // After a restart every owner gets a full lease to come back.
-        let leases = doc
-            .tracks
-            .iter()
-            .filter(|(_, t)| t.checkout.is_some())
-            .map(|(&id, _)| (id, clock.micros()))
-            .collect();
         Ok(Self {
             store,
             seq: Sequencer::new(doc, head, recent),
             token,
             key,
             sessions: BTreeMap::new(),
-            departed: HashMap::new(),
             snapshot_seq,
-            clock,
-            transport: TransportState::default(),
+            catch_up_limit: CATCH_UP_LIMIT,
             blobs,
-            leases,
-            stale: Vec::new(),
             runs,
         })
+    }
+
+    /// Sends a client missing more than `limit` events the whole document instead. For tests
+    /// of the snapshot path, which otherwise takes thousands of events to reach.
+    pub fn with_catch_up_limit(mut self, limit: u64) -> Self {
+        self.catch_up_limit = limit;
+        self
     }
 
     /// The secret clients need to join.
@@ -142,22 +129,8 @@ impl Hub {
         self.seq.head()
     }
 
-    /// The clock the transport's anchors are measured on.
-    pub fn clock(&self) -> Clock {
-        self.clock
-    }
-
-    pub fn transport(&self) -> &TransportState {
-        &self.transport
-    }
-
     pub fn blobs(&self) -> &Blobs {
         &self.blobs
-    }
-
-    /// The checkouts whose lease ran out, as last announced.
-    pub fn stale(&self) -> &[TrackId] {
-        &self.stale
     }
 
     /// Admits a client. Its `Welcome` is the first thing `sink` receives; from then on it gets
@@ -183,22 +156,15 @@ impl Hub {
             r.session_secret == self.secret(r.prev_actor) && r.last_seq <= head && !lost
         });
         let mut history = Vec::new();
-        let (sync, acked) = match resume {
+        let sync = match resume {
             Some(resume) => {
-                // Whatever connection the client had before is replaced by this one.
+                // Whatever connection the client had before is replaced by this one, so it
+                // leaves the peers at once. What it sent and was not answered comes again on
+                // this one; receipts make that safe.
                 self.remove(resume.prev_actor);
-                let acked = match self.departed.get(&resume.prev_actor) {
-                    Some(last) => *last,
-                    // The server restarted in between. What it rejected back then is forgotten
-                    // and comes in again, to be rejected again.
-                    None => self
-                        .store
-                        .last_txn(resume.prev_actor)
-                        .expect("reading the event log"),
-                };
-                (self.catch_up(resume.last_seq), acked)
+                self.catch_up(resume.last_seq)
             }
-            None => (SyncData::Snapshot(self.seq.doc().clone()), None),
+            None => SyncData::Snapshot(self.seq.doc().clone()),
         };
         if matches!(sync, SyncData::Snapshot(_)) {
             history = self.seq.history(HISTORY);
@@ -223,7 +189,6 @@ impl Hub {
                 user,
                 name,
                 sink: Box::new(|_| true),
-                last_txn: None,
             },
         );
         let welcome = Welcome {
@@ -232,11 +197,8 @@ impl Hub {
             session_secret: self.secret(actor),
             head_seq: head,
             sync,
-            acked,
             peers: self.peers(),
-            transport: self.transport,
             history,
-            stale: self.stale.clone(),
         };
         if !sink(ServerMsg::Welcome(Box::new(welcome))) {
             self.sessions.remove(&actor);
@@ -254,177 +216,81 @@ impl Hub {
             ClientMsg::Hello(_) => self.leave(actor),
             ClientMsg::Submit(txn) => self.submit(actor, txn),
             ClientMsg::Presence(presence) => self.presence(actor, presence),
-            ClientMsg::SetTransport(state) => self.set_transport(actor, state),
-            ClientMsg::Checkout { track } => self.checkout(actor, track),
-            ClientMsg::LeaseRenew { track } => self.renew(actor, track),
-            ClientMsg::Release { track } => self.release(actor, track, false),
-            ClientMsg::ForceRelease { track } => self.release(actor, track, true),
-            ClientMsg::Commit(commit) => self.commit(actor, *commit),
-            ClientMsg::Attach { entry_seq, sample } => self.attach(actor, entry_seq, sample),
         }
     }
 
-    pub fn checkout(&mut self, actor: ActorId, track: TrackId) {
-        let Some(user) = self.sessions.get(&actor).map(|s| s.user) else {
-            return;
-        };
-        let result = self.seq.checkout(actor, user, now_millis(), track);
-        if result.is_ok() {
-            self.leases.insert(track, self.clock.micros());
-        }
-        self.settle(actor, Request::Checkout(track), result);
-    }
-
-    pub fn release(&mut self, actor: ActorId, track: TrackId, forced: bool) {
-        let Some(user) = self.sessions.get(&actor).map(|s| s.user) else {
-            return;
-        };
-        let result = self.seq.release(actor, user, now_millis(), track, forced);
-        let request = if forced {
-            Request::ForceRelease(track)
-        } else {
-            Request::Release(track)
-        };
-        self.settle(actor, request, result);
-    }
-
-    pub fn commit(&mut self, actor: ActorId, commit: CommitRequest) {
-        let Some(user) = self.sessions.get(&actor).map(|s| s.user) else {
-            return;
-        };
-        let request = Request::Commit(commit.track);
-        let now = self.clock.micros();
-        let tempo = self.transport.running(now).then(|| self.seq.doc().tempo_map());
-        let blobs = &self.blobs;
-        let result = self
-            .seq
-            .commit(actor, user, now_millis(), commit, |h| blobs.has(h));
-        let accepted = result.is_ok();
-        self.settle(actor, request, result);
-        if accepted {
-            self.follow_tempo(now, tempo);
-        }
-    }
-
-    pub fn attach(&mut self, actor: ActorId, entry_seq: u64, sample: Sample) {
-        let Some(user) = self.sessions.get(&actor).map(|s| s.user) else {
-            return;
-        };
-        let blobs = &self.blobs;
-        let result = self
-            .seq
-            .attach(actor, user, now_millis(), entry_seq, sample, |h| blobs.has(h));
-        self.settle(actor, Request::Attach(entry_seq), result);
-    }
-
-    /// The owner of a checkout is still at it.
-    pub fn renew(&mut self, actor: ActorId, track: TrackId) {
-        let Some(user) = self.sessions.get(&actor).map(|s| s.user) else {
-            return;
-        };
-        let owned = self
-            .seq
-            .doc()
-            .track(track)
-            .and_then(|t| t.checkout)
-            .is_some_and(|c| c.user == user);
-        if owned {
-            self.leases.insert(track, self.clock.micros());
-            self.check_leases();
-        }
-    }
-
-    /// Looks at the time. Call about once a second.
-    pub fn tick(&mut self) {
-        self.check_leases();
-    }
-
-    /// Announces the checkouts whose lease ran out, when that set changes.
-    fn check_leases(&mut self) {
-        let now = self.clock.micros();
-        let limit = LEASE_STALE_SECS as i64 * 1_000_000;
-        let doc = self.seq.doc();
-        self.leases
-            .retain(|id, _| doc.track(*id).is_some_and(|t| t.checkout.is_some()));
-        let stale: Vec<TrackId> = self
-            .leases
-            .iter()
-            .filter(|(_, at)| now - **at > limit)
-            .map(|(id, _)| *id)
-            .collect();
-        if stale != self.stale {
-            self.stale = stale.clone();
-            self.broadcast(None, &ServerMsg::Stale(stale));
-        }
-    }
-
-    /// Stores and sends an accepted event, or tells the asker why not.
-    fn settle(&mut self, actor: ActorId, request: Request, result: Result<Event, RejectReason>) {
-        match result {
-            Ok(event) => {
-                self.record(event);
-                self.check_leases();
-            }
-            Err(reason) => {
-                let Some(session) = self.sessions.get_mut(&actor) else {
-                    return;
-                };
-                if !(session.sink)(ServerMsg::Denied { request, reason }) {
-                    self.leave(actor);
-                }
-            }
-        }
-    }
-
-    /// Puts a sequenced event on disk and sends it to everyone.
-    fn record(&mut self, event: Event) {
-        // A log the disk refuses cannot be continued in memory: clients would hold events that
-        // are gone after a restart.
-        self.store.append(&event).expect("appending to the event log");
-        if event.seq - self.snapshot_seq >= SNAPSHOT_EVERY {
-            self.store
-                .put_snapshot(event.seq, self.seq.doc())
-                .expect("storing a snapshot");
-            self.snapshot_seq = event.seq;
-        }
-        self.broadcast(None, &ServerMsg::Event(event));
-    }
-
-    /// After an event: if the tempo changed under a running transport, keeps the playhead
-    /// where it was. `old` is the tempo map before the event, taken only while running.
-    fn follow_tempo(&mut self, now: i64, old: Option<mdaw_model::TempoMap>) {
-        if let Some(old) = old.filter(|old| *old != self.seq.doc().tempo_map()) {
-            // Everyone was where the old tempo put them. Going on from there keeps the music
-            // continuous; the old anchor under the new tempo would be a jump.
-            self.transport = self.transport.reanchored(now, &old);
-            self.transport.epoch += 1;
-            let state = self.transport;
-            self.broadcast(None, &ServerMsg::Transport { state, by: None });
-        }
-    }
-
+    /// Takes a transaction from a client. Exactly one of these happens:
+    ///
+    /// - The sender's user sent this transaction before: the sender alone gets the answer it got
+    ///   then, `Accepted` with the event's seq or the same `Rejected`. Nothing else happens.
+    /// - It is refused: the refusal is stored as its receipt, then the sender gets `Rejected`.
+    /// - It is taken: its event and its receipt are committed to disk together. Only once the
+    ///   commit has returned is the event applied to the document in memory and sent to
+    ///   everyone, the sender included.
+    ///
+    /// If the disk refuses a write, nothing of the transaction is applied or sent, and the
+    /// sender's connection is dropped; it will send the transaction again when it is back.
     pub fn submit(&mut self, actor: ActorId, txn: Txn) {
-        let Some(session) = self.sessions.get_mut(&actor) else {
+        let Some(session) = self.sessions.get(&actor) else {
             return;
         };
-        let client_txn_id = txn.client_txn_id;
-        session.last_txn = session.last_txn.max(Some(client_txn_id));
-        let now = self.clock.micros();
-        // While the transport runs, a change of tempo changes where the playhead is.
-        let tempo = self.transport.running(now).then(|| self.seq.doc().tempo_map());
-        match self.seq.sequence(actor, session.user, now_millis(), txn) {
-            Ok(event) => {
-                self.record(event);
-                self.follow_tempo(now, tempo);
-            }
-            Err(reason) => {
-                if !(session.sink)(ServerMsg::Rejected {
-                    client_txn_id,
-                    reason,
-                }) {
-                    self.leave(actor);
+        let (user, id) = (session.user, txn.id);
+        let receipt = match self.store.receipt(user, id) {
+            Ok(receipt) => receipt,
+            Err(err) => return self.fail(actor, err),
+        };
+        let answer = match receipt {
+            Some(Receipt::Accepted(seq)) => ServerMsg::Accepted { txn: id, seq },
+            Some(Receipt::Rejected(reason)) => ServerMsg::Rejected { txn: id, reason },
+            None => {
+                let blobs = &self.blobs;
+                match self.seq.prepare(actor, user, now_millis(), txn, |h| blobs.has(h)) {
+                    Ok(prepared) => {
+                        // Decided; now on disk, event and receipt in one commit.
+                        if let Err(err) = self.store.append(user, prepared.event()) {
+                            // Dropping `prepared` leaves the document and the log in memory as
+                            // they are on disk.
+                            return self.fail(actor, err);
+                        }
+                        // On disk: from here on it may be applied and told.
+                        let event = self.seq.commit(prepared);
+                        self.snapshot_if_due();
+                        self.broadcast(None, &ServerMsg::Event(event));
+                        return;
+                    }
+                    Err(reason) => {
+                        if let Err(err) = self.store.reject(user, id, &reason) {
+                            return self.fail(actor, err);
+                        }
+                        ServerMsg::Rejected { txn: id, reason }
+                    }
                 }
             }
+        };
+        let session = self.sessions.get_mut(&actor).expect("looked up above");
+        if !(session.sink)(answer) {
+            self.leave(actor);
+        }
+    }
+
+    /// The disk refused a write for `actor`'s transaction. Nothing was applied or sent; the
+    /// client loses its connection, comes back, and sends what it has pending again.
+    fn fail(&mut self, actor: ActorId, err: anyhow::Error) {
+        eprintln!("mdaw-server: an edit could not be stored, dropping its sender ({actor:?}): {err:#}");
+        self.leave(actor);
+    }
+
+    /// Stores the document now and then, so opening the project does not replay the whole log.
+    /// A snapshot is only a shortcut: the events it sums up are on disk already, so one that
+    /// cannot be written is skipped.
+    fn snapshot_if_due(&mut self) {
+        let head = self.seq.head();
+        if head - self.snapshot_seq < SNAPSHOT_EVERY {
+            return;
+        }
+        match self.store.put_snapshot(head, self.seq.doc()) {
+            Ok(()) => self.snapshot_seq = head,
+            Err(err) => eprintln!("mdaw-server: could not store a snapshot at event {head}: {err:#}"),
         }
     }
 
@@ -434,40 +300,11 @@ impl Hub {
         }
     }
 
-    /// Any client may move the shared transport; the last request wins. Everyone is told,
-    /// the one who asked too: the state counts from the server's answer on.
-    pub fn set_transport(&mut self, actor: ActorId, wanted: TransportState) {
-        if !self.sessions.contains_key(&actor) {
-            return;
-        }
-        let by = Some(actor);
-        match wanted.accepted(self.clock.micros(), &self.transport) {
-            Some(state) => {
-                self.transport = state;
-                self.broadcast(None, &ServerMsg::Transport { state, by });
-            }
-            None => {
-                // The client already acts on what it asked for: put it right.
-                let state = self.transport;
-                let current = ServerMsg::Transport { state, by };
-                let session = self.sessions.get_mut(&actor).expect("checked above");
-                if !(session.sink)(current) {
-                    self.leave(actor);
-                }
-            }
-        }
-    }
-
     /// The client's connection ended.
     pub fn leave(&mut self, actor: ActorId) {
         if self.remove(actor) {
             self.broadcast_peers();
         }
-    }
-
-    /// The user behind a connected actor. A made-up one for an actor that is gone.
-    pub fn user_of(&self, actor: ActorId) -> UserId {
-        self.sessions.get(&actor).map_or(UserId(0), |s| s.user)
     }
 
     pub fn peers(&self) -> Vec<Peer> {
@@ -482,40 +319,21 @@ impl Hub {
     }
 
     fn remove(&mut self, actor: ActorId) -> bool {
-        let Some(session) = self.sessions.remove(&actor) else {
-            return false;
-        };
-        if self.departed.len() >= 4096 {
-            self.departed.clear();
-        }
-        self.departed.insert(actor, session.last_txn);
-        if self.sessions.is_empty() && self.transport.playing {
-            // Nobody listens: whoever comes next finds the playhead where it was left.
-            let now = self.clock.micros();
-            let tick = self.transport.position(now, &self.seq.doc().tempo_map());
-            self.transport = TransportState {
-                playing: false,
-                anchor_tick: tick.round(),
-                anchor_server_micros: now,
-                loop_range: self.transport.loop_range,
-                epoch: self.transport.epoch + 1,
-            };
-        }
-        true
+        self.sessions.remove(&actor).is_some()
     }
 
     fn catch_up(&self, last_seq: u64) -> SyncData {
-        if self.seq.head() - last_seq > CATCH_UP_LIMIT {
+        if self.seq.head() - last_seq > self.catch_up_limit {
             return SyncData::Snapshot(self.seq.doc().clone());
         }
         let events = match self.seq.events_after(last_seq) {
             Some(events) => events,
             None => self
                 .store
-                .events_after(last_seq, CATCH_UP_LIMIT)
+                .events_after(last_seq, self.catch_up_limit)
                 .expect("reading the event log"),
         };
-        // Large commits make few events many bytes; past the budget a snapshot is smaller.
+        // Large edits make few events many bytes; past the budget a snapshot is smaller.
         let bytes: usize = events.iter().map(encoded_len).sum();
         if bytes > CATCH_UP_BYTES {
             return SyncData::Snapshot(self.seq.doc().clone());
