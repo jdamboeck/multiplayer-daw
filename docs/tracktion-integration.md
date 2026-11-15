@@ -75,6 +75,12 @@ cmake --build target/native --target mdaw-te-spike
 The spike binary is
 `target/native/spike/mdaw-te-spike_artefacts/RelWithDebInfo/mdaw-te-spike`.
 
+The native code is built with `-g1` (function names and line numbers for backtraces, no local
+variables), and Cargo builds dependencies with line tables only, so that the test binaries stay
+small. For full debug info of the native side, configure once with
+`cmake -S native -B target/native -DMDAW_NATIVE_FULL_DEBUG=ON` and build again (about ten
+minutes); `-DMDAW_NATIVE_FULL_DEBUG=OFF` goes back.
+
 `native/CMakeLists.txt` passes `-Wno-template-body`: GCC 15 and later reject the bundled
 `nanorange.hpp` without it. Older GCC ignores the unknown option (see the comment there). The
 build is C++20.

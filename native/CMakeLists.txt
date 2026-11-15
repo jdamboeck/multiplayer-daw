@@ -12,6 +12,17 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE RelWithDebInfo)
 endif()
 
+# RelWithDebInfo with -g1 instead of -g: function names and line tables, so a crash in the
+# plugin host still gives a backtrace with file:line, but no local variables or types. Full
+# debug info made every Rust binary that links the bridge about 800 MB (some 240 MB of it from
+# here) and target/debug grow to 60 GB. Set before JUCE and Tracktion are added, so they get it
+# too; a normal variable, so it also wins over the -g already in an existing cache.
+option(MDAW_NATIVE_FULL_DEBUG "Build the native code with full debug info (-g)" OFF)
+if(NOT MDAW_NATIVE_FULL_DEBUG AND NOT MSVC)
+    set(CMAKE_C_FLAGS_RELWITHDEBINFO "-O2 -g1 -DNDEBUG")
+    set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O2 -g1 -DNDEBUG")
+endif()
+
 set(MDAW_TE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/tracktion_engine")
 if(NOT EXISTS "${MDAW_TE_DIR}/modules/juce/CMakeLists.txt")
     message(FATAL_ERROR
