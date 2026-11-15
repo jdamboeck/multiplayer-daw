@@ -223,10 +223,31 @@ fn build(options: &Options) -> Result<()> {
         command.args(["--features", "mdaw-client/tracktion"]);
     }
     match command.status() {
-        Ok(status) if status.success() => Ok(()),
-        Ok(status) => Err(format!("the build failed with {status}")),
-        Err(err) => Err(format!("could not run cargo: {err}")),
+        Ok(status) if status.success() => {}
+        Ok(status) => return Err(format!("the build failed with {status}")),
+        Err(err) => return Err(format!("could not run cargo: {err}")),
     }
+    if options.tracktion {
+        copy_scanner(release)?;
+    }
+    Ok(())
+}
+
+/// Puts the plugin scanner the native build made next to the client, where a package has it,
+/// so that the demo finds it the way an installed client does and not by the build path
+/// compiled into it.
+fn copy_scanner(release: bool) -> Result<()> {
+    let name = format!("mdaw-plugin-scan{}", std::env::consts::EXE_SUFFIX);
+    // The native build folder, as `mdaw-tracktion-sys/build.rs` chooses it.
+    let native = match std::env::var_os("MDAW_NATIVE_BUILD_DIR") {
+        Some(dir) if !dir.is_empty() => root().join(dir),
+        _ => root().join("target").join("native"),
+    };
+    let from = native.join("tracktion-bridge").join(&name);
+    let to = binary(&name, release);
+    std::fs::copy(&from, &to)
+        .map(|_| ())
+        .map_err(|err| format!("copying {} to {}: {err}", from.display(), to.display()))
 }
 
 /// Starts the server and waits for its join string, which is also left in `join.txt`.

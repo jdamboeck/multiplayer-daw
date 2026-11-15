@@ -2726,6 +2726,7 @@ dependencies = [
  "mdaw-tracktion-sys",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

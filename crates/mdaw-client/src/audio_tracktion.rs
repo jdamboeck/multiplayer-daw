@@ -404,9 +404,20 @@ impl TracktionAudio {
         let mut config = Config::new("mdaw", &options.settings_dir);
         config.open_audio_device = options.open_audio_device;
         config.enable_plugins = options.enable_plugins;
-        config.scanner_path = mdaw_tracktion::built_scanner_path().map(Path::to_path_buf);
+        config.scanner_path = mdaw_tracktion::scanner_path();
+        let in_process = options.enable_plugins && config.scanner_path.is_none();
         let engine = Arc::new(Engine::new(config).map_err(|e| e.to_string())?);
         let shared = Arc::new(Mutex::new(Shared::default()));
+        if in_process {
+            // Said once, at start: the engine works without the scanner, only less safely.
+            let notice = format!(
+                "{} not found: plugins are examined inside mdaw, and one that crashes while \
+                 being examined ends it",
+                mdaw_tracktion::SCANNER
+            );
+            eprintln!("mdaw: {notice}");
+            lock(&shared).notices.push(notice);
+        }
         let queue = Arc::new(Queue::new());
         let worker = Worker {
             engine: engine.clone(),

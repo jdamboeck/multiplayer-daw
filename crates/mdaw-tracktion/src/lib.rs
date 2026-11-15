@@ -32,12 +32,45 @@ pub fn abi_version() -> u32 {
     sys::mdaw_abi_version()
 }
 
-/// The plugin scanner (`mdaw-plugin-scan`) the build made, for [`Config::scanner_path`]: a path
-/// fixed at compile time, inside the build folder (`target/native`). Right for tests and
-/// development runs; a packaged application will ship the scanner next to its executable and
-/// pass that path instead. `None` if the build gave none.
+/// The plugin scanner (`mdaw-plugin-scan`) the build made: a path fixed at compile time,
+/// inside the build folder (`target/native`). Tests use it to find the build's fixtures; an
+/// application asks [`scanner_path`], which also looks next to its executable. `None` if the
+/// build gave none.
 pub fn built_scanner_path() -> Option<&'static Path> {
     option_env!("MDAW_TRACKTION_BUILT_SCANNER").map(Path::new)
+}
+
+/// The scanner's file name.
+pub const SCANNER: &str = if cfg!(windows) {
+    "mdaw-plugin-scan.exe"
+} else {
+    "mdaw-plugin-scan"
+};
+
+/// The plugin scanner to run, for [`Config::scanner_path`]: `MDAW_PLUGIN_SCAN` if it names a
+/// file; else [`SCANNER`] beside the running program, where a package puts it (or one folder
+/// up, as for test binaries in `target/debug/deps`); else the one the build made, for
+/// development runs from a source tree. `None` if none of them exists: plugins are then
+/// examined in process.
+pub fn scanner_path() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok();
+    find_scanner(
+        std::env::var_os("MDAW_PLUGIN_SCAN").map(PathBuf::from),
+        exe.as_deref(),
+        built_scanner_path(),
+    )
+}
+
+fn find_scanner(from_env: Option<PathBuf>, exe: Option<&Path>, built: Option<&Path>) -> Option<PathBuf> {
+    let dir = exe.and_then(Path::parent);
+    let beside = dir.map(|d| d.join(SCANNER));
+    let above = dir.and_then(Path::parent).map(|d| d.join(SCANNER));
+    from_env
+        .into_iter()
+        .chain(beside)
+        .chain(above)
+        .chain(built.map(Path::to_path_buf))
+        .find(|p| p.is_file())
 }
 
 // ---- errors ------------------------------------------------------------------------------------
@@ -194,7 +227,7 @@ pub struct Config {
     pub audio_backend: Option<String>,
     /// VST3, LV2 and CLAP as well as the built-in instruments.
     pub enable_plugins: bool,
-    /// The plugin scanner executable (`mdaw-plugin-scan`, see [`built_scanner_path`]). With it,
+    /// The plugin scanner executable (`mdaw-plugin-scan`, see [`scanner_path`]). With it,
     /// plugin files are examined in child processes, so a plugin that crashes or hangs while it
     /// is looked at cannot take the application down, and listing plugins or adding a device
     /// never loads a library just to identify it. `None`: examined in this process.
@@ -867,6 +900,39 @@ fn param_id_text(raw: &[c_char; 64]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scanner_is_looked_for_in_order() {
+        let root = tempfile::tempdir().unwrap();
+        let deps = root.path().join("debug").join("deps");
+        std::fs::create_dir_all(&deps).unwrap();
+        let exe = deps.join("mdaw");
+        let built = root.path().join("built");
+        let from_env = root.path().join("from-env");
+        let beside = deps.join(SCANNER);
+        let above = root.path().join("debug").join(SCANNER);
+        let find = || find_scanner(Some(from_env.clone()), Some(&exe), Some(&built));
+
+        assert_eq!(find(), None);
+        std::fs::write(&built, "").unwrap();
+        assert_eq!(find(), Some(built.clone()));
+        std::fs::write(&above, "").unwrap();
+        assert_eq!(find(), Some(above.clone()));
+        std::fs::write(&beside, "").unwrap();
+        assert_eq!(find(), Some(beside.clone()));
+        std::fs::write(&from_env, "").unwrap();
+        assert_eq!(find(), Some(from_env.clone()));
+        // A folder of that name is not the scanner.
+        std::fs::remove_file(&beside).unwrap();
+        std::fs::create_dir(&beside).unwrap();
+        assert_eq!(find_scanner(None, Some(&exe), None), Some(above.clone()));
+
+        // SAFETY: no other test in this binary reads or writes the environment (none starts an
+        // engine), so setting it races nothing.
+        unsafe { std::env::set_var("MDAW_PLUGIN_SCAN", &from_env) };
+        assert_eq!(scanner_path(), Some(from_env.clone()));
+        unsafe { std::env::remove_var("MDAW_PLUGIN_SCAN") };
+    }
 
     #[test]
     fn read_buffer_grows_once_for_text() {
