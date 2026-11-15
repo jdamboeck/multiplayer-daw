@@ -61,7 +61,8 @@ typedef struct mdaw_engine_config {
     int32_t open_audio_device; /* 0: no device (tests, offline render); 1: open the default.
                                   If it cannot be opened the engine is still created; see
                                   mdaw_engine_state.device_open */
-    const char* audio_backend; /* "ALSA", "JACK", ... or NULL for the platform default */
+    const char* audio_backend; /* "ALSA", "JACK", ... or NULL: JACK if it opens a device,
+                                  else the first backend (ALSA on Linux) */
     int32_t enable_plugins;    /* 0: built-in instruments only; 1: VST3, LV2 and CLAP as well */
     const char* scanner_path;  /* the mdaw-plugin-scan executable, or NULL. With it, plugin files
                                   are examined in a child process, one file at a time, so a

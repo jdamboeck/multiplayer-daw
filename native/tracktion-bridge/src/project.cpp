@@ -1589,19 +1589,36 @@ void Project::openDefaultDevice()
 {
     initialiseDeviceManager();
     auto& adm = engine->getDeviceManager().deviceManager;
+
     // Always name the backend: Tracktion would otherwise reuse whatever its settings remember.
-    auto type = config.backend;
-    if (type.isEmpty())
-        if (auto* first = adm.getAvailableDeviceTypes().getFirst())
-            type = first->getTypeName();
-    adm.setCurrentAudioDeviceType (type, true);
-    auto setup = adm.getAudioDeviceSetup();
-    setup.inputDeviceName = {};
-    setup.useDefaultInputChannels = false;
-    setup.inputChannels.clear();
-    setup.useDefaultOutputChannels = true;
-    // A device that does not open leaves the engine usable offline; the state says so.
-    adm.setAudioDeviceSetup (setup, true);
+    auto open = [&adm] (const juce::String& type)
+    {
+        adm.setCurrentAudioDeviceType (type, true);
+        auto setup = adm.getAudioDeviceSetup();
+        setup.inputDeviceName = {};
+        setup.useDefaultInputChannels = false;
+        setup.inputChannels.clear();
+        setup.useDefaultOutputChannels = true;
+        // A device that does not open leaves the engine usable offline; the state says so.
+        adm.setAudioDeviceSetup (setup, true);
+        auto* dev = adm.getCurrentAudioDevice();
+        return dev != nullptr && dev->isOpen();
+    };
+
+    if (config.backend.isNotEmpty())
+    {
+        open (config.backend);
+        return;
+    }
+
+    // JACK (PipeWire's, on Linux) follows the server's buffer size; JUCE's ALSA device keeps
+    // its own 512 x 4 frames whatever PipeWire runs at. So JACK first, the first backend else.
+    for (auto* type : adm.getAvailableDeviceTypes())
+        if (type->getTypeName() == "JACK" && open (type->getTypeName()))
+            return;
+    if (auto* first = adm.getAvailableDeviceTypes().getFirst())
+        if (first->getTypeName() != "JACK")   // already tried
+            open (first->getTypeName());
 }
 
 juce::String Project::audioDevices()

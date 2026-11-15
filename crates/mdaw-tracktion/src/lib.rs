@@ -223,7 +223,8 @@ pub struct Config {
     /// Open the default audio device. If it cannot be opened the engine is still created; see
     /// [`EngineState::device_open`].
     pub open_audio_device: bool,
-    /// "ALSA", "JACK", ... or `None` for the platform default.
+    /// "ALSA", "JACK", ... or `None`: JACK if it opens a device, otherwise the first backend
+    /// (ALSA on Linux).
     pub audio_backend: Option<String>,
     /// VST3, LV2 and CLAP as well as the built-in instruments.
     pub enable_plugins: bool,
