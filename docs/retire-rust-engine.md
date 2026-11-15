@@ -7,7 +7,7 @@ Since phase 5 the client plays through Tracktion (`--features tracktion`); the R
 feature, and still what CI tests the client with. This plan removes it. Context:
 `docs/migration-checklist.md` ("Replace"), ADR 0002, `docs/tracktion-integration.md`.
 
-## What still depends on it (surveyed at c5ba727)
+## What still depends on it (surveyed at c5ba727; checked against a review the same day)
 
 | Used | By | What it is |
 |---|---|---|
@@ -51,15 +51,29 @@ The bridge builds on Linux only (`mdaw-tracktion-sys/build.rs` refuses other tar
    tests that use it (`mdaw-model/tests/properties.rs`, `mdaw-sync/tests/replica.rs`,
    `mdaw-tracktion/tests/engine.rs`, client `record.rs`, `session.rs`, `ui/devices.rs`, tests
    `net.rs`, `playback.rs`, `plugins.rs`); protocol 11, store 7. `mdaw-tracktion` then no longer
-   depends on `mdaw-dsp`.
+   depends on `mdaw-dsp`. In `ui/devices.rs` the old Pocket panel goes whole (`SECTIONS`,
+   `param()`, `KnobParam for ParamInfo`, `to_norm`, `from_norm`, the `mdaw_dsp::pocket` import):
+   the 4osc panel uses only `mdaw_model::two_osc`, so nothing has to move into the model for it.
+   `session.rs` loses its `pocket::DSP_VERSION` arm. (`mdaw-slice`'s `pocket-param` command
+   drives the 4osc instrument; at most a rename.)
 3. **Move the small things the client keeps.** `clock` and `midi` from `mdaw-engine` into
    `mdaw-client` (the server does not use them); drop `alloc_guard` and the client's global
    allocator (there is no real-time thread in Rust any more).
 4. **Tracktion by default.** The `tracktion` feature goes; `mdaw-tracktion` becomes an ordinary
    dependency of the client. `--old-engine`, `OldAudio` (`audio_old.rs`), `plugins.rs`,
-   `Session::engine*`, `Session::enable_plugins(Host)` go. The `Audio` trait stays (it keeps
-   the session testable and the engine replaceable). `ui/devices.rs` loses the paths only the
-   old engine used (the helper's crash and restart map to the bridge's statuses).
+   `Session::engine*`, `Session::enable_plugins(Host)` go; `mdaw-slice` loses its
+   `required-features`. The `Audio` trait stays (it keeps the session testable and the engine
+   replaceable); the module doc of `audio.rs` ("two engines sit behind it") is rewritten.
+   - *Crashed plugins:* `DeviceStatus::Crashed`, `TrackSound::Crashed`,
+     `Session::plugin_crashed` and the "crashed, restart" row in `ui/devices.rs` are only ever
+     produced by the old helper process (in process, a crash ends the app). They go; failure-
+     policy item 2 (a plugin that crashed the app while loading is loaded disabled) will bring
+     its own status. `restart_plugin` stays: it retries a plugin that `Failed` to load.
+   - *`--test-synth`* (client and `xtask demo`) offered the test synth through the Rust host. It
+     goes from the client; `xtask demo --test-synth` instead builds `mdaw-test-plugin` and puts
+     a folder with `mdaw-test-synth.clap` on `CLAP_PATH` for the clients.
+   - `mdaw_plugin::Waker` goes with `plugins.rs`; the engine and the link use
+     `crate::link::Waker` already.
 5. **Port the tests.** `ui.rs`, `ui_net.rs`, `playback.rs`, `net.rs` to Tracktion. One engine
    per process: a binary whose tests each need an engine either becomes one test with steps (as
    `ui_tracktion.rs`) or is split into binaries. Network tests that need no sound get an engine
@@ -67,23 +81,56 @@ The bridge builds on Linux only (`mdaw-tracktion-sys/build.rs` refuses other tar
    goes; what it checks about the session (a plugin's state reaching the document, restart after
    a failure) moves to the Tracktion tests. Nothing tested today goes untested without a line
    here saying so.
+   - *The test synth.* Tests got it from `mdaw_plugin` (`Host::test_synth_only()`, which hosts
+     the crate in process, and `TEST_SYNTH`). On Tracktion it must be a `.clap` file in a
+     `CLAP_PATH` folder. `tests/slice.rs` has a private `clap_dir()` that takes the dev-
+     dependency's `cdylib` from `target/debug/deps` (building it only if missing) and copies it
+     there; the bridge tests and `mdaw-tracktion`'s tests expect it copied by hand to
+     `target/bridge-scratch/clap`. One shared helper for all of them, in `mdaw-test-plugin`
+     (`pub fn clap_folder(dir)`, keeping slice.rs's care about concurrent copies and not
+     rebuilding during a run), and `mdaw_test_plugin::ID` instead of `mdaw_plugin::TEST_SYNTH`.
 6. **CI and release** (decisions 1 and 2): Linux only; checkout with submodules
    (`git -c url."https://github.com/".insteadOf="git@github.com:" submodule update --init
    --recursive --depth 1`); the packages from `docs/tracktion-integration.md` "Build" plus
    cmake, ninja and xvfb/xprop; cache `target/native`; build the scanner, the test plugins and
    the test synth; run the C bridge test, the Rust tests, and the window tests through
    `run_gui_tests.sh`. Release: the client, the server and `mdaw-plugin-scan`; no
-   `mdaw-plugin-host`. `default-members` and the `--exclude` flags go: the whole workspace is
+   `mdaw-plugin-host`. Packages: `libpipewire-0.3-dev` and `libclang-dev` were for cpal's
+   PipeWire backend (bindgen) and go; JUCE's come in (ALSA, JACK headers, X11, Xext, Xrandr,
+   Xinerama, Xcursor, Xcomposite, Xrender, freetype, fontconfig, ladspa; the Ubuntu names of the
+   Arch list in `tracktion-integration.md` "Build"), with cmake, ninja, xvfb and x11-utils. `default-members` and the `--exclude` flags go: the whole workspace is
    built and tested.
 7. **Remove the crates.** `mdaw-engine`, `mdaw-dsp`, `mdaw-plugin` from the workspace and from
    xtask's build list (`-p mdaw-plugin`); `xtask demo --tracktion` becomes the default (the flag
    goes). `mdaw-test-plugin` stays (the bridge tests and the client tests use the test synth).
-8. **Docs.** `architecture.md`, `migration-checklist.md` (rows to "Removed"), `plan.md`, ADR 0002
-   (decision 3, and the commit to recover the helper from), README (Linux only; the build needs
-   the native part and its packages), `tracktion-integration.md` ("Build" becomes the normal
-   build), `protocol.md` (protocol 11, store 7).
-9. **Hand test.** `docs/manual-tests/tracktion-client.md` and `plugin-windows.md` on the result,
+   Workspace dependencies only they used go: `cpal`, `rtrb`, `libm`, and in `mdaw-plugin`'s own
+   list `clack-host`, `clack-extensions`, `memmap2`, `x11rb`, `libc`. `midir` moves to the
+   client with the MIDI input (step 3); `clack-plugin` stays (the test synth); `blake3` and
+   `postcard` stay (proto, server, model). `Cargo.lock` follows.
+8. **Licence.** Decided 2026-11-12 (`tracktion-integration.md`, "Licences"): the client links
+   JUCE 8 and is distributed under AGPLv3 terms, "before the first release that links JUCE" —
+   which is the next release. `mdaw-client`'s `license` becomes `AGPL-3.0-only` (the workspace
+   default stays `GPL-3.0-only`, for the server and the libraries); the AGPLv3 text is added
+   (`LICENSE-AGPL`, shipped with the client by the release); README's licence section says which
+   applies to what.
+9. **Docs.** After step 7, so that ADR 0002 can name the last commit that still has the helper
+   (step 7's parent) for recovering it. `architecture.md`, `migration-checklist.md` (rows to
+   "Removed"), `plan.md`, ADR 0002 (decision 3 and that commit), README (Linux only; the build
+   needs the native part and its packages), `tracktion-integration.md` ("Build" becomes the
+   normal build), `protocol.md` (protocol 11, store 7, and its mentions of the old Pocket and
+   the Rust engine), `optimizations-plan.md` (about the old engine's processors and helper:
+   marked as history at the top, not rewritten), `manual-tests/tracktion-client.md` (step F.1
+   compares with `--old-engine`: removed). ADR 0001 needs nothing (it does not mention the old
+   engine). The m2–m6 manual tests stay as they are, as history.
+10. **Version and release notes.** Workspace version 0.2.0. Release notes: Tracktion Engine with
+   VST3, LV2 and CLAP; Linux only (no Windows build until the bridge is ported); data
+   directories, projects and client profiles of 0.1 are not readable (protocol 11, store 7);
+   the client is AGPLv3.
+11. **Hand test.** `docs/manual-tests/tracktion-client.md` and `plugin-windows.md` on the result,
    with a fresh data directory (old ones are refused).
+
+No release is tagged before step 10: steps 6 and 8 together make the first release that
+links JUCE, and it has to carry the AGPLv3 text.
 
 ## Not part of this phase
 
