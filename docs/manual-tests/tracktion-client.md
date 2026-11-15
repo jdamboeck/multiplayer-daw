@@ -1,6 +1,6 @@
 # Manual test session: two clients on Tracktion
 
-The client now plays through Tracktion Engine (built with the `tracktion` feature). Shared
+The client plays through Tracktion Engine (its only engine since 2026-11-15). Shared
 transport, checkout and network MIDI are gone: two people edit one project, and each plays it
 on their own. The automated tests cover this with two client processes, no audio device and
 no windows: same document, matching renders, concurrent edits, a crash and reconnect without
@@ -26,7 +26,7 @@ Things under [Known gaps](#known-gaps-not-failures) are not failures.
 
 - [ ] **0.1** `cmake --build target/native --target mdaw_tracktion_bridge mdaw-plugin-scan`
       Expect: finishes without errors (quick if the native part was built before).
-- [ ] **0.2** `cargo xtask demo --fresh --tracktion`
+- [ ] **0.2** `cargo xtask demo --fresh`
       Expect: after the build, a server line in the terminal and two windows, Ann and Ben.
       Each terminal log has a line like `mdaw: Tracktion Engine, audio device open at … Hz`.
 - [ ] **0.3** Look at both windows for the first seconds.
@@ -97,15 +97,15 @@ Things under [Known gaps](#known-gaps-not-failures) are not failures.
 - [ ] **D.6** Close the plugin's window with its close button.
       Expect: the device's button reads "Open window" again.
 - [ ] **D.7** Close Ben's window. In another terminal start Ben again without plugins:
-      `cargo xtask client Ben --tracktion --no-plugins`
+      `cargo xtask client Ben --no-plugins`
       Expect: Ben's window shows the same project; the plugin's track is marked
       "plugin not installed" and is silent there; the other tracks play.
 
 ## E. Losing the connection, and a crash
 
 - [ ] **E.1** Start the pieces separately for this: close everything, then
-      `cargo xtask server` in one terminal and `cargo xtask client Ann --tracktion`,
-      `cargo xtask client Ben --tracktion` in two others. Stop the server with Ctrl+C.
+      `cargo xtask server` in one terminal and `cargo xtask client Ann`,
+      `cargo xtask client Ben` in two others. Stop the server with Ctrl+C.
       Expect: both windows show "Reconnecting…" (or "Disconnected…").
 - [ ] **E.2** With the server stopped, add three notes in Ann's window. Then kill Ann's
       client hard: `pkill -9 -f 'mdaw.*Ann'` (or kill its terminal).
@@ -116,17 +116,10 @@ Things under [Known gaps](#known-gaps-not-failures) are not failures.
 - [ ] **E.4** Play both.
       Expect: both sound the same.
 
-## F. Old engine, for comparison (optional)
-
-- [ ] **F.1** `cargo run -p mdaw-client --features tracktion -- --old-engine`, make a track
-      with a few notes; then the same without `--old-engine`.
-      Expect: both play. The built-in instrument sounds similar but not the same (see gaps).
-      Note under Findings how far apart they are for you.
-
 ## Known gaps (not failures)
 
-- The built-in Pocket instrument is played by Tracktion's 4osc with mapped parameters: an
-  approximation. Velocity response and filter character differ.
+- The built-in Pocket instrument is Tracktion's 4osc with part of its settings (no LFOs,
+  modulation or effects). With two oscillators a note's level varies a little from play to play.
 - A plugin's settings travel as a whole (its state), about 0.5–2 s after a change, not knob
   movement by knob movement.
 - Plugins run inside the client: a plugin that crashes takes that client down. Restart it;

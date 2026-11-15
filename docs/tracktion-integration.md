@@ -1,7 +1,8 @@
 # Tracktion Engine integration
 
-Status: 2026-11-12. Everything stated as a result here was run on this machine; anything not
-run is listed under "Not tested yet".
+Status: 2026-11-12; updated 2026-11-15, when the Rust engine was removed and Tracktion became
+the client's only engine (`docs/retire-rust-engine.md`). Everything stated as a result here was
+run on this machine; anything not run is listed under "Not tested yet".
 
 ## Versions
 
@@ -17,13 +18,17 @@ in the submodule and commit the submodule pointer.
 **Licences.** Tracktion Engine is GPLv3 or commercial. JUCE 8 is AGPLv3 or commercial. This
 project is GPL-3.0-only. A binary that links JUCE 8 without a commercial licence is distributed
 under AGPLv3 terms; the server does not link either and is unaffected. Decided 2026-11-12:
-the client is distributed under AGPLv3 terms. The licence files and README have to say so
-before the first release that links JUCE.
+the client is distributed under AGPLv3 terms. Done 2026-11-15: `mdaw-client`,
+`mdaw-tracktion` and `mdaw-tracktion-sys` are `AGPL-3.0-only`, the text is `LICENSE-AGPL`, and
+README says which licence applies to what.
 
 Test machine: CachyOS, Linux 7.3.1, PipeWire 1.6.10 with `pipewire-jack`, GCC 16.2.1,
 CMake 4.4.5, Ninja.
 
 ## Build
+
+This is the normal build of the client: it links the bridge, so `cargo build` and `cargo test`
+build the native part too (see "The bridge"). Linux only so far.
 
 Packages (Arch / CachyOS):
 
@@ -34,11 +39,22 @@ sudo pacman -S --needed base-devel cmake ninja git \
     ladspa
 ```
 
+On Ubuntu 24.04 (what CI installs, `.github/workflows/ci.yml`; the first line is for the Rust
+side, egui and the MIDI input):
+
+```sh
+sudo apt-get install build-essential cmake ninja-build pkg-config git \
+    libasound2-dev libjack-jackd2-dev libx11-dev libxcb1-dev libxkbcommon-dev libwayland-dev \
+    libxext-dev libxrandr-dev libxinerama-dev libxcursor-dev libxcomposite-dev libxrender-dev \
+    libfreetype-dev libfontconfig1-dev ladspa-sdk
+```
+
 `pipewire-jack` (or `jack2`) supplies the JACK headers and library; JUCE loads the JACK library
 at run time. X11 libraries are needed for plugin editor windows. `curl` and WebKit are switched
-off in the build.
+off in the build. The window tests also need `xvfb-run` and `xprop` (Ubuntu: `xvfb`,
+`x11-utils`).
 
-Fetch the sources (the first command is only needed if GitHub over SSH is not set up, because
+Fetch the sources (the `-c` option is only needed if GitHub over SSH is not set up, because
 some nested submodules use SSH URLs):
 
 ```sh
@@ -46,7 +62,10 @@ git -c url."https://github.com/".insteadOf="git@github.com:" \
     submodule update --init --recursive --depth 1
 ```
 
-Configure and build:
+Then `cargo build`. The build script of `mdaw-tracktion-sys` configures `target/native` the first
+time (CMake, Ninja if it is there, `RelWithDebInfo` for every Cargo profile, so a release build
+shares the folder) and builds the bridge and the scanner in it; the first build takes about ten
+minutes. The same folder by hand, for the spike and the C tests:
 
 ```sh
 cmake -S native -B target/native -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
@@ -57,10 +76,13 @@ The spike binary is
 `target/native/spike/mdaw-te-spike_artefacts/RelWithDebInfo/mdaw-te-spike`.
 
 `native/CMakeLists.txt` passes `-Wno-template-body`: GCC 15 and later reject the bundled
-`nanorange.hpp` without it. The build is C++20.
+`nanorange.hpp` without it. Older GCC ignores the unknown option (see the comment there). The
+build is C++20.
 
 Nothing here is Linux-only by design. The CLAP editor embedding (`XEmbedComponent`), the
-`dlopen` pinning and the plugin search paths are the Linux-specific parts and are small.
+`dlopen` pinning and the plugin search paths are the Linux-specific parts and are small; but
+`mdaw-tracktion-sys`'s build script refuses other targets until the bridge has been built and
+tested there.
 
 ## The spike
 
@@ -297,8 +319,9 @@ project into the engine whole or one operation at a time).
 cargo test -p mdaw-tracktion-sys -p mdaw-tracktion
 ```
 
-Plain `cargo build` and `cargo test` leave these two crates out (`default-members`), and CI
-excludes them, because they need the submodules and a C++ toolchain. The integration test
+Since 2026-11-15 these two crates are part of every build (the client depends on them), and CI
+builds the native part, runs the C test, the Rust tests and the window tests (`ci.yml`). The
+integration test
 applies model operations to the model and the engine side by side, renders after each step,
 and checks that the incremental result matches a fresh load. After moving a submodule pin,
 run `cmake --build target/native` once: the build script does not watch third-party sources.
@@ -332,10 +355,10 @@ parameter change costs one `mdaw_device_set_param`, a change of a state setting 
 write. Two free-running oscillators make the level of a note vary from play to play (accepted).
 The integration test checks every continuous value against the text 4osc shows for it.
 
-The old Rust engine's synth, also Pocket (`BuiltinKind::Pocket`), stays for old projects and goes
-with that engine. Tracktion plays it through 4osc as an approximation (table
-`POCKET_TO_FOUR_OSC` in `crates/mdaw-tracktion/src/apply.rs`, which is why `mdaw-tracktion` still
-depends on `mdaw-dsp`); the Rust engine leaves the new instrument silent.
+The old Rust engine's synth, also Pocket (`BuiltinKind::Pocket`), went with that engine on
+2026-11-15, and with it the table that played it through 4osc as an approximation
+(`POCKET_TO_FOUR_OSC`) and `mdaw-tracktion`'s dependency on `mdaw-dsp`. Projects that have it
+are not readable (protocol 11, store 7).
 
 The model's tempo limit is now 20–300 bpm, the range Tracktion plays.
 
@@ -353,7 +376,8 @@ sections. A plugin that hangs inside a call still blocks every call after it.)
 
 ## ABI 4 and the client on Tracktion
 
-Added 2026-11-13 for the client (feature `tracktion` of `mdaw-client`).
+Added 2026-11-13 for the client (then behind its feature `tracktion`; since 2026-11-15 the
+client's only engine).
 
 - `mdaw_track_live_note(engine, track, pitch, velocity)`: a note on the track's devices at once
   (velocity 0 ends it), for the computer keyboard, a MIDI input and auditioning. Tracktion's
@@ -511,8 +535,8 @@ open. `crates/mdaw-tracktion/tests/scan_concurrency.rs`: the same from Rust.
 `crates/mdaw-client`: the scheduler's unit tests; `tests/engine_scheduling.rs` (catalog from the
 cache before the scan ends, sync and `wait_idle` during a scan, bounded polling with a slow
 plugin, repeated parameter reads, a window that cannot open, drop during a scan);
-`tests/editor_gui.rs` (ignored; run with `MDAW_TEST_GUI=1 test/run_gui_tests.sh cargo test -p
-mdaw-client --features tracktion --test editor_gui -- --ignored`). Benchmarks:
+`tests/editor_gui.rs` (ignored; run with `native/tracktion-bridge/test/run_gui_tests.sh cargo test -p
+mdaw-client --test editor_gui -- --ignored`, which sets `MDAW_TEST_GUI=1`). Benchmarks:
 `native/tracktion-bridge/test/run_editor_bench.sh` and `tests/editor_latency.rs` (ignored). The
 fixture `test-gui.clap` (`test/bad_clap.c`) has a window and a state, with settings for a slow
 save, a slow window and a window that fails.
@@ -533,7 +557,8 @@ save, a slow window and a window that fails.
 - The real first paint of a plugin's window, and behaviour under a real window manager, are
   checked by hand (`docs/manual-tests/plugin-windows.md`), not by the tests (Xvfb has no window
   manager).
-- Windows: the scanner child's cancel waits in 20 ms slices; compiled for, not tested.
+- Windows: the scanner child's cancel waits in 20 ms slices; written, never compiled or tested
+  (the bridge builds on Linux only).
 - Destroying the engine takes about 1 s (the teardown gaps of point 7).
 
 ## Not tested yet
@@ -547,3 +572,6 @@ save, a slow window and a window that fails.
 - Out-of-process scanning for the CLAP format (in-process scan only).
 - Plugins with side-chain or multiple output buses in use (extra buses are disabled).
 - Windows and macOS.
+- The build and the tests on Ubuntu with its GCC (13 on 24.04) and in GitHub Actions: the
+  workflows are written (2026-11-15) and each CI command was run on this machine, but CI has not
+  run them yet.

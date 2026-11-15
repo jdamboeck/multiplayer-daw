@@ -27,12 +27,12 @@ around a slow moment into Findings.
 ## 0. Preparation
 
 - [ ] **0.1** `cmake --build target/native` — Expect: finishes without errors.
-- [ ] **0.2** `MDAW_TRACE=1 cargo xtask demo --fresh --tracktion`
+- [ ] **0.2** `MDAW_TRACE=1 cargo xtask demo --fresh`
       Expect: two windows, Ann and Ben. "Scanning plugins…" shows for a few seconds (a cold scan
       of everything installed; about 4 s on the development machine) and goes away. Both
       windows stay responsive meanwhile (scroll, add a track).
 - [ ] **0.3** Close both clients and the server (Ctrl-C in the terminal). Start again without
-      `--fresh`: `MDAW_TRACE=1 cargo xtask demo --tracktion`.
+      `--fresh`: `MDAW_TRACE=1 cargo xtask demo`.
       Expect: the plugin menus are full at once (the catalog from the last run is shown before the
       new scan ends); "Scanning plugins…" is short.
 
@@ -68,7 +68,7 @@ In Ann's window: add a track per plugin you test, and put one plugin on each.
       ```sh
       mkdir -p /tmp/mdaw-hang && cp target/native/tracktion-bridge/bad-hang.clap /tmp/mdaw-hang/ \
         && touch /tmp/mdaw-hang/bad-hang.clap
-      MDAW_TRACE=1 MDAW_SCAN_TIMEOUT_MS=20000 CLAP_PATH=/tmp/mdaw-hang cargo xtask demo --tracktion
+      MDAW_TRACE=1 MDAW_SCAN_TIMEOUT_MS=20000 CLAP_PATH=/tmp/mdaw-hang cargo xtask demo
       ```
       (`bad-hang.clap` is a test plugin that never finishes loading; the scanner gives up on it
       after 20 s. If the file is elsewhere, `find target/native -name bad-hang.clap`.)

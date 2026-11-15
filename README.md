@@ -7,8 +7,8 @@ Prototype of a server/client DAW for collaborative editing. Working name.
 - `docs/protocol.md`: the wire protocol and sync rules as built.
 - `docs/manual-tests/`: test protocols to run through by hand after a milestone.
 - `docs/spikes/`: spike reports.
-- `docs/architecture.md`: where the project is going — Tracktion Engine for local audio, Rust for
-  everything shared — and what the audit of the current code found.
+- `docs/architecture.md`: the shape of the project — Tracktion Engine for local audio, Rust for
+  everything shared — and what the audit of 2026-11-12 found.
 - `docs/tracktion-integration.md`: pinned versions, how to build the native part, test results.
 - `docs/decisions/`: decision records. `docs/migration-checklist.md`: what is kept and what goes.
 
@@ -38,40 +38,48 @@ were removed: people collaborate on the project, not on the audio clock. Every e
 included, is an ordinary transaction; each client plays the project on its own; a client
 without a plugin hears nothing from that track and says so.
 
-**In progress** (branch `tracktion-integration`): moving local audio to Tracktion Engine. So far
-a native spike under `native/`, a C bridge with its Rust side, the documents above, and the
-client on Tracktion behind the `tracktion` feature (see "Run").
+On 2026-11-15 the Rust audio engine (`mdaw-engine`, `mdaw-dsp`, `mdaw-plugin`) was removed: the
+client plays through Tracktion Engine and hosts VST3, LV2 and CLAP plugins, examined in a separate
+scanner process (`docs/retire-rust-engine.md`). Data directories, projects and unsent edits of
+earlier versions are not readable (protocol 11, store 7).
 
-## Native build (Tracktion spike)
+**Linux only.** The bridge to Tracktion builds on Linux only so far; there is no Windows build
+until it is ported.
 
-Needs CMake, Ninja, a C++20 compiler and the packages listed in `docs/tracktion-integration.md`.
+## Build
+
+The client links Tracktion Engine and JUCE through a C++ bridge (`native/`), so the build needs
+CMake, Ninja, a C++20 compiler, the system packages listed in `docs/tracktion-integration.md`
+("Build", for Arch and Ubuntu) and the pinned submodules:
 
 ```sh
 git -c url."https://github.com/".insteadOf="git@github.com:" submodule update --init --recursive --depth 1
-cmake -S native -B target/native -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cargo build
+```
+
+`cargo` builds the native part itself, in `target/native` (the first time takes about ten
+minutes; afterwards it is incremental). The Tracktion spike, a native test program:
+
+```sh
 cmake --build target/native --target mdaw-te-spike
 S=target/native/spike/mdaw-te-spike_artefacts/RelWithDebInfo/mdaw-te-spike
 $S play                     # eight seconds of MIDI through the default audio device
 $S render --out demo.wav    # the same, rendered to a file without a device
 ```
 
-The client builds it itself (through `mdaw-tracktion-sys`).
-
 ## Downloads
 
-Releases on GitHub carry ready-made builds of the client (`mdaw`) and the server (`mdaw-server`)
-for Linux x86-64 and Windows x86-64. The Linux build needs PipeWire and ALSA libraries
-(`libpipewire-0.3`, `libasound2`), which desktop distributions have.
+Releases on GitHub carry ready-made builds for Linux x86-64: the client (`mdaw`), the server
+(`mdaw-server`) and the plugin scanner (`mdaw-plugin-scan`, which must stay next to `mdaw`). The
+client needs the ALSA, X11 (or Wayland), freetype and fontconfig libraries, which desktop distributions have;
+JACK is used if it is there.
 
 ## Run
-
-The client plays through Tracktion Engine, so the build needs the native part above (`cargo`
-runs it; the first time takes about ten minutes):
 
 ```sh
 cargo run -p mdaw-client      # a local project; runs without sound if the engine does not start
 cargo xtask demo              # a server and two clients (Ann, Ben) on this machine
-cargo test                    # the client's tests, on Tracktion where they need sound
+cargo test --workspace        # the tests; those that need windows or an audio device are ignored
 ```
 
 The client hosts VST3, LV2 and CLAP plugins (scanned at startup, in child processes, by
@@ -94,6 +102,17 @@ With the release builds, the same is `mdaw-server --data ./mdaw-data --host <nam
 
 The server prints the join string. `cargo xtask server` and `cargo xtask client <name>` do the same
 with everything kept under `target/demo`; `cargo xtask help` lists the options.
+
+Tests that open plugin windows run on a virtual X display (needs `xvfb-run` and `xprop`), never
+on the desktop:
+
+```sh
+native/tracktion-bridge/test/run_gui_tests.sh                 # the bridge's C test, with windows
+native/tracktion-bridge/test/run_gui_tests.sh cargo test -p mdaw-client --test editor_gui -- --ignored
+```
+
+The bridge's C test without windows, and how it finds the test synth: `docs/tracktion-integration.md`,
+"The bridge".
 
 The UI tests drive the app headlessly. To render screenshots from them:
 

@@ -1,11 +1,14 @@
 # mdaw protocol
 
-What client and server say to each other, as built. Protocol version **10**. The types live in
+What client and server say to each other, as built. Protocol version **11**. The types live in
 `mdaw-proto` (`lib.rs` for transactions and events, `wire.rs` for messages) and in `mdaw-model`
 (ops); this text explains the rules around them. People share the project — tracks, clips,
 notes, devices, tempo — and nothing else: each client plays it back on its own, and nothing
 about playback travels.
 
+Version 11 removes the Rust engine's synth (`BuiltinKind::Pocket`), which renumbers `TwoOsc` in
+the wire and store formats; data directories, projects and the client's unsent edits of
+version 10 and earlier are not readable (see "Server storage" and "What the client does").
 Version 10 adds the built-in instrument of the Tracktion engine (`BuiltinKind::TwoOsc`, shown
 as "Pocket") with its own parameter table and range checks (see "Built-in devices").
 Version 9 gives a plugin device the plugin's name (`DeviceKind::Plugin::name`), so a client
@@ -191,7 +194,10 @@ from the file at most once a second, by writing it anew and renaming it over the
 next start the client shows what the outbox holds at once, uploads its blobs again and sends the
 transactions again; the server answers those it had from their receipts. One it had refused is
 refused again and taken back again, with the notice once more. Without a server (the local mode)
-there is no outbox.
+there is no outbox. A file `format` next to the transactions holds the protocol version they are
+encoded in; an outbox of another version, or one from a client before that file, that still holds
+transactions is refused rather than misread (the client says why and does not start), and an empty
+one is taken over.
 
 ### Concurrent edits: last one wins, the other is kept
 
@@ -260,7 +266,7 @@ undo step and reaches the others like any edit.
 
 ```
 DeviceKind::Builtin { kind: BuiltinKind, dsp_version: u16 }
-BuiltinKind = Pocket | TwoOsc   // new kinds are added at the end
+BuiltinKind = TwoOsc   // new kinds are added at the end
 ```
 
 A built-in device's settings are its `params`: plain values by parameter id. A missing entry is
@@ -276,12 +282,11 @@ are part of the format: they are never renumbered or reused.
   a value outside a parameter's range, a fraction for a choice, switch or tuning in semitones,
   and an id the table does not have (`Invalid`), in `DeviceAdd`, `TrackAdd` and
   `DeviceSetParam`. `dsp_version` is 1.
-- **`Pocket`** is the Rust engine's own synth (`crates/mdaw-dsp/src/pocket.rs`, 20 parameters,
-  values clamped rather than refused). Projects made before version 10 have it. The Tracktion
-  engine plays it with 4OSC as an approximation; the Rust engine, which goes in phase 7, plays
-  it exactly and leaves `TwoOsc` silent.
 
-New tracks get the built-in instrument of the client's engine.
+Up to version 10 there was also `Pocket`, the synth of the Rust engine (removed with that engine
+in version 11); projects that have it are not readable.
+
+New tracks get the built-in instrument.
 
 ## Plugins
 
@@ -305,50 +310,34 @@ PluginFormat = Clap | Vst3 | Lv2   // new formats are added at the end
   `params` are not written by the client for plugins (for CLAP they are applied on top of the
   state if a document has them). Turning a plugin's knobs, in its own window or in the generic
   controls, changes the running instance, and its state reaches the document as
-  `DeviceSetState` (which waits for the upload of the blob, see "What the client does"):
-  - On Tracktion Engine (client built with `tracktion`): the engine reports a parameter changed
-    or a preset loaded in the plugin's window; a generic slider marks the device itself. 500 ms
-    after the last change of a device, and at most 2 s after the first, the client reads the
-    plugin's state (the engine first makes sure every value set has reached the plugin) and
-    submits it if its hash differs from the state the document holds. A
-    state that arrives from another client, or from undo, is given to the plugin; the engine does
-    not report that as a change, and the client knows the plugin holds it, so it is not sent
-    back.
-  - On the Rust engine: every 2 s the client saves the state of each instance that says it
-    changed or whose window is open, and submits it if it differs from the one the same instance
-    gave when it was made or last saved.
+  `DeviceSetState` (which waits for the upload of the blob, see "What the client does"). The
+  engine reports a parameter changed or a preset loaded in the plugin's window; a generic slider
+  marks the device itself. 500 ms after the last change of a device, and at most 2 s after the
+  first, the client reads the plugin's state (the engine first makes sure every value set has
+  reached the plugin) and submits it if its hash differs from the state the document holds. A
+  state that arrives from another client, or from undo, is given to the plugin; the engine does
+  not report that as a change, and the client knows the plugin holds it, so it is not sent back.
 
   Successive saves of one plugin are one undo step. Plugins do not always say that their
   settings changed (Vital does not for presets), so a save is compared only with saves of the
   same instance: different instances save the same settings differently.
-- **Hearing a track with plugins.** Each client decides for itself. On Tracktion Engine a device
-  whose plugin is missing or does not load is left out and the rest of the track plays (a
-  missing instrument makes the track silent); the header says "plugin not installed" or "plugin
-  crashed", and "loading plugin…" while plugins are still being looked for. The text below is the
-  Rust engine's behaviour. With every plugin of the
-  track installed and its state at hand, it runs them, loaded with the document's state.
-  Otherwise the whole track is silent on that client, and its header says so: "plugin not
-  installed" when a plugin is missing (or the client runs with `--no-plugins`), "no sound here"
-  when the state could not be had, "loading plugin…" while one starts. The device tab names the
-  missing plugin.
+- **Hearing a track with plugins.** Each client decides for itself. A device whose plugin is
+  missing or does not load is left out and the rest of the track plays (a missing instrument
+  makes the track silent); the header says "plugin not installed" (also when the client runs
+  with `--no-plugins`), "plugin failed" when it did not load, "no sound here" while its state
+  is not at hand, and "loading plugin…" while plugins are still being looked for. The device tab
+  names the missing plugin.
 - **Downloads.** State blobs are downloaded when a client needs them.
 - **Listening volume.** The volume in each client's top bar is that listener's own: applied at
   the end of that client's output, it is not part of the document. (The document's master
   volume stays, at 1 unless an older project set it.)
-- **Crashes.** On Linux each plugin instance runs in a helper process (`mdaw-plugin-host`),
-  also for scanning, one file at a time and a few files at once. What a scan found is kept in
-  `~/.cache/mdaw/clap-scan` and a file is scanned again only once it changed; one whose scan
-  failed is left out until it changes. Helpers start on threads of their own, so the client
-  does not wait for them; meanwhile the track header says "loading plugin…". The audio thread
-  hands a helper each block through anonymous shared memory (a `memfd` only that helper gets)
-  and waits at most the block's length plus 2 ms, and never past 60% of the audio callback for
-  all plugins together; a late block goes without the plugin. Helpers report changes to their
-  state and window themselves. A helper whose client is gone ends within two seconds.
-  A helper that crashes or stops answering is ended: the client says so, the track is silent,
-  and the user can restart the plugin, which comes back with the settings the document has (at
-  most about two seconds old). A plugin that does not start or will not take its settings is
-  treated the same way, as is one running inside the client whose processing fails. While a
-  plugin waits for a restart it is not tried again.
+- **Crashes.** Plugins run inside the client (ADR 0002). They are examined in a child process,
+  `mdaw-plugin-scan` next to the client's executable, one file at a time with a time limit; a
+  file whose examination crashed or hung is listed as failed and not offered, and a file is
+  examined again only once it changed (the records are kept in the engine's settings folder,
+  `<profile>/engine/`). A plugin that crashes while it runs takes the client down; a hung one
+  stops its sound and blocks the engine. The edits not yet confirmed are in the outbox, so a
+  restart loses none. A plugin that failed to load can be tried again from its device tab.
 
 ## Blobs
 
@@ -386,9 +375,9 @@ transaction is committed by itself, without grouping several into one commit.
 
 Blobs are files in `blobs/`, named by their hash in hex.
 
-The format entry is `<store version>/<protocol version>`, now `6/10`. A database with another
+The format entry is `<store version>/<protocol version>`, now `7/11`. A database with another
 format is not opened; the prototype has no migrations, so a breaking change means a new data
-directory. In particular, data directories of protocol 7 and earlier are not readable: move them
-away and start a new project.
+directory. In particular, data directories of protocol 10 and earlier (mdaw 0.1 included) are not
+readable: move them away and start a new project.
 
 A client whose outgoing queue reaches 4096 messages is disconnected and resumes later.

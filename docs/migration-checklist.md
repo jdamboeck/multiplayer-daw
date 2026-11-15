@@ -1,7 +1,8 @@
 # Migration checklist
 
-What happens to each existing part. The rows of the "Remove" table are done (2026-11-13, see
-"Removed" below); everything else goes only when the thing that replaces it has passed its tests. Order follows the phases in
+What happens to each existing part. The rows of the "Remove" table are done (2026-11-13), and
+so are the Rust engine's rows of "Replace" (2026-11-15, phase 7; see "Removed" below); everything
+else goes only when the thing that replaces it has passed its tests. Order follows the phases in
 the mission: bridge (4), collaborative slice (5), reliability (6), retire the Rust engine (7).
 
 ## Keep
@@ -22,10 +23,10 @@ the mission: bridge (4), collaborative slice (5), reliability (6), retire the Ru
 
 | Part | With | When |
 |---|---|---|
-| `mdaw-engine` (cpal device, real-time thread, transport) | Tracktion through `mdaw-tracktion` | phase 7, after the bridge passes |
-| `mdaw-dsp` graph, Pocket synth, offline render | Tracktion graph, a Tracktion built-in or bundled instrument, Tracktion render | phase 7 |
-| `mdaw-plugin` CLAP host (clack) | `native/clap-format` | phase 7, after the manual test (ADR 0002) |
-| `mdaw-plugin` isolation helper | in-process hosting plus the failure policy in ADR 0002; later an optional isolated mode whose host side is C++ and whose helper is the existing Rust process | the helper stays until that isolated mode exists |
+| `mdaw-engine` (cpal device, real-time thread, transport) | Tracktion through `mdaw-tracktion` | removed 2026-11-15 (phase 7) |
+| `mdaw-dsp` graph, Pocket synth, offline render | Tracktion graph, 4osc as the built-in instrument (`TwoOsc`), Tracktion render | removed 2026-11-15 (phase 7) |
+| `mdaw-plugin` CLAP host (clack) | `native/clap-format` | removed 2026-11-15 (phase 7) |
+| `mdaw-plugin` isolation helper | in-process hosting plus the failure policy in ADR 0002; later an optional isolated mode whose host side is C++, with the helper recovered from git history | removed 2026-11-15 (ADR 0002, decision 3 of `docs/retire-rust-engine.md`) |
 | `client_txn_id` per connection | stable transaction ID, receipts by user + ID | phase 5 |
 | `synchronous=NORMAL` on the event path | commit on disk before the acknowledgement | phase 5 |
 | Whole-graph replacement on every edit | per-operation updates to the Edit | phase 4 |
@@ -57,6 +58,26 @@ All done on 2026-11-13 (branch `tracktion-integration`, protocol version 6).
 Removing these changed the wire protocol: version 6. Data directories of earlier servers are
 not readable (store format `2/6`).
 
+## Removed (2026-11-15)
+
+Phase 7, `docs/retire-rust-engine.md`. Protocol version 11, store format `7/11`: data
+directories, projects and unsent edits (the client's outbox) of earlier versions are not
+readable.
+
+- `mdaw-engine`: the cpal device and its real-time thread, the transport, the allocation guard.
+  The clock and the MIDI input moved into `mdaw-client`.
+- `mdaw-dsp`: the audio graph, the offline render and the old Pocket synth
+  (`BuiltinKind::Pocket`, with the 4osc approximation of it in `mdaw-tracktion`). The built-in
+  instrument is the 4osc one (`TwoOsc`), still called Pocket in the UI; projects with the old
+  synth are not readable.
+- `mdaw-plugin`: the Rust CLAP host and its isolation helper `mdaw-plugin-host` (plugins in
+  helper processes, the per-block deadline, "plugin crashed, restart"). Plugins run in process
+  (ADR 0002). The helper is in the last commit that has it, `7521840`.
+- The client's `--old-engine` and `--test-synth`, and the `tracktion` feature: the client plays
+  through Tracktion only.
+- The Windows build in CI and in the release: the bridge builds on Linux only so far.
+- Their tests.
+
 ## Removed (2026-11-13)
 
 - Shared transport, follow and Link; clock sync (client and server); the datagram path.
@@ -71,10 +92,11 @@ not readable (store format `2/6`).
 
 ## Capabilities that change — nothing is dropped silently
 
-| Today | After | 
+| Before | Now |
 |---|---|
 | A crashing or hung CLAP plugin takes down only its helper | it takes down or stalls the app; mitigations in ADR 0002 |
 | Everyone hears the same playhead | each person has their own |
 | Others hear your MIDI keyboard live | they hear it when you have recorded a clip |
 | CLAP only | VST3, LV2 and CLAP |
 | No latency compensation | Tracktion's |
+| Linux and Windows builds | Linux only, until the bridge is ported |

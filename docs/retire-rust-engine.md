@@ -1,13 +1,19 @@
 # Plan: retire the Rust audio engine (phase 7)
 
-Status: planned, 2026-11-15; decisions taken by the project owner the same day.
+Status: done 2026-11-15 except step 9 (the hand test); decisions taken by the project owner the
+same day. Steps 1–8 are the commits `cf67e05` (1), `aeaa816` (2), `7521840` (3), `82dbaa4` (4)
+and the four after it (5–8). CI as written in step 5 has not run yet.
 
-Since phase 5 the client plays through Tracktion (`--features tracktion`); the Rust engine
-(`mdaw-engine`, `mdaw-dsp`, `mdaw-plugin`) is still built, still the default without the
-feature, and still what CI tests the client with. This plan removes it. Context:
+When this plan was written the client played through Tracktion only with `--features tracktion`;
+the Rust engine (`mdaw-engine`, `mdaw-dsp`, `mdaw-plugin`) was still built, still the default
+without the feature, and still what CI tested the client with. This plan removed it. The text
+below is the plan as agreed, in the present tense of that day. Context:
 `docs/migration-checklist.md` ("Replace"), ADR 0002, `docs/tracktion-integration.md`.
 
 ## What still depends on it (surveyed at c5ba727; checked against a review the same day)
+
+History: the state before step 1. None of it is in the tree any more; `mdaw_engine::clock` and
+`mdaw_engine::midi` live on as `mdaw-client`'s `clock` and `midi` (step 2).
 
 | Used | By | What it is |
 |---|---|---|

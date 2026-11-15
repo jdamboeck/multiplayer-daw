@@ -1,6 +1,8 @@
 # Architecture
 
-Status: 2026-11-12, branch `tracktion-integration` (from `m1-local-daw` at `379f0a1`).
+Status: 2026-11-15, branch `tracktion-integration` (from `m1-local-daw` at `379f0a1`). The Rust
+audio engine is gone (phase 7, `docs/retire-rust-engine.md`): the client plays through Tracktion
+only. "What the audit found" is the audit of 2026-11-12, with what became of each point.
 
 The guiding rule: **collaborate on the project, not on the audio clock.** People share a
 project — tracks, clips, notes, instruments, plugin settings, automation, tempo, audio files.
@@ -46,26 +48,33 @@ is in `docs/tracktion-integration.md`; what happens to each existing part is in
 
 ## Today
 
-Rust workspace, edition 2024, GPL-3.0-only.
+Rust workspace, edition 2024, and the C++ bridge under `native/`. Linux only for now: the bridge
+builds on Linux only, so there is no Windows build until it is ported. The server and the
+libraries are GPL-3.0-only; the client and the bridge crates are AGPL-3.0-only, because they
+link JUCE 8 (README, "License").
 
-| Crate | Lines | What it does |
+| Part | Lines | What it does |
 |---|---|---|
-| `mdaw-model` | 1.7k | Project, typed stable IDs (`EntityId = actor << 32 | counter`), `Tick` at 960 PPQ, the `Op` enum and `apply` |
-| `mdaw-proto` | 1.4k | Wire messages (protocol version 9), `Txn { id: TxnId, base_seq, ops }`, blobs, live MIDI packets, transport |
-| `mdaw-sync` | 0.7k | Client replica: optimistic ops, rebase on server events, checkout workspaces |
-| `mdaw-server` | 1.9k | Hub, sequencer, SQLite store, checkout/lease bookkeeping, live-MIDI relay |
-| `mdaw-net` | 0.6k | QUIC (quinn), clock sync |
-| `mdaw-dsp` | 1.7k | Own audio graph, built-in synth, offline render, plugin slots |
-| `mdaw-engine` | 1.6k | cpal device, real-time thread, transport |
-| `mdaw-plugin` | 3.3k | CLAP host (clack), each plugin in a helper process over shared memory |
-| `mdaw-client` | 8.9k | egui app: arrange, piano roll, devices, checkout UI, live jam, changelog |
+| `mdaw-model` | 2.1k | Project, typed stable IDs (`EntityId = actor << 32 | counter`), `Tick` at 960 PPQ, the `Op` enum and `apply`, the built-in instrument's parameter table (`two_osc.rs`) |
+| `mdaw-proto` | 0.4k | Wire messages (protocol version 11), `Txn { id: TxnId, base_seq, ops }`, blobs |
+| `mdaw-sync` | 0.4k | Client replica: optimistic ops, rebase on server events |
+| `mdaw-server` | 1.5k | Hub, sequencer, SQLite store (format `7/11`), receipts |
+| `mdaw-net` | 0.5k | QUIC (quinn) |
+| `mdaw-client` | 10.2k | egui app: arrange, piano roll, devices, changelog; the outbox; the engine worker and its scheduler; MIDI input (midir) and the clock for recording |
+| `mdaw-tracktion-sys` | 0.4k | Declarations of the bridge's C header; its build script runs the CMake build in `target/native` |
+| `mdaw-tracktion` | 2.6k | Safe `Engine`; brings the canonical project into the engine whole or by difference (`sync_project`) |
 | `mdaw-test-plugin` | 0.5k | CLAP synth that can fail, stall, hang or crash on request |
-
-Baseline before any change: `cargo test --workspace --no-fail-fast` → 237 passed, 0 failed,
-9 ignored.
+| `native/tracktion-bridge` | 6.6k | The C ABI (`include/mdaw_engine.h`) over Tracktion Engine and JUCE; the plugin scanner `mdaw-plugin-scan` |
+| `native/clap-format` | 1.1k | CLAP hosting as a JUCE `AudioPluginFormat` (ADR 0002) |
 
 The model has tracks, MIDI clips, notes, a tempo map, devices with parameters and opaque state.
 It has no time signatures, no automation and no audio clips yet.
+
+At the audit (2026-11-12) the workspace also had `mdaw-dsp` (own audio graph, the old Pocket
+synth, offline render), `mdaw-engine` (cpal device, real-time thread, transport) and
+`mdaw-plugin` (CLAP host, each plugin in a helper process over shared memory); they were removed
+on 2026-11-15 (`docs/migration-checklist.md`, "Removed"). Baseline then: `cargo test --workspace
+--no-fail-fast` → 237 passed, 0 failed, 9 ignored.
 
 ## What the audit found
 
@@ -88,18 +97,21 @@ These are confirmed in the code, not suspected.
    Measured: 0.23 ms p50, 0.5 ms p99 per commit (ext4, NVMe), so no group commit.
 3. **The audio thread waits on other processes.** For every isolated plugin, every block,
    `isolated/parent.rs` blocks on a futex until the helper answers. It has a deadline, but a
-   blocking wait in the audio callback is the cost of that isolation.
+   blocking wait in the audio callback is the cost of that isolation. Gone with `mdaw-plugin`
+   on 2026-11-15: plugins run in process (ADR 0002).
 4. **The graph is replaced whole.** Each edit rebuilds the audio graph and sends it to the
-   real-time thread (`Command::SetGraph`).
+   real-time thread (`Command::SetGraph`). Gone: the engine is brought from one state of the
+   project to the next by their difference (`mdaw_tracktion::sync_project`).
 5. **Machinery for things that are now non-goals.** Shared transport and "follow"
    (`mdaw-proto/src/transport.rs`, hub, session), clock sync (`mdaw-net/src/clock.rs`), live MIDI
    relay (`mdaw-proto/src/midi.rs`, `mdaw-server/src/relay.rs`, `mdaw-client/src/live.rs`).
+   Removed 2026-11-13.
 6. **Editing a plugin track needs a checkout.** Checkout, lease renewal, force release and
    commit run through proto, sync, server and client (`RefuseReason::PluginOutsideCommit`,
-   `StemRequired`). The target has no mandatory checkout for ordinary edits.
+   `StemRequired`). The target has no mandatory checkout for ordinary edits. Removed 2026-11-13.
 7. **Two playback implementations would exist** once Tracktion is in: `mdaw-dsp` +
    `mdaw-engine` and Tracktion. The Rust one goes when Tracktion has passed (phase 7), not
-   before.
+   before. Done 2026-11-15: Tracktion is the only engine.
 
 ## Collaboration target
 

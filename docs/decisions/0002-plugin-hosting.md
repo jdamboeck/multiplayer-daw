@@ -1,7 +1,8 @@
 # ADR 0002: Plugin hosting — VST3 and LV2 through JUCE, CLAP through our own format, in process
 
 Status: accepted, 2026-11-12 (in-process now; optional per-plugin isolation as a later, planned
-phase). Measurements are in `docs/tracktion-integration.md`.
+phase). Amended 2026-11-15: `mdaw-plugin` and its helper are removed (see "Decision" and the
+amendment at the end). Measurements are in `docs/tracktion-integration.md`.
 
 ## Question
 
@@ -42,7 +43,7 @@ modulation, remote controls, out-of-process scan, resizing editors.
 Measured with the repo's test synth during live playback: a failing plugin is harmless; a slow
 one drags the whole project; a hung one stops all audio (the UI stays alive); a crashing one
 takes the process down. Scanning can run in a child process; processing cannot. This is what
-every in-process host does, and it is a real step back from what `mdaw-plugin` does today.
+every in-process host does, and it is a real step back from what `mdaw-plugin` did then.
 
 What that step costs in this product is smaller than it was: the project lives on the server
 and in the local log, so a crash loses at most the edits not yet acknowledged — and pending
@@ -64,11 +65,12 @@ transactions are to be kept durably on the client and resubmitted (phase 5).
   5. Plugin libraries are never unloaded (integration doc, point 6).
 - **`crates/mdaw-plugin` and its helper stay in the tree** until the bridge hosts CLAP in the
   real client and the manual test has passed. Then they are removed with the Rust engine
-  (phase 7).
+  (phase 7). *Amended 2026-11-15: removed, the helper included; see below.*
 - **Isolation can come back** as a per-plugin option: a Tracktion plugin in C++ that speaks the
   existing shared-memory protocol to the existing Rust helper *process*. Rust then runs only in
   the other process. Decided 2026-11-12: this is a planned phase after the bridge and the
-  collaborative slice, not a maybe; the helper and its protocol stay in the tree until then.
+  collaborative slice, not a maybe. *Amended 2026-11-15: the helper and its protocol are no
+  longer kept in the tree until then; that phase recovers them from git history.*
 
 Item 1 is built and tested (`mdaw-plugin-scan`, with plugins that crash and hang on purpose).
 Item 4 is built and tested (2026-11-13: the client's outbox, `mdaw-client/src/outbox.rs`; see
@@ -103,6 +105,24 @@ through ports and atoms): a helper process that instantiates the plugin's LV2 UI
 host passes, and exchanges port writes and atom messages with the host over a pipe, with a
 timeout like Carla's (4 s) after which the host closes the window and says so. CLAP and VST3 would
 come after, if ever. The per-plugin isolation of *processing* stays the planned phase above.
+
+## Amendment 2026-11-15: the helper is removed
+
+Decision 3 of `docs/retire-rust-engine.md` (the project owner, 2026-11-15): `mdaw-plugin` goes
+with the Rust engine now, the isolation helper `mdaw-plugin-host` and its shared-memory protocol
+included. Per-plugin isolation, when it comes, needs a C++ host side anyway (a Tracktion plugin
+on the parent side, see above); keeping the Rust crate building in the meantime cost more than
+recovering it.
+
+The last commit that has the crate is `7521840` ("Play through Tracktion only, and port the
+client's tests to it"); it was removed in the next one, `82dbaa4`. The helper is
+`crates/mdaw-plugin/src/bin/mdaw-plugin-host.rs`, the protocol and both of its sides
+`crates/mdaw-plugin/src/isolated/` (`protocol.rs`, `shm.rs`, `parent.rs`, `child.rs`), its tests
+`crates/mdaw-plugin/tests/isolated.rs`. To read a file: `git show
+7521840:crates/mdaw-plugin/src/isolated/protocol.rs`; to bring the whole crate back into the
+tree: `git checkout 7521840 -- crates/mdaw-plugin`. As it stands there it depends on `mdaw-dsp`
+and `mdaw-engine` (also in that commit) and on the workspace dependency `rtrb`; its other
+dependencies are in its own `Cargo.toml`.
 
 ## Consequences
 
