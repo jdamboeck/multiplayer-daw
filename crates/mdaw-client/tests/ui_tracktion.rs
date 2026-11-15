@@ -1,6 +1,9 @@
 //! The whole client headlessly on Tracktion Engine: pointer and key events in, document and a
-//! render out. One engine per process, so one test. No audio
-//! device: playing is what the transport was asked for; sound is checked by rendering.
+//! render out, in one test whose steps build on each other. Tracktion allows one engine per
+//! process at a time (another can be made once the previous one is gone; `tests/ui.rs` takes
+//! turns that way); this binary has only this test, so it needs no lock. No audio device:
+//! playing is what the transport was asked for, and the playhead does not move; sound is checked
+//! by rendering.
 
 use egui::{Key, Pos2, vec2};
 use egui_kittest::Harness;

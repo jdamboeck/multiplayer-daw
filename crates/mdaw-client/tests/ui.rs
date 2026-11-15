@@ -1,6 +1,8 @@
 //! Drives the whole client headlessly: real pointer and key events in, document and transport
-//! out. Most tests run on `SilentAudio` (no sound, a transport moved by hand); those about sound
-//! or plugins run on Tracktion, one at a time (`support::tracktion`), and listen by rendering.
+//! out. The tests run on Tracktion, one engine at a time (`support::tracktion`), with no audio
+//! device and with plugins off unless a test needs them; sound is checked by rendering. Those
+//! that need the playhead to move (playing, the loop, recording) run on `SilentAudio`, whose
+//! transport is moved by hand: without an audio device Tracktion's transport does not move.
 
 mod support;
 
@@ -15,7 +17,14 @@ use std::time::Duration;
 
 type App<'a> = Harness<'a, DawApp>;
 
-fn harness<'a>() -> App<'a> {
+/// A window on Tracktion without plugins, with settings under `name`. Hold
+/// `support::tracktion()` while it lives.
+fn harness<'a>(name: &str) -> App<'a> {
+    harness_on(support::tracktion_audio(name, false))
+}
+
+/// A window on `SilentAudio`, whose playhead moves when the test says so ([`advance`]).
+fn silent_harness<'a>() -> App<'a> {
     harness_on(SilentAudio::manual())
 }
 
@@ -141,9 +150,10 @@ fn cell(h: &App, tick: Tick, pitch: u8) -> Pos2 {
     pos
 }
 
-/// Draws a two-bar clip on the first track and opens it.
-fn with_open_clip<'a>() -> App<'a> {
-    with_open_clip_on(SilentAudio::manual())
+/// Draws a two-bar clip on the first track and opens it, in a window on Tracktion (see
+/// [`harness`]).
+fn with_open_clip<'a>(name: &str) -> App<'a> {
+    with_open_clip_on(support::tracktion_audio(name, false))
 }
 
 fn with_open_clip_on<'a>(audio: impl Into<Box<dyn Audio>>) -> App<'a> {
@@ -203,7 +213,8 @@ fn rendered_peak(h: &mut App, name: &str) -> f64 {
 
 #[test]
 fn draw_a_clip_hear_it_undo_it() {
-    let mut h = harness();
+    // The playhead has to move: SilentAudio.
+    let mut h = silent_harness();
     assert!(clips(&h).is_empty());
 
     // Draw a clip over the first two bars.
@@ -281,7 +292,8 @@ fn draw_a_clip_hear_it_undo_it() {
 
 #[test]
 fn clips_move_and_resize() {
-    let mut h = harness();
+    let _engine = support::tracktion();
+    let mut h = harness("ui-clips");
     let (from, to) = (
         lane(&h, 0, Tick::ZERO),
         lane(&h, 0, Tick::bars(2)) - vec2(8.0, 0.0),
@@ -317,7 +329,8 @@ fn clips_move_and_resize() {
 
 #[test]
 fn notes_add_move_resize_velocity_delete() {
-    let mut h = with_open_clip();
+    let _engine = support::tracktion();
+    let mut h = with_open_clip("ui-notes");
     let sixteenth = PPQ / 4;
 
     // Drag out a note of three sixteenths.
@@ -409,13 +422,15 @@ fn playing(h: &App) -> bool {
 
 #[test]
 fn a_window_without_a_server_shows_no_server_controls() {
-    let h = harness();
+    let _engine = support::tracktion();
+    let h = harness("ui-no-server");
     assert!(h.query_by_label_contains("Online").is_none());
 }
 
 #[test]
 fn space_plays_the_loop_goes_round_and_stop_twice_goes_back_to_the_start() {
-    let mut h = with_open_clip();
+    // The playhead has to move: SilentAudio.
+    let mut h = with_open_clip_on(SilentAudio::manual());
     let at = cell(&h, Tick::ZERO, 60);
     click(&mut h, at);
     // Shift-drag in the ruler sets the loop region to bar 1, and turns looping on.
@@ -499,7 +514,8 @@ fn a_track_is_renamed_from_its_header_and_silent_when_muted() {
 
 #[test]
 fn undo_and_redo_go_one_gesture_at_a_time() {
-    let mut h = with_open_clip();
+    let _engine = support::tracktion();
+    let mut h = with_open_clip("ui-undo");
     for beat in 0..3 {
         let at = cell(&h, Tick::beats(beat), 60 + beat as u8);
         click(&mut h, at);
@@ -528,7 +544,8 @@ fn undo_and_redo_go_one_gesture_at_a_time() {
 
 #[test]
 fn tracks_and_devices() {
-    let mut h = harness();
+    let _engine = support::tracktion();
+    let mut h = harness("ui-tracks");
     h.get_by_label("+ Track").click();
     h.run_steps(3);
     let project = h.state().session.project().clone();
@@ -570,7 +587,8 @@ fn screenshots() {
     let Ok(dir) = std::env::var("MDAW_SHOTS") else {
         return;
     };
-    let mut h = with_open_clip();
+    let _engine = support::tracktion();
+    let mut h = with_open_clip("ui-screenshots");
     let sixteenth = PPQ / 4;
     for (step, pitch) in [
         (0, 60),
@@ -608,9 +626,9 @@ fn screenshots() {
         .expect("render")
         .save(format!("{dir}/device.png"))
         .expect("save");
-    // The instrument menu with plugins, in a window on Tracktion.
-    let _engine = support::tracktion();
-    let mut h = plugin_window("ui-screenshots");
+    // The instrument menu with plugins, in a window of its own: one engine at a time.
+    drop(h);
+    let mut h = plugin_window("ui-screenshots-plugins");
     h.get_by_label("Device").click();
     h.run_steps(2);
     let add = h.get_by_label("Instrument…").rect().center();
@@ -624,7 +642,8 @@ fn screenshots() {
 
 #[test]
 fn the_computer_keyboard_plays_the_selected_track() {
-    let mut h = harness();
+    let _engine = support::tracktion();
+    let mut h = harness("ui-keyboard");
     let id = track(&h);
     let held = |h: &App| h.state().session.live().held();
 
@@ -676,7 +695,8 @@ fn the_computer_keyboard_plays_the_selected_track() {
 
 #[test]
 fn typing_a_track_name_plays_nothing() {
-    let mut h = harness();
+    let _engine = support::tracktion();
+    let mut h = harness("ui-typing");
     let name = header_name(&h, 0);
     h.run_steps(30);
     double_click(&mut h, name);
@@ -688,7 +708,8 @@ fn typing_a_track_name_plays_nothing() {
 
 #[test]
 fn what_is_played_while_recording_becomes_a_clip_when_playback_stops() {
-    let mut h = harness();
+    // Recording follows the playhead: SilentAudio.
+    let mut h = silent_harness();
     let rec = h.get_by_label("Rec").rect().center();
     click(&mut h, rec);
     assert!(h.state().session.is_recording());
@@ -823,14 +844,8 @@ fn a_plugin_is_added_from_the_device_tab_and_its_settings_shown() {
 /// not installed, under the name the document gives it; the plugin can be taken off, and the built-in instrument put on again.
 #[test]
 fn without_plugins_a_plugin_comes_off_and_pocket_goes_on() {
-    let session = Session::starter(SilentAudio::manual());
-    let app = DawApp::new(session);
-    let mut h = Harness::builder()
-        .with_size(vec2(1280.0, 800.0))
-        .with_step_dt(1.0 / 60.0)
-        .with_context_setup(DawApp::setup)
-        .build_ui_state(|ui, app: &mut DawApp| app.ui(ui), app);
-    h.run_steps(3);
+    let _engine = support::tracktion();
+    let mut h = harness("ui-without-plugins");
     let id = track(&h);
     let devices = |h: &App| {
         h.state()
