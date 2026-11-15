@@ -1,5 +1,7 @@
 //! The bar at the top: this client's own transport, position, tempo, undo and the output.
 
+use std::collections::VecDeque;
+
 use egui::{Align, Button, DragValue, Layout, Rect, RichText, Sense, Ui, pos2, vec2};
 use mdaw_model::{Op, TempoPoint, Tick};
 
@@ -10,11 +12,22 @@ use crate::{DawApp, Status, theme};
 pub struct TransportState {
     /// Output peaks with a falling decay, per channel.
     meter: [f32; 2],
+    /// When each of the frames in the last second was drawn (egui time, seconds).
+    frames: VecDeque<f64>,
 }
 
 impl TransportState {
     pub fn meter_active(&self) -> bool {
         self.meter.iter().any(|level| *level > 0.001)
+    }
+
+    /// Counts this frame and returns how many were drawn in the last second.
+    fn count_frame(&mut self, now: f64) -> usize {
+        self.frames.push_back(now);
+        while self.frames.front().is_some_and(|t| now - t > 1.0) {
+            self.frames.pop_front();
+        }
+        self.frames.len()
     }
 }
 
@@ -125,11 +138,15 @@ pub fn show(app: &mut DawApp, ui: &mut Ui) {
                 app.session.audio_mut().set_output_gain(db_to_gain(db));
             }
             meter(app, ui);
-            ui.label(
-                RichText::new(app.session.audio().description())
-                    .color(theme::TEXT_DIM)
-                    .small(),
-            );
+            // No repaint is requested for this: an idle window draws rarely, and a low
+            // count then is the truth.
+            let fps = app.transport.count_frame(ui.input(|i| i.time));
+            let stats = format!("{}, {fps} fps", app.session.audio().description());
+            ui.label(RichText::new(stats).color(theme::TEXT_DIM).small())
+                .on_hover_text(
+                    "fps counts the frames drawn in the last second. The window only redraws \
+                     when something changes.",
+                );
             connection(app, ui);
         });
     });
