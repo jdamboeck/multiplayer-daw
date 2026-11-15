@@ -215,7 +215,7 @@ Each milestone ends with a demo and its tests green on Linux; CI also builds and
 - Stem bounce on commit (full track, pre-fader, 24-bit FLAC, peak-scaled to -1 dBFS at most with the factor stored as `stem.gain`, rendered in a fresh offline instance), download and cached decode on other clients, resampling (linear for now) when device rates differ, stale badge when `tempo_hash` differs.
 - Clients that have the same plugin render it live from the state blob; others play the stem.
 - `mdaw-test-plugin` drives headless host tests in CI.
-- **Demo:** A adds Vital to a track through checkout and commits. B, started with plugins disabled (`--no-plugins`, also `--no-clap`), hears the stem; started normally, B renders Vital itself.
+- **Demo:** A adds Vital to a track through checkout and commits. B, started with plugins disabled (`--no-plugins`), hears the stem; started normally, B renders Vital itself.
 
 ## Verification
 

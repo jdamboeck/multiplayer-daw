@@ -22,8 +22,6 @@ Options:
   --no-plugins      Clients load no plugins; tracks with plugins are silent in them.
   --test-synth      Clients also offer the test synth (mdaw-test-plugin as a CLAP file, put
                     first on the clients' CLAP_PATH).
-  --tracktion       Accepted and ignored: clients always play through Tracktion Engine (the
-                    build needs the native part, see docs/tracktion-integration.md).
 
 The pieces can be mixed: `cargo xtask server` in one terminal and `cargo xtask client Ann` in
 others gives the same setup as `demo`, with a server that can be stopped and started alone.
@@ -61,10 +59,8 @@ fn main() -> ExitCode {
             }
             "--fresh" => options.fresh = true,
             "--release" => options.release = true,
-            "--no-plugins" | "--no-clap" => options.no_plugins = true,
+            "--no-plugins" => options.no_plugins = true,
             "--test-synth" => options.test_synth = true,
-            // The default now; kept so that older command lines still work.
-            "--tracktion" => {}
             "--listen" => match args.next() {
                 Some(addr) => options.listen = addr,
                 None => return fail("--listen needs an address"),

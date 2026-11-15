@@ -20,7 +20,7 @@ Usage: mdaw [--join <mdaw://...>] [--name <name>] [--profile <dir>] [--no-plugin
   --profile <dir>   Where this install keeps its identity, and the edits a server has not
                     confirmed yet. Use different directories to run several clients as
                     different people on one machine.
-  --no-plugins      Load no plugins (also --no-clap). Tracks with plugins are silent.
+  --no-plugins      Load no plugins. Tracks with plugins are silent.
   -h, --help        Show this text.
 
 mdaw plays through Tracktion Engine, which hosts VST3, LV2 and CLAP plugins. They are looked
@@ -49,7 +49,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Option<Args>, String>
             }
             "--name" => parsed.name = Some(value("a name")?),
             "--profile" => parsed.profile = Some(value("a directory")?.into()),
-            "--no-plugins" | "--no-clap" => parsed.no_plugins = true,
+            "--no-plugins" => parsed.no_plugins = true,
             other => return Err(format!("unknown argument {other}")),
         }
     }

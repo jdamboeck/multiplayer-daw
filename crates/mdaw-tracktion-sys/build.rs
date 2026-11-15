@@ -41,7 +41,7 @@ fn main() {
     if target_os != "linux" {
         fail(&format!(
             "the Tracktion bridge is not supported on {target_os} yet: only Linux builds it so far. \
-             Build without mdaw-tracktion (plain `cargo build` leaves it out)."
+             The client needs the bridge, so only Linux is supported until it is ported."
         ));
     }
 
@@ -127,10 +127,7 @@ fn main() {
     }
     println!("cargo:root={}", build.display());
     // `links` metadata: DEP_MDAW_TRACKTION_BRIDGE_SCANNER in the build scripts of dependents.
-    let suffix = if target_os == "windows" { ".exe" } else { "" };
-    let scanner = build
-        .join("tracktion-bridge")
-        .join(format!("mdaw-plugin-scan{suffix}"));
+    let scanner = build.join("tracktion-bridge").join("mdaw-plugin-scan");
     println!("cargo:scanner={}", scanner.display());
 }
 
