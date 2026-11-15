@@ -77,16 +77,24 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
+      # Only for the release notes, docs/releases/<version>.md (tag v0.2.0 -> 0.2.0.md).
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: docs/releases
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
-      # The release notes for 0.2.0 are written with the version bump (docs/releases/).
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          notes="docs/releases/${GITHUB_REF_NAME#v}.md"
+          if [ ! -f "$notes" ]; then
+            echo "no release notes: $notes is missing" >&2
+            exit 1
+          fi
           gh release create "$GITHUB_REF_NAME" dist/* \
             --repo "$GITHUB_REPOSITORY" \
             --title "mdaw ${GITHUB_REF_NAME#v}" \
-            --notes "Linux x86-64 build of the client (mdaw), the server (mdaw-server) and the plugin scanner (mdaw-plugin-scan)."
+            --notes-file "$notes"
