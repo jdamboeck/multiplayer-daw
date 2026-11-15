@@ -319,7 +319,9 @@ needs an open audio device (device switching, xruns, loop, restart after a devic
 the stalled-audio event; meters, live notes and playing are covered by the ignored test
 `crates/mdaw-tracktion/tests/live_device.rs`); parameter events from a plugin's own window; the
 resulting order after track and device moves; VST3 and LV2 through the bridge; calls from
-several threads at once. A hung plugin blocks every call: there is no timeout.
+several threads at once. A hung plugin blocks every call: there is no timeout. (Since ABI 5
+plugin windows, scans from another thread and calls during a scan are tested; see the next
+sections. A plugin that hangs inside a call still blocks every call after it.)
 
 ## ABI 4 and the client on Tracktion
 
@@ -363,9 +365,145 @@ Pocket's oscillator mix at 0, 4osc's level repeats to 0.1 %; with two oscillator
 by up to 3 dB from render to render).
 
 In the client (`crates/mdaw-client/src/audio_tracktion.rs`) every engine call that changes
-something or may take long runs on a worker thread, in order; the UI thread only reads the
-engine's state and events. The view is synced at most once per frame (requests coalesce).
-Plugins are scanned on the worker at startup (`--scan` formats; the app scans CLAP, VST3, LV2).
+something or may take long runs on a worker thread; the UI thread only reads the engine's state
+and events. The view is synced at most once per frame (requests coalesce). Since ABI 5 the
+worker takes its jobs from a scheduler and plugins are scanned on a thread of their own (next
+section).
+
+## ABI 5: plugin windows, scanning and the worker
+
+Added 2026-11-15, after plugin windows opened late and engine work piled up behind polling.
+
+**What was wrong (measured on 340b477, `test/editor_bench.c` and
+`crates/mdaw-client/tests/editor_latency.rs`).**
+
+- A scan held the engine's message thread for its whole length: `runChild` waited for each
+  scanner child (up to 30 s per file) inside a message-thread call. Every other call waited — a
+  call issued 300 ms into a scan with one hanging file (limit 4 s) returned after 3.7 s — and so
+  did everything the message loop drives: the bridge's 30 Hz timer (position age 4.0 s), JUCE's
+  60 Hz LV2 UI idle timer, CLAP timers and file descriptors, VST3 run loops.
+- In the client the scan was the first job on the worker: the first sync, and any window
+  request, waited for the whole scan (5.6 s with a 5 s hang limit), and the catalog stayed empty
+  until it ended although the engine knew the plugins from earlier runs.
+- The worker's queue was an unbounded channel. A look at the settings of each plugin with an open
+  window every 500 ms, and a parameter read every 150 ms per shown device, were queued whether or
+  not the last one had run. With a plugin that saves its state in 800 ms, 8 s of frames left
+  17.6 s of work queued.
+- Each state read made the plugin save twice or more: Tracktion's
+  `flushPluginStateToValueTree` already calls `getStateInformation`, the bridge called it again,
+  and a state over 1 KB was read again for the Rust wrapper's second, larger buffer.
+- Windows: the client marked a window open before the engine had made it (a failed open stayed
+  "open"); a window the user had just closed and that was opened again before the bridge's timer
+  ran was then deleted by the timer; removing a device or clearing the project closed its window
+  without telling the client; a CLAP plugin whose `gui.create` failed got an empty black window;
+  showing a window for a device that does not exist returned OK.
+
+Opening a plugin's window itself was never the problem: 5–75 ms for the plugins measured
+(ChowKick VST3/LV2/CLAP 70 ms, vitOTT 62 ms, Fasttracker II 20–45 ms, Dexed LV2 4 ms), 10–20 ms
+to show one again. That is plugin and window-system work on the message thread, and stays there:
+JUCE 8.0.6's VST3 and LV2 formats require the message thread for instance and editor creation
+(`requiresUnblockedMessageThreadDuringCreation` returns false; the VST3 code asserts it).
+
+**The scan.** `mdaw_plugins_scan` still returns when the scan is done, but the message thread
+only does short steps: list the candidates; decide, 16 candidates per call, which need
+examining (LV2 stamps come from lilv and stay on the message thread); for each candidate run the
+scanner child and parse its result on the *calling* thread; merge each result into the
+known-plugin list, the id cache and the scan records in one short message-thread call; save.
+`KnownPluginList`, `PluginIds`, `ScanRecords` and the project are only ever touched on the message
+thread. One scan at a time per engine. Plugins known from earlier scans stay loadable throughout.
+The in-process scan (no scanner configured) is still done entirely on the message thread.
+`mdaw_plugins_scan_cancel` (any thread, sticky for the engine's life, meant for shutdown) kills
+the running child's process group and makes the scan return `MDAW_ERR_CANCELLED`; a cancelled
+file is not recorded. Measured with one hanging file (limit 4 s): calls during the scan return in
+under 1 ms, opening a window during it takes 0.7 ms, the position age stays at 33 ms.
+
+**The client's scan thread.** `TracktionAudio::new` starts a thread `mdaw-plugin-scan`. It first
+publishes the catalog the engine knows from earlier runs, then scans format by format and
+publishes after each; each time the worker gets a coalesced "catalog changed" job that retries
+devices missing from the engine. Dropping `TracktionAudio` cancels the scan and joins the thread
+(1 s while a hanging file is being examined).
+
+**The worker's scheduler** (`crates/mdaw-client/src/engine_queue.rs`, engine-free and
+unit-tested). Producers (UI thread, network thread, scan thread) take a mutex briefly and never
+wait for the worker.
+
+- Classes: *interactive* (window open/close, parameter sets, transport, output gain), *normal*
+  (sync, capture, downloaded state, retry, render, flush, catalog changed) and *background*
+  (one look or parameter read per device).
+- Ordered jobs name what they touch: everything (sync, downloaded state, render, flush, catalog),
+  one device (window, parameter set, capture, retry) or the transport. The next job is the
+  earliest interactive one that touches nothing an earlier waiting job touches — so a window
+  never opens before the sync that made its device, and a set never overtakes a capture of its
+  device — unless the oldest normal job has waited 1 s (then plain order). Otherwise the oldest
+  ordered job. Background jobs run only when no ordered job waits.
+- Coalescing: a parameter set replaces a waiting set of the same parameter (if nothing touching
+  its device was queued after it); a window request replaces the device's waiting one; output
+  gain likewise; a capture, retry or catalog job is dropped if the same one waits; one sync waits
+  at most. Background: one waiting job per (kind, device), plus one follow-up while that one
+  runs; closing a window drops the device's waiting look.
+- A flush first runs the waiting background jobs, then answers.
+- Nothing is preempted: a job that has started (a plugin loading, a slow state save) runs to its
+  end, and whatever comes next waits for it. The scheduler only decides what starts next.
+- A parameter read keeps the shown value of a parameter whose last set had not been carried out
+  when the read began (the worker records the last set it carried out per parameter).
+
+Measured: 8 s of frames with an 800 ms state save leave 313 ms of work (17.6 s before); a sync
+during a scan with a hanging file is done in 0.6 s, the plugin load itself (5.6 s before).
+
+**Window lifecycle.** `mdaw_device_show_editor(engine, device, show, token)`: the client hands a
+token with each open; the window keeps the token of the last open; `MDAW_EVENT_EDITOR_CLOSED`
+carries it. The event is sent when the user or the window manager closed the window, and when
+the bridge deleted it for another reason than a close request (device or track removed, project
+cleared). Opening a window that exists, also one the user has just closed, shows it again and
+brings it to the front; never two windows for one device. A failed open (no device, no editor,
+the plugin made none) leaves no window. In the client a device's window is *Closed*, *Opening*,
+*Open* or *Closing*; it is Open only once the worker has carried out the open without error.
+Answers and events whose token is not the device's current one are ignored, so an old answer or
+the close of an earlier window cannot close a newer one. The answers are taken before the
+events are read in a frame, because a close event about a window can only have been queued after
+the answer about that window. The device tab shows "Opening…" and "Closing…".
+
+**Timing.** With `MDAW_TRACE=1` the bridge writes `mdaw-trace … engine …` lines next to the
+client's: every labelled call with its wait for the message thread and its run time, the steps of
+opening a window (`hasEditor`, `createEditorIfNeeded`, window and `setVisible`, and the "first
+loop turn after show" — the next free turn of the message loop, the closest JUCE lets us come to
+the first paint of a native plugin window), device creation, state reads, each scanned file and
+each format's totals with the time spent on the message thread. The client traces each job's
+wait and run time with the queue depths, the scan flag and the number of open windows (jobs over
+50 ms, all window jobs, and every job over 250 ms as "slow"), and a window's way from the click
+to the worker, the bridge and the frame that shows it open. Without tracing, every message-thread
+call that waited or ran 100 ms or more is written to `engine.log` in the settings folder.
+
+**Tests.** `test/bridge_test.c`: calls, adding a device and the 30 Hz timer during a scan with a
+hanging file; cancel; one plugin save per state read; and, on a virtual display
+(`test/run_gui_tests.sh`, which runs Xvfb with the X atoms JUCE expects), the window lifecycle:
+open twice, close twice, a failing and a slow plugin window, the user's close, 20 closes each
+followed at once by an open, two windows, a device removed and the project cleared with a window
+open. `crates/mdaw-tracktion/tests/scan_concurrency.rs`: the same from Rust.
+`crates/mdaw-client`: the scheduler's unit tests; `tests/engine_scheduling.rs` (catalog from the
+cache before the scan ends, sync and `wait_idle` during a scan, bounded polling with a slow
+plugin, repeated parameter reads, a window that cannot open, drop during a scan);
+`tests/editor_gui.rs` (ignored; run with `MDAW_TEST_GUI=1 test/run_gui_tests.sh cargo test -p
+mdaw-client --features tracktion --test editor_gui -- --ignored`). Benchmarks:
+`native/tracktion-bridge/test/run_editor_bench.sh` and `tests/editor_latency.rs` (ignored). The
+fixture `test-gui.clap` (`test/bad_clap.c`) has a window and a state, with settings for a slow
+save, a slow window and a window that fails.
+
+**Still open.**
+
+- A plugin call that hangs or is slow holds the message thread and the worker; nothing can
+  interrupt it. A slow `getStateInformation` delays the next job by its length (once per look,
+  no longer piling up).
+- A state read right after a parameter set, before the plugin has processed a block, gives the
+  old value (point 8), and the old value then wins. The client renders a moment before a look
+  when no audio device is open; with a device open a few milliseconds remain. To be fixed in
+  the bridge.
+- Two scans on one engine queue on a mutex; written, not exercised.
+- The real first paint of a plugin's window, and behaviour under a real window manager, are
+  checked by hand (`docs/manual-tests/plugin-windows.md`), not by the tests (Xvfb has no window
+  manager).
+- Windows: the scanner child's cancel waits in 20 ms slices; compiled for, not tested.
+- Destroying the engine takes about 1 s (the teardown gaps of point 7).
 
 ## Not tested yet
 
@@ -373,7 +511,8 @@ Plugins are scanned on the worker at startup (`--scan` formats; the app scans CL
   devices; selecting a device other than the default.
 - MIDI input from a hardware device (discovery is tested; receiving notes is not).
 - Recording.
-- Plugin editors: mouse gestures, resizing.
+- Plugin editors: mouse gestures, resizing; first paint; behaviour under a real window manager
+  (hand test only).
 - Out-of-process scanning for the CLAP format (in-process scan only).
 - Plugins with side-chain or multiple output buses in use (extra buses are disabled).
 - Windows and macOS.

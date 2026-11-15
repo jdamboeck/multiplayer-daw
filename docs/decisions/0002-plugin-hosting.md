@@ -75,6 +75,35 @@ Item 4 is built and tested (2026-11-13: the client's outbox, `mdaw-client/src/ou
 "What the client does" in `docs/protocol.md`). Items 2 and 3 are designed, not built. Item 5 is in
 the bridge.
 
+## Addendum 2026-11-15: responsiveness and plugin windows (ABI 5)
+
+Measured, plugin windows were slow to open not because of the plugins (5–75 ms) but because of
+what waited in front of them: a scan that held the engine's message thread while scanner
+children ran, a client worker that ran the scan first and queued polling without bound, and
+plugin states saved two or more times per read. Fixed without changing the decisions above: the
+scan's waiting moved off the message thread (scanner children still examine one file each, with
+the same time limit and records); the client's worker got a scheduler with priorities that keep
+the order of dependent work, and coalesced background polling; windows got an explicit
+lifecycle with tokens. Details and numbers: `docs/tracktion-integration.md`, "ABI 5".
+
+VST3 and LV2 instance and editor creation stay on the message thread, as JUCE 8.0.6 requires.
+A plugin call that hangs or is slow still blocks the engine; in-process calls cannot be
+interrupted.
+
+**Out-of-process plugin windows are not built.** Carla separates UI bridges (a plugin's window in
+another process) from plugin bridges (its processing in another process) and prefers UI bridges
+by default. After the fixes above, the measured delays left are the plugins' own window creation
+(tens of milliseconds) — nothing a UI process would remove; it would add process start and IPC,
+and it cannot be done for VST3 and LV2 instances that live in this process without the instance
+data-access paths those formats rely on. A UI process would only pay off for plugins whose window
+code hangs or crashes the application while their processing is fine; none is known so far. If
+one appears, the smallest useful prototype is for LV2 only (the format has a clean UI/DSP split
+through ports and atoms): a helper process that instantiates the plugin's LV2 UI, drives
+`LV2UI_Idle_Interface` at 30 Hz or more on its own UI thread, embeds into an X11 window id the
+host passes, and exchanges port writes and atom messages with the host over a pipe, with a
+timeout like Carla's (4 s) after which the host closes the window and says so. CLAP and VST3 would
+come after, if ever. The per-plugin isolation of *processing* stays the planned phase above.
+
 ## Consequences
 
 - One plugin path for all formats: automation, latency, state, windows behave alike.
