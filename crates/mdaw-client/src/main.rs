@@ -4,20 +4,15 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::{Arc, OnceLock};
 
+use mdaw_client::audio_tracktion::{TracktionAudio, TracktionOptions};
 use mdaw_client::outbox::Outbox;
-use mdaw_client::{Audio, DawApp, OldAudio, Session, Waker, profile};
-use mdaw_engine::Engine;
+use mdaw_client::{Audio, DawApp, Session, SilentAudio, Waker, profile};
 use mdaw_net::JoinInfo;
-
-// Debug builds stop on any allocation made inside the audio callback.
-#[cfg(debug_assertions)]
-#[global_allocator]
-static ALLOC: mdaw_engine::alloc_guard::GuardedAlloc = mdaw_engine::alloc_guard::GuardedAlloc;
 
 const USAGE: &str = "\
 mdaw, a collaborative DAW (prototype)
 
-Usage: mdaw [--join <mdaw://...>] [--name <name>] [--profile <dir>] [--no-plugins] [--old-engine]
+Usage: mdaw [--join <mdaw://...>] [--name <name>] [--profile <dir>] [--no-plugins]
 
   --join <string>   Join the project on a server. The server prints the join string when it starts.
                     Without it, mdaw opens a local project that is not saved.
@@ -26,15 +21,11 @@ Usage: mdaw [--join <mdaw://...>] [--name <name>] [--profile <dir>] [--no-plugin
                     confirmed yet. Use different directories to run several clients as
                     different people on one machine.
   --no-plugins      Load no plugins (also --no-clap). Tracks with plugins are silent.
-  --test-synth      Also offer the built-in test synth, a plugin for trying things out that
-                    can be told to fail or crash.
-  --old-engine      Play through the Rust engine instead of Tracktion Engine, for comparison
-                    during the move to Tracktion (CLAP plugins only). Builds without the
-                    `tracktion` feature always use it.
   -h, --help        Show this text.
 
-Plugins are looked for in the usual folders (CLAP also in CLAP_PATH). Through Tracktion, VST3,
-LV2 and CLAP plugins are hosted; through the Rust engine, CLAP only.
+mdaw plays through Tracktion Engine, which hosts VST3, LV2 and CLAP plugins. They are looked
+for in the usual folders (CLAP also in CLAP_PATH). If the engine does not start, mdaw says why
+and runs without sound.
 ";
 
 #[derive(Default)]
@@ -43,8 +34,6 @@ struct Args {
     name: Option<String>,
     profile: Option<PathBuf>,
     no_plugins: bool,
-    test_synth: bool,
-    old_engine: bool,
 }
 
 /// `Ok(None)` means help was asked for.
@@ -61,8 +50,6 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Option<Args>, String>
             "--name" => parsed.name = Some(value("a name")?),
             "--profile" => parsed.profile = Some(value("a directory")?.into()),
             "--no-plugins" | "--no-clap" => parsed.no_plugins = true,
-            "--test-synth" => parsed.test_synth = true,
-            "--old-engine" => parsed.old_engine = true,
             other => return Err(format!("unknown argument {other}")),
         }
     }
@@ -102,30 +89,16 @@ fn main() -> ExitCode {
         }
     };
 
-    #[cfg(debug_assertions)]
-    mdaw_engine::alloc_guard::set_abort(true);
-
     let profile_dir = args.profile.clone().or_else(profile::default_dir);
-    let tracktion = cfg!(feature = "tracktion") && !args.old_engine;
-    let audio: Box<dyn Audio> = if tracktion {
-        let Some(dir) = &profile_dir else {
-            eprintln!("mdaw: no place for the profile; pass --profile <dir>");
-            return ExitCode::FAILURE;
-        };
-        match tracktion_audio(dir, !args.no_plugins) {
-            Ok(audio) => audio,
-            Err(err) => {
-                eprintln!("mdaw: {err}");
-                return ExitCode::FAILURE;
-            }
-        }
-    } else {
-        let engine = Engine::open().unwrap_or_else(|err| {
-            eprintln!("mdaw: no audio output ({err}); running without sound");
-            Engine::manual(48_000, true)
-        });
-        Box::new(OldAudio::new(engine))
+    let Some(engine_dir) = profile_dir.as_ref().map(|dir| dir.join("engine")) else {
+        eprintln!("mdaw: no place for the profile; pass --profile <dir>");
+        return ExitCode::FAILURE;
     };
+    let audio = tracktion_audio(&engine_dir, !args.no_plugins).unwrap_or_else(|err| {
+        eprintln!("mdaw: {err}; running without sound");
+        Box::new(SilentAudio::new())
+    });
+    let engine_failed = audio.as_any().is::<SilentAudio>();
 
     // The network thread wakes the UI through this once the window exists.
     let ctx: Arc<OnceLock<egui::Context>> = Arc::default();
@@ -166,8 +139,8 @@ fn main() -> ExitCode {
     };
 
     let mut session = session;
-    if !args.no_plugins && !tracktion {
-        session.enable_plugins(mdaw_plugin::Host::standard(args.test_synth));
+    if engine_failed {
+        session.notify("The audio engine did not start, so mdaw plays nothing; see the terminal for why.");
     }
 
     let options = eframe::NativeOptions {
@@ -196,12 +169,10 @@ fn main() -> ExitCode {
     }
 }
 
-/// Tracktion Engine on the default audio device, its settings in the profile. Plugins are looked
+/// Tracktion Engine on the default audio device, its settings in `dir`. Plugins are looked
 /// for on a thread of the engine's while the window opens.
-#[cfg(feature = "tracktion")]
-fn tracktion_audio(profile: &std::path::Path, plugins: bool) -> Result<Box<dyn Audio>, String> {
-    use mdaw_client::audio_tracktion::{TracktionAudio, TracktionOptions};
-    let mut options = TracktionOptions::new(profile.join("engine"));
+fn tracktion_audio(dir: &std::path::Path, plugins: bool) -> Result<Box<dyn Audio>, String> {
+    let mut options = TracktionOptions::new(dir);
     options.open_audio_device = true;
     options.enable_plugins = plugins;
     let audio = TracktionAudio::new(options).map_err(|e| format!("the audio engine did not start: {e}"))?;
@@ -215,9 +186,4 @@ fn tracktion_audio(profile: &std::path::Path, plugins: bool) -> Result<Box<dyn A
         eprintln!("mdaw: Tracktion Engine, no audio device opened; running without sound");
     }
     Ok(Box::new(audio))
-}
-
-#[cfg(not(feature = "tracktion"))]
-fn tracktion_audio(_profile: &std::path::Path, _plugins: bool) -> Result<Box<dyn Audio>, String> {
-    Err("this build has no Tracktion Engine".into())
 }

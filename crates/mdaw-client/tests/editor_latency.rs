@@ -10,7 +10,7 @@
 //! process, so this binary has one test):
 //!
 //! ```sh
-//! cargo test -p mdaw-client --features tracktion --test editor_latency -- --ignored --nocapture
+//! cargo test -p mdaw-client --test editor_latency -- --ignored --nocapture
 //! ```
 //!
 //! The plugin is `test-gui.clap` (native/tracktion-bridge/test/bad_clap.c), built next to the

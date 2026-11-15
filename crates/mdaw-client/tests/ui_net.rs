@@ -1,11 +1,13 @@
 //! Two whole client windows against a real server in one process: pointer events in, the other
-//! window's document and labels out.
+//! window's document and labels out. The windows run on `SilentAudio`, except for the one that
+//! adds a plugin, which has Tracktion (one engine per process).
+
+mod support;
 
 use egui::{Pos2, vec2};
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
-use mdaw_client::{DawApp, Session, Status, Who};
-use mdaw_engine::Engine;
+use mdaw_client::{Audio, DawApp, Session, SilentAudio, Status, Who};
 use mdaw_model::{ClipId, ClipProp, Device, DeviceKind, EntityRef, Note, NoteProp, Op, Tick, TrackId};
 use mdaw_server::{Config, Server};
 use std::path::Path;
@@ -24,22 +26,22 @@ fn serve(dir: &Path, listen: &str) -> Server {
 }
 
 fn window<'a>(server: &Server, name: &str) -> App<'a> {
-    window_with(server, name, Engine::manual(48_000, false))
+    window_with(server, name, SilentAudio::manual())
 }
 
-/// A window whose engine keeps time like one with an audio device.
+/// A window whose transport keeps time like one with an audio device.
 fn live_window<'a>(server: &Server, name: &str) -> App<'a> {
-    window_with(server, name, Engine::manual(48_000, true))
+    window_with(server, name, SilentAudio::new())
 }
 
-fn window_with<'a>(server: &Server, name: &str, engine: Engine) -> App<'a> {
+fn window_with<'a>(server: &Server, name: &str, audio: impl Into<Box<dyn Audio>>) -> App<'a> {
     let mut user_key = [0u8; 16];
     user_key[..name.len()].copy_from_slice(name.as_bytes());
     let who = Who {
         user_key,
         name: name.into(),
     };
-    let session = Session::join(server.join_info().clone(), who, engine, Arc::new(|| {})).unwrap();
+    let session = Session::join(server.join_info().clone(), who, audio, Arc::new(|| {})).unwrap();
     let mut harness = Harness::builder()
         .with_size(vec2(1280.0, 800.0))
         .with_step_dt(1.0 / 60.0)
@@ -51,7 +53,7 @@ fn window_with<'a>(server: &Server, name: &str, engine: Engine) -> App<'a> {
 
 /// Runs frames in both windows until `done`.
 fn until(a: &mut App, b: &mut App, what: &str, done: impl Fn(&DawApp, &DawApp) -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         a.step();
         b.step();
@@ -115,7 +117,15 @@ fn shows(h: &App, text: &str) -> bool {
 
 /// Ann adds a track and draws a two-bar clip at the start; both windows end up with it.
 fn with_a_clip<'a>(server: &Server) -> (App<'a>, App<'a>, TrackId, ClipId) {
-    let (mut ann, mut ben) = (window(server, "ann"), window(server, "ben"));
+    with_a_clip_on(server, SilentAudio::manual())
+}
+
+/// [`with_a_clip`], with ann's window on `audio`.
+fn with_a_clip_on<'a>(
+    server: &Server,
+    audio: impl Into<Box<dyn Audio>>,
+) -> (App<'a>, App<'a>, TrackId, ClipId) {
+    let (mut ann, mut ben) = (window_with(server, "ann", audio), window(server, "ben"));
     ann.get_by_label("+ Track").click();
     ann.run_steps(3);
     let (from, to) = (
@@ -480,10 +490,17 @@ fn screenshots() {
 fn a_plugin_added_in_the_device_tab_reaches_the_other_window() {
     let dir = tempfile::tempdir().unwrap();
     let server = serve(dir.path(), "127.0.0.1:0");
-    let (mut ann, mut ben, track, _) = with_a_clip(&server);
-    ann.state_mut()
-        .session
-        .enable_plugins(mdaw_plugin::Host::test_synth_only());
+    // Ann's window on Tracktion, with the test synth; Ben's without plugins.
+    let _engine = support::tracktion();
+    let audio = support::tracktion_audio("ui-net-plugin", true);
+    let (mut ann, mut ben, track, _) = with_a_clip_on(&server, audio);
+    until(&mut ann, &mut ben, "ann's engine finds the test synth", |a, _| {
+        !a.session.scanning_plugins()
+            && a.session
+                .plugin_catalog()
+                .iter()
+                .any(|p| p.id == mdaw_test_plugin::ID)
+    });
     ann.state_mut().sel.track = Some(track);
     ann.get_by_label("Device").click();
     ann.run_steps(3);
@@ -500,7 +517,7 @@ fn a_plugin_added_in_the_device_tab_reaches_the_other_window() {
     ann.drop_at(add);
     ann.run_steps(2);
     // Plugins are grouped by format; resting on the format opens its submenu.
-    let clap = ann.get_by_label("CLAP (1)").rect().center();
+    let clap = ann.get_by_label_contains("CLAP (").rect().center();
     ann.hover_at(clap);
     ann.run_steps(3);
     let synth = ann.get_by_label_contains("mdaw Test Synth").rect().center();
@@ -517,7 +534,7 @@ fn a_plugin_added_in_the_device_tab_reaches_the_other_window() {
     ben.run_steps(3);
     assert_eq!(
         ben.state().session.track_sound(track),
-        mdaw_client::plugins::TrackSound::NotInstalled,
+        mdaw_client::TrackSound::NotInstalled,
         "the track header says \"plugin not installed\""
     );
     assert!(shows(&ben, "is not installed here"));

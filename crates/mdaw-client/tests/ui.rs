@@ -1,17 +1,26 @@
-//! Drives the whole client headlessly: real pointer and key events in, document and audio out.
+//! Drives the whole client headlessly: real pointer and key events in, document and transport
+//! out. Most tests run on `SilentAudio` (no sound, a transport moved by hand); those about sound
+//! or plugins run on Tracktion, one at a time (`support::tracktion`), and listen by rendering.
+
+mod support;
 
 use egui::{Key, Modifiers, PointerButton, Pos2, vec2};
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
+use mdaw_client::audio_tracktion::TracktionAudio;
 use mdaw_client::ui::{arrange, piano_roll};
-use mdaw_client::{DawApp, Session, Tab};
-use mdaw_engine::Engine;
+use mdaw_client::{Audio, DawApp, Session, SilentAudio, Tab};
 use mdaw_model::{Clip, ClipId, Note, PPQ, Tick, TrackId};
+use std::time::Duration;
 
 type App<'a> = Harness<'a, DawApp>;
 
 fn harness<'a>() -> App<'a> {
-    let app = DawApp::new(Session::starter(Engine::manual(48_000, false)));
+    harness_on(SilentAudio::manual())
+}
+
+fn harness_on<'a>(audio: impl Into<Box<dyn Audio>>) -> App<'a> {
+    let app = DawApp::new(Session::starter(audio));
     let mut harness = Harness::builder()
         .with_size(vec2(1280.0, 800.0))
         .with_step_dt(1.0 / 60.0)
@@ -32,7 +41,7 @@ fn click(h: &mut App, pos: Pos2) {
 
 /// Opens a submenu of an open menu, the way a pointer does: by resting on its button.
 fn open_submenu(h: &mut App, label: &str) {
-    let at = h.get_by_label(label).rect().center();
+    let at = h.get_by_label_contains(label).rect().center();
     h.hover_at(at);
     h.run_steps(3);
 }
@@ -134,7 +143,11 @@ fn cell(h: &App, tick: Tick, pitch: u8) -> Pos2 {
 
 /// Draws a two-bar clip on the first track and opens it.
 fn with_open_clip<'a>() -> App<'a> {
-    let mut h = harness();
+    with_open_clip_on(SilentAudio::manual())
+}
+
+fn with_open_clip_on<'a>(audio: impl Into<Box<dyn Audio>>) -> App<'a> {
+    let mut h = harness_on(audio);
     let (from, to) = (
         lane(&h, 0, Tick::ZERO),
         lane(&h, 0, Tick::bars(2)) - vec2(8.0, 0.0),
@@ -149,14 +162,43 @@ fn with_open_clip<'a>() -> App<'a> {
     h
 }
 
-fn peak(h: &mut App, frames: usize) -> f32 {
-    let audio = h
-        .state_mut()
+fn silent<'h>(h: &'h mut App) -> &'h mut SilentAudio {
+    h.state_mut()
         .session
-        .engine_mut()
-        .pump(frames)
-        .expect("a manual engine");
-    audio.iter().fold(0.0, |peak, sample| peak.max(sample.abs()))
+        .audio_mut()
+        .as_any_mut()
+        .downcast_mut::<SilentAudio>()
+        .expect("a window on SilentAudio")
+}
+
+/// Plays on for `time` (the transport moves only when told to).
+fn advance(h: &mut App, time: Duration) {
+    silent(h).advance(time);
+    h.run_steps(1);
+}
+
+/// The live notes sounding: auditioning and the computer keyboard.
+fn sounding(h: &mut App) -> Vec<(TrackId, u8)> {
+    silent(h).held()
+}
+
+/// The peak of the first bar, rendered through the window's Tracktion engine.
+fn rendered_peak(h: &mut App, name: &str) -> f64 {
+    let path = support::scratch("client-tests").join(format!("ui-{name}.wav"));
+    let _ = std::fs::remove_file(&path);
+    h.run_steps(2);
+    let audio = h.state_mut().session.audio_mut();
+    let te = audio.as_any_mut().downcast_mut::<TracktionAudio>().unwrap();
+    te.wait_idle();
+    h.state_mut()
+        .session
+        .render(&path, Tick::ZERO, Tick::bars(1))
+        .expect("render");
+    let data = std::fs::read(&path).unwrap();
+    let pcm = &data[data.windows(4).position(|w| w == b"data").unwrap() + 8..];
+    pcm.chunks_exact(3)
+        .map(|s| ((i32::from_le_bytes([0, s[0], s[1], s[2]]) >> 8) as f64 / 8_388_608.0).abs())
+        .fold(0.0, f64::max)
 }
 
 #[test]
@@ -188,8 +230,10 @@ fn draw_a_clip_hear_it_undo_it() {
     h.step();
     h.drag_at(at);
     h.step();
-    assert!(
-        peak(&mut h, 4_800) > 0.01,
+    let id = track(&h);
+    assert_eq!(
+        sounding(&mut h),
+        [(id, 60)],
         "the key sounds while the pointer is down"
     );
     h.drop_at(at);
@@ -203,22 +247,20 @@ fn draw_a_clip_hear_it_undo_it() {
             vel: 100
         }]
     );
-    peak(&mut h, 96_000);
     assert!(
-        peak(&mut h, 4_800) < 1e-4,
+        sounding(&mut h).is_empty(),
         "the preview note is released with the pointer"
     );
 
-    // Hear it.
+    // Play it (that it is heard is `tests/ui_tracktion.rs`).
     h.key_press(Key::Space);
     h.run_steps(2);
-    assert!(h.state().session.engine().is_playing());
-    assert!(peak(&mut h, 12_000) > 0.01, "the drawn note is audible");
-    h.run_steps(2);
-    assert!(h.state().session.engine().position() > 0.0, "the playhead moves");
+    assert!(h.state().session.is_playing());
+    advance(&mut h, Duration::from_millis(250));
+    assert!(h.state().session.position() > 0.0, "the playhead moves");
     h.key_press(Key::Space);
     h.run_steps(2);
-    assert!(!h.state().session.engine().is_playing());
+    assert!(!h.state().session.is_playing());
 
     // Undo the note, then the clip.
     undo(&mut h);
@@ -362,7 +404,7 @@ fn header_name(h: &App, row: usize) -> Pos2 {
 }
 
 fn playing(h: &App) -> bool {
-    h.state().session.engine().is_playing()
+    h.state().session.is_playing()
 }
 
 #[test]
@@ -398,28 +440,29 @@ fn space_plays_the_loop_goes_round_and_stop_twice_goes_back_to_the_start() {
     h.key_press(Key::Space);
     h.run_steps(2);
     assert!(playing(&h));
-    // Twice round a loop of one bar at 120 bpm: 4 seconds.
+    // More than twice round a loop of one bar at 120 bpm (2 seconds).
     for _ in 0..10 {
-        assert!(peak(&mut h, 24_000) >= 0.0);
-        let at = h.state().session.engine().position();
+        advance(&mut h, Duration::from_millis(450));
+        let at = h.state().session.position();
         assert!(at < loop_end, "the playhead stays inside the loop, at {at}");
     }
     h.key_press(Key::Space);
     h.run_steps(2);
     assert!(!playing(&h), "space again pauses");
-    assert!(h.state().session.engine().position() > 0.0);
+    assert!(h.state().session.position() > 0.0);
 
     for _ in 0..2 {
         h.get_by_label("Stop").click();
         h.run_steps(2);
     }
-    assert_eq!(h.state().session.engine().position(), 0.0);
+    assert_eq!(h.state().session.position(), 0.0);
     assert!(h.query_by_label_contains("1.1.1").is_some());
 }
 
 #[test]
 fn a_track_is_renamed_from_its_header_and_silent_when_muted() {
-    let mut h = with_open_clip();
+    let _engine = support::tracktion();
+    let mut h = with_open_clip_on(support::tracktion_audio("ui-mute", false));
     let at = cell(&h, Tick::ZERO, 60);
     click(&mut h, at);
 
@@ -444,18 +487,14 @@ fn a_track_is_renamed_from_its_header_and_silent_when_muted() {
     };
     assert_eq!(renamed(&h), "Keys");
 
+    assert!(rendered_peak(&mut h, "unmuted") > 0.01, "the note sounds");
     h.get_by_label("M").click();
     h.run_steps(2);
-    h.key_press(Key::Space);
-    h.run_steps(2);
-    assert_eq!(peak(&mut h, 24_000), 0.0, "a muted track is silent");
+    assert!(h.state().session.project().track(track).unwrap().content.mute);
+    assert_eq!(rendered_peak(&mut h, "muted"), 0.0, "a muted track is silent");
     h.get_by_label("M").click();
-    for label in ["Pause", "Stop", "Play"] {
-        h.run_steps(2);
-        h.get_by_label(label).click();
-    }
     h.run_steps(2);
-    assert!(peak(&mut h, 24_000) > 0.01, "and sounds again");
+    assert!(rendered_peak(&mut h, "unmuted-again") > 0.01, "and sounds again");
 }
 
 #[test]
@@ -511,7 +550,7 @@ fn tracks_and_devices() {
     // The device tab shows the synth; turning it off is an edit like any other.
     h.state_mut().tab = Tab::Device;
     h.run_steps(3);
-    h.get_by_label("Cutoff");
+    h.get_by_label("FILTER Freq");
     h.get_by_label("On").click();
     h.run_steps(3);
     let project = h.state().session.project().clone();
@@ -569,13 +608,14 @@ fn screenshots() {
         .expect("render")
         .save(format!("{dir}/device.png"))
         .expect("save");
-    h.state_mut()
-        .session
-        .enable_plugins(mdaw_plugin::Host::test_synth_only());
-    h.run_steps(3);
+    // The instrument menu with plugins, in a window on Tracktion.
+    let _engine = support::tracktion();
+    let mut h = plugin_window("ui-screenshots");
+    h.get_by_label("Device").click();
+    h.run_steps(2);
     let add = h.get_by_label("Instrument…").rect().center();
     click(&mut h, add);
-    open_submenu(&mut h, "CLAP (1)");
+    open_submenu(&mut h, "CLAP (");
     h.render()
         .expect("render")
         .save(format!("{dir}/instrument_menu.png"))
@@ -678,27 +718,61 @@ fn what_is_played_while_recording_becomes_a_clip_when_playback_stops() {
     assert!(clips(&h).is_empty(), "the take is one undo step");
 }
 
+/// A window on Tracktion that has found the test synth. Hold `support::tracktion()`.
+fn plugin_window<'a>(name: &str) -> App<'a> {
+    let mut h = harness_on(support::tracktion_audio(name, true));
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while h.state().session.scanning_plugins()
+        || !h
+            .state()
+            .session
+            .plugin_catalog()
+            .iter()
+            .any(|p| p.id == mdaw_test_plugin::ID)
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the scan finds the test synth"
+        );
+        h.step();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    h.run_steps(2);
+    h
+}
+
+/// Runs frames until `done`, giving the engine time.
+fn until(h: &mut App, what: &str, done: impl Fn(&App) -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !done(h) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting until {what}"
+        );
+        h.step();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    h.run_steps(2);
+}
+
 #[test]
 fn a_plugin_is_added_from_the_device_tab_and_its_settings_shown() {
-    let mut session = Session::starter(Engine::manual(48_000, false));
-    session.enable_plugins(mdaw_plugin::Host::test_synth_only());
-    let app = DawApp::new(session);
-    let mut h = Harness::builder()
-        .with_size(vec2(1280.0, 800.0))
-        .with_step_dt(1.0 / 60.0)
-        .with_context_setup(DawApp::setup)
-        .build_ui_state(|ui, app: &mut DawApp| app.ui(ui), app);
-    h.run_steps(3);
+    let _engine = support::tracktion();
+    let mut h = plugin_window("ui-plugin");
     let id = track(&h);
 
     h.get_by_label("Device").click();
     h.run_steps(2);
     let add = h.get_by_label("Instrument…").rect().center();
     click(&mut h, add);
-    open_submenu(&mut h, "CLAP (1)");
+    open_submenu(&mut h, "CLAP (");
     let synth = h.get_by_label_contains("mdaw Test Synth").rect().center();
     click(&mut h, synth);
     h.run_steps(4);
+    until(&mut h, "the plugin runs", |h| {
+        let device = h.state().session.project().track(id).unwrap().content.devices[0].id;
+        h.state().session.plugin_running(id, device)
+    });
     let devices = |h: &App| {
         h.state()
             .session
@@ -711,17 +785,13 @@ fn a_plugin_is_added_from_the_device_tab_and_its_settings_shown() {
     };
     assert_eq!(devices(&h).len(), 1, "one instrument: the synth replaced Pocket");
     assert!(
-        matches!(&devices(&h)[0].kind, mdaw_model::DeviceKind::Plugin { id, .. } if id == mdaw_plugin::TEST_SYNTH),
+        matches!(&devices(&h)[0].kind, mdaw_model::DeviceKind::Plugin { id, .. } if id == mdaw_test_plugin::ID),
         "a plugin device"
     );
     // The plugin is simply there, and runs.
     assert!(
         h.query_all_by_label_contains("Balance").count() > 0,
         "its settings are shown"
-    );
-    assert!(
-        h.query_by_label("Open window").is_none(),
-        "the test synth has no window of its own"
     );
     // It is a device like the others: undo takes it away again, and Pocket is back.
     undo(&mut h);
@@ -736,7 +806,7 @@ fn a_plugin_is_added_from_the_device_tab_and_its_settings_shown() {
         let add = h.get_by_label("Instrument…").rect().center();
         click(&mut h, add);
         if choice != "Pocket (built in)" {
-            open_submenu(&mut h, "CLAP (1)");
+            open_submenu(&mut h, "CLAP (");
         }
         let item = h.get_by_label_contains(choice).rect().center();
         click(&mut h, item);
@@ -753,7 +823,7 @@ fn a_plugin_is_added_from_the_device_tab_and_its_settings_shown() {
 /// not installed, under the name the document gives it; the plugin can be taken off, and the built-in instrument put on again.
 #[test]
 fn without_plugins_a_plugin_comes_off_and_pocket_goes_on() {
-    let session = Session::starter(Engine::manual(48_000, false));
+    let session = Session::starter(SilentAudio::manual());
     let app = DawApp::new(session);
     let mut h = Harness::builder()
         .with_size(vec2(1280.0, 800.0))
@@ -778,7 +848,7 @@ fn without_plugins_a_plugin_comes_off_and_pocket_goes_on() {
         h.state_mut().session.ids().device(),
         mdaw_model::DeviceKind::Plugin {
             format: mdaw_model::PluginFormat::Clap,
-            id: mdaw_plugin::TEST_SYNTH.into(),
+            id: mdaw_test_plugin::ID.into(),
             name: "Ann's Synth".into(),
             state: None,
         },

@@ -1,8 +1,10 @@
 //! What the session and the UI need from a sound engine, and nothing more.
 //!
-//! Two engines sit behind it during the move to Tracktion: [`crate::audio_old::OldAudio`], the
-//! Rust engine (`mdaw-engine`, `mdaw-dsp`, `mdaw-plugin`), and with the `tracktion` feature
-//! `crate::audio_tracktion::TracktionAudio`. Each plays the project on this machine only;
+//! The client plays through Tracktion Engine, [`crate::audio_tracktion::TracktionAudio`]. The
+//! seam keeps the session testable without sound and the engine replaceable:
+//! [`crate::audio_silent::SilentAudio`] stands in where no sound is wanted, or where the
+//! engine cannot be had (it does not start, or a second session in the same process needs one:
+//! Tracktion allows one engine per process). Each plays the project on this machine only;
 //! nothing here travels.
 
 use std::any::Any;
@@ -29,8 +31,8 @@ pub enum TrackSound {
     NotInstalled,
     /// A plugin is installed but cannot run, as while its settings are not here.
     Silent,
-    /// A plugin crashed or failed to load.
-    Crashed,
+    /// A plugin failed to load.
+    Failed,
     /// A plugin is starting, or the plugins are being looked for.
     Loading,
 }
@@ -47,7 +49,7 @@ pub enum DeviceStatus {
     NotInstalled,
     /// Installed, but waiting for its settings.
     WaitingForState,
-    /// It crashed, or failed to load: the text says what happened.
+    /// It failed to load: the text says what happened.
     Failed(String),
 }
 
@@ -109,8 +111,9 @@ pub trait Audio: Any {
 
     // ---- the project
 
-    /// The built-in instrument this engine plays, which new tracks get: Pocket on the Rust
-    /// engine, its successor for 4OSC (`BuiltinKind::TwoOsc`, also called "Pocket") on Tracktion.
+    /// The built-in instrument this engine plays, which new tracks get: the one for 4OSC
+    /// (`BuiltinKind::TwoOsc`, called "Pocket" in the UI). The old Pocket of the Rust engine
+    /// (`BuiltinKind::Pocket`) is played by none of them any more.
     fn default_instrument(&self) -> BuiltinKind;
 
     /// The project as it should sound from now on: the session's view. Cheap when it did not
@@ -189,7 +192,7 @@ pub trait Audio: Any {
     /// Opens or closes the plugin's own window (an engine may do it later; see
     /// [`Audio::editor_state`]).
     fn toggle_editor(&mut self, track: TrackId, device: DeviceId, title: &str) -> Result<(), String>;
-    /// Starts a crashed or failed plugin again, with the settings the document has.
+    /// Starts a plugin that failed to load again, with the settings the document has.
     fn restart_plugin(&mut self, track: TrackId, device: DeviceId);
 
     // ---- plugin settings and the document
@@ -221,7 +224,7 @@ pub fn track_sound_from(statuses: impl IntoIterator<Item = DeviceStatus>) -> Tra
         return TrackSound::Builtin;
     }
     if statuses.iter().any(|s| matches!(s, DeviceStatus::Failed(_))) {
-        return TrackSound::Crashed;
+        return TrackSound::Failed;
     }
     if statuses.contains(&DeviceStatus::Loading) {
         return TrackSound::Loading;
@@ -233,4 +236,24 @@ pub fn track_sound_from(statuses: impl IntoIterator<Item = DeviceStatus>) -> Tra
         return TrackSound::NotInstalled;
     }
     TrackSound::Silent
+}
+
+/// The old Pocket of the Rust engine (`BuiltinKind::Pocket`): no engine plays it any more, and
+/// the client shows it as an instrument to replace. It leaves the model with the next store
+/// format.
+pub fn is_old_pocket(device: &mdaw_model::Device) -> bool {
+    matches!(
+        device.kind,
+        mdaw_model::DeviceKind::Builtin {
+            kind: BuiltinKind::Pocket,
+            ..
+        }
+    )
+}
+
+/// Whether a track's instrument is the old Pocket, so that the track is silent here.
+pub fn has_old_pocket(project: &Project, track: TrackId) -> bool {
+    project
+        .track(track)
+        .is_some_and(|t| t.content.devices.iter().any(is_old_pocket))
 }

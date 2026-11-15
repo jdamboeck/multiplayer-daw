@@ -8,7 +8,7 @@
 //!
 //! ```sh
 //! native/tracktion-bridge/test/run_gui_tests.sh \
-//!     cargo test -p mdaw-client --features tracktion --test editor_gui -- --ignored --nocapture
+//!     cargo test -p mdaw-client --test editor_gui -- --ignored --nocapture
 //! ```
 //!
 //! The plugins are `test-gui.clap` and `bad-hang.clap` (native/tracktion-bridge/test/bad_clap.c),

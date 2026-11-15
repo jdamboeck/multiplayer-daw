@@ -14,10 +14,7 @@ workspace = true
 mdaw-model.workspace = true
 mdaw-proto.workspace = true
 mdaw-sync.workspace = true
-mdaw-dsp.workspace = true
-mdaw-engine.workspace = true
 mdaw-net.workspace = true
-mdaw-plugin.workspace = true
 anyhow.workspace = true
 getrandom.workspace = true
 imbl.workspace = true
@@ -29,13 +26,7 @@ eframe.workspace = true
 egui.workspace = true
 chrono.workspace = true
 midir.workspace = true
-mdaw-tracktion = { workspace = true, optional = true }
-
-[features]
-# Plays through Tracktion Engine (crates/mdaw-tracktion), which builds native code with CMake and
-# a C++ toolchain. Off by default, so that plain `cargo build` / `cargo test` and CI need neither;
-# `cargo run -p mdaw-client --features tracktion` or `cargo xtask demo --tracktion` turn it on.
-tracktion = ["dep:mdaw-tracktion"]
+mdaw-tracktion.workspace = true
 
 [dev-dependencies]
 egui_kittest = { workspace = true, features = ["wgpu"] }
@@ -55,27 +46,15 @@ path = "src/main.rs"
 [[bin]]
 name = "mdaw-slice"
 path = "src/bin/mdaw-slice.rs"
-required-features = ["tracktion"]
-
-[[test]]
-name = "slice"
-required-features = ["tracktion"]
-
-[[test]]
-name = "ui_tracktion"
-required-features = ["tracktion"]
 
 # A benchmark of the engine worker behind plugin windows; ignored, run by hand (see the file).
 [[test]]
 name = "editor_latency"
-required-features = ["tracktion"]
 
 # How the engine worker schedules its jobs: scan, slow state reads, windows that fail, shutdown.
 [[test]]
 name = "engine_scheduling"
-required-features = ["tracktion"]
 
 # Plugin windows with a display; ignored, run by hand on a virtual one (see the file).
 [[test]]
 name = "editor_gui"
-required-features = ["tracktion"]

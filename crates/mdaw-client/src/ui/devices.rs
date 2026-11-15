@@ -4,20 +4,10 @@ use egui::{
     Align, Align2, Color32, ComboBox, FontId, Layout, Response, RichText, Sense, Shape, Stroke, Ui, pos2,
     vec2,
 };
-use mdaw_dsp::pocket::{self, ParamInfo, Scale};
 use mdaw_model::two_osc::{self, Group, Kind};
 use mdaw_model::{BuiltinKind, Device, DeviceKind, Op, PluginFormat, TrackId};
 
 use crate::{DawApp, DeviceStatus, EditorState, PluginEntry, theme};
-
-/// Parameters by section, as indices into `pocket::PARAMS`.
-const SECTIONS: [(&str, &[usize]); 5] = [
-    ("Oscillators", &[0, 1, 2, 3, 4, 5, 6]),
-    ("Amp envelope", &[7, 8, 9, 10]),
-    ("Filter", &[11, 12, 13, 18]),
-    ("Filter envelope", &[14, 15, 16, 17]),
-    ("Output", &[19]),
-];
 
 pub fn toolbar(app: &mut DawApp, ui: &mut Ui) {
     let name = app
@@ -48,7 +38,7 @@ pub fn show(app: &mut DawApp, ui: &mut Ui) {
                 DeviceKind::Builtin {
                     kind: BuiltinKind::Pocket,
                     ..
-                } => pocket_panel(app, ui, track_id, device),
+                } => old_pocket_panel(app, ui, track_id, device),
                 DeviceKind::Builtin {
                     kind: BuiltinKind::TwoOsc,
                     ..
@@ -120,26 +110,9 @@ fn plugin_panel(
             app.session.edit(vec![Op::DeviceRemove { track, id: device.id }]);
         }
     });
-    if app.session.plugin_crashed(track, device.id) {
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(format!(
-                    "{name} crashed. The rest of mdaw goes on; the track is silent here until the plugin is restarted."
-                ))
-                .color(theme::METER_HOT),
-            );
-            if ui
-                .button("Restart")
-                .on_hover_text("Start the plugin again, with the settings it had shortly before")
-                .clicked()
-            {
-                app.session.restart_plugin(track, device.id);
-            }
-        });
-        return;
-    }
     if !running {
-        let why = match app.session.device_status(track, device.id) {
+        let status = app.session.device_status(track, device.id);
+        let why = match &status {
             DeviceStatus::NotInstalled => {
                 format!("{name} is not installed here, so it gives no sound on this computer.")
             }
@@ -147,7 +120,17 @@ fn plugin_panel(
             DeviceStatus::WaitingForState => format!("{name} waits for its settings."),
             _ => "Starting the plugin…".to_string(),
         };
-        ui.label(RichText::new(why).color(theme::TEXT_DIM));
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(why).color(theme::TEXT_DIM));
+            if matches!(status, DeviceStatus::Failed(_))
+                && ui
+                    .button("Try again")
+                    .on_hover_text("Load the plugin again, with the settings the document has")
+                    .clicked()
+            {
+                app.session.restart_plugin(track, device.id);
+            }
+        });
         return;
     }
     let (params, count) = app
@@ -226,7 +209,7 @@ fn add_plugin(app: &mut DawApp, ui: &mut Ui, track: TrackId) {
     ui.horizontal(|ui| {
         ui.menu_button("Instrument…", |ui| {
             ui.label(RichText::new("A track has one instrument; this one takes its place.").small());
-            // Both engines call their built-in instrument Pocket.
+            // The UI calls the built-in instrument Pocket.
             if ui.button("Pocket (built in)").clicked() {
                 pick = Some(Pick::Builtin);
                 ui.close();
@@ -273,37 +256,28 @@ fn by_format(catalog: &[PluginEntry], instruments: bool) -> Vec<(PluginFormat, V
         .collect()
 }
 
-fn pocket_panel(app: &mut DawApp, ui: &mut Ui, track: TrackId, device: &Device) {
-    // Two rows of sections, so the panel fits a window of ordinary width.
-    const ROWS: [&[usize]; 2] = [&[0, 4], &[1, 2, 3]];
-    ui.horizontal_top(|ui| {
-        builtin_header(app, ui, track, device);
-        ui.separator();
-        ui.vertical(|ui| {
-            for row in ROWS {
-                // A fixed height, because a separator takes all the height it is offered.
-                let size = vec2(ui.available_width(), 98.0);
-                ui.allocate_ui_with_layout(size, Layout::left_to_right(Align::Min), |ui| {
-                    for (position, &section) in row.iter().enumerate() {
-                        if position > 0 {
-                            ui.separator();
-                        }
-                        let (title, params) = SECTIONS[section];
-                        ui.vertical(|ui| {
-                            ui.label(RichText::new(title).small().color(theme::TEXT_DIM));
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 2.0;
-                                for &index in params {
-                                    param(app, ui, track, device, &pocket::PARAMS[index]);
-                                }
-                            });
-                        });
-                    }
-                });
-                ui.add_space(4.0);
-            }
-        });
+/// The old Pocket of the Rust engine (`BuiltinKind::Pocket`), from documents made before
+/// Tracktion: nothing plays it any more, so it is shown as an instrument to replace.
+fn old_pocket_panel(app: &mut DawApp, ui: &mut Ui, track: TrackId, device: &Device) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Pocket (old engine)").strong().size(15.0));
+        if ui
+            .button("Use the built-in instrument")
+            .on_hover_text("Put the built-in instrument in its place")
+            .clicked()
+        {
+            app.session.use_builtin(track);
+        }
+        if ui
+            .button("Remove")
+            .on_hover_text("Take the instrument off the track")
+            .clicked()
+        {
+            app.session.edit(vec![Op::DeviceRemove { track, id: device.id }]);
+        }
     });
+    let why = "Not played any more; replace it with the built-in instrument.";
+    ui.label(RichText::new(why).color(theme::WARN));
 }
 
 /// The name of a built-in instrument and its on switch, left of its controls.
@@ -338,10 +312,6 @@ fn two_osc_panel(app: &mut DawApp, ui: &mut Ui, track: TrackId, device: &Device)
         builtin_header(app, ui, track, device);
         ui.separator();
         ui.vertical(|ui| {
-            if app.session.device_status(track, device.id) == crate::DeviceStatus::NotInstalled {
-                let why = "This instrument plays on the Tracktion engine only; it is silent here.";
-                ui.label(RichText::new(why).color(theme::WARN));
-            }
             for row in ROWS {
                 let size = vec2(ui.available_width(), 98.0);
                 ui.allocate_ui_with_layout(size, Layout::left_to_right(Align::Min), |ui| {
@@ -465,24 +435,6 @@ trait KnobParam {
     fn text(&self, value: f64) -> String;
 }
 
-impl KnobParam for ParamInfo {
-    fn name(&self) -> &str {
-        self.name
-    }
-    fn default(&self) -> f64 {
-        f64::from(self.default)
-    }
-    fn travel_of(&self, value: f64) -> f64 {
-        f64::from(to_norm(self, value as f32))
-    }
-    fn value_at(&self, travel: f64) -> f64 {
-        f64::from(from_norm(self, travel as f32))
-    }
-    fn text(&self, value: f64) -> String {
-        format_value(self.unit, value as f32)
-    }
-}
-
 struct TwoOscKnob<'a> {
     param: &'a two_osc::Param,
     label: &'a str,
@@ -503,7 +455,7 @@ impl KnobParam for TwoOscKnob<'_> {
     }
     fn value_at(&self, travel: f64) -> f64 {
         let value = self.param.from_travel(travel);
-        // Whole cents, as for Pocket.
+        // Whole cents.
         if self.param.unit == "ct" {
             value.round()
         } else {
@@ -515,71 +467,12 @@ impl KnobParam for TwoOscKnob<'_> {
     }
 }
 
-fn param(app: &mut DawApp, ui: &mut Ui, track: TrackId, device: &Device, info: &ParamInfo) {
-    let stored = device.params.get(&info.id).map_or(info.default, |v| *v as f32);
-    let value = if stored.is_finite() {
-        stored.clamp(info.min, info.max)
-    } else {
-        info.default
-    };
-    let set = |value: Option<f32>| Op::DeviceSetParam {
-        track,
-        id: device.id,
-        param: info.id,
-        value: value.map(f64::from),
-    };
-    if info.scale == Scale::Stepped {
-        ui.vertical(|ui| {
-            ui.add_space(6.0);
-            let label = ui.label(RichText::new(info.name).size(11.0).color(theme::TEXT_DIM));
-            let mut choice = value.round() as usize;
-            let current = info.choices.get(choice).copied().unwrap_or("?");
-            let combo = ComboBox::from_id_salt(info.id)
-                .selected_text(current)
-                .width(76.0)
-                .show_ui(ui, |ui| {
-                    for (index, name) in info.choices.iter().enumerate() {
-                        if ui.selectable_value(&mut choice, index, *name).changed() {
-                            app.session.edit(vec![set(Some(index as f32))]);
-                        }
-                    }
-                });
-            combo.response.labelled_by(label.id);
-        });
-        return;
-    }
-    let (response, change) = knob(ui, info, f64::from(value));
-    knob_edit(app, &response, change, |value| set(value.map(|v| v as f32)));
-}
-
 enum Change {
     Set(f64),
     Reset,
 }
 
-fn to_norm(info: &ParamInfo, value: f32) -> f32 {
-    let norm = match info.scale {
-        Scale::Log => (value / info.min).ln() / (info.max / info.min).ln(),
-        Scale::Linear | Scale::Stepped => (value - info.min) / (info.max - info.min),
-    };
-    norm.clamp(0.0, 1.0)
-}
-
-fn from_norm(info: &ParamInfo, norm: f32) -> f32 {
-    let value = match info.scale {
-        Scale::Log => info.min * (info.max / info.min).powf(norm),
-        Scale::Linear | Scale::Stepped => info.min + (info.max - info.min) * norm,
-    };
-    // Whole steps for semitones and cents.
-    let value = if matches!(info.unit, "st" | "ct") {
-        value.round()
-    } else {
-        value
-    };
-    value.clamp(info.min, info.max)
-}
-
-/// A value as a knob shows it. Pocket's unitless values are fractions, shown in percent.
+/// A value as a knob shows it. Unitless values are fractions, shown in percent.
 fn format_value(unit: &str, value: f32) -> String {
     match unit {
         "s" if value < 1.0 => format!("{:.0} ms", value * 1000.0),

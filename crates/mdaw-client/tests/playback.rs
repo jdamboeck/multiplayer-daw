@@ -1,10 +1,9 @@
 //! Playback is each client's own: two clients on one server play, stop, seek and loop
 //! independently, and nothing about it goes over the network. What one records arrives at the
-//! other as an ordinary edit.
+//! other as an ordinary edit. On `SilentAudio`, whose transport runs with the clock: two
+//! sessions in one process cannot both have Tracktion.
 
-use mdaw_client::{Session, Status, Who};
-use mdaw_dsp::pocket;
-use mdaw_engine::Engine;
+use mdaw_client::{Session, SilentAudio, Status, Who};
 use mdaw_model::*;
 use mdaw_net::JoinInfo;
 use mdaw_proto::{ClientMsg, ServerMsg};
@@ -29,8 +28,8 @@ fn join(join: &JoinInfo, name: &str) -> Session {
         user_key,
         name: name.into(),
     };
-    let engine = Engine::manual(48_000, true);
-    Session::join(join.clone(), who, engine, Arc::new(|| {})).unwrap()
+    // Its transport keeps time with the clock, as one with an audio device.
+    Session::join(join.clone(), who, SilentAudio::new(), Arc::new(|| {})).unwrap()
 }
 
 fn until(sessions: &mut [&mut Session], what: &str, done: impl Fn(&mut [&mut Session]) -> bool) {
@@ -69,15 +68,12 @@ fn settle(sessions: &mut [&mut Session]) {
     });
 }
 
-/// A Pocket track without clips.
+/// A track with the built-in instrument and no clips.
 fn add_track(session: &mut Session) -> TrackId {
     let ids = session.ids();
     let (track, device) = (ids.track(), ids.device());
     let mut content = TrackContent::default();
-    let kind = DeviceKind::Builtin {
-        kind: BuiltinKind::Pocket,
-        dsp_version: pocket::DSP_VERSION,
-    };
+    let kind = mdaw_client::builtin_kind(BuiltinKind::TwoOsc);
     content.devices.push_back(Device::new(device, kind));
     assert!(session.edit(vec![Op::TrackAdd {
         id: track,

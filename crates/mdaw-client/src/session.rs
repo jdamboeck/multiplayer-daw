@@ -9,7 +9,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
-use mdaw_dsp::pocket;
 use mdaw_model::{
     ActorId, BlobHash, BuiltinKind, Device, DeviceId, DeviceKind, EntityRef, IdGen, Op, Project, TempoMap,
     TempoPoint, Tick, TickRange, TrackContent, TrackId, TrackShell, UserId, apply, apply_all,
@@ -19,7 +18,6 @@ use mdaw_proto::{ClientMsg, Event, Peer, Presence, ServerMsg, Superseded, SyncDa
 use mdaw_sync::{Gesture, Loopback, Replica};
 
 use crate::audio::{Audio, DeviceStatus, EditorState, ParamEntry, PluginEntry, TrackSound};
-use crate::audio_old::OldAudio;
 use crate::clock;
 use crate::link::{Link, LinkEvent, Upload, Waker, Who};
 use crate::live::Live;
@@ -304,27 +302,6 @@ impl Session {
         self.audio.as_mut()
     }
 
-    /// The Rust engine, when the session runs on it (tests that drive a manual engine). Panics
-    /// on any other engine.
-    pub fn engine(&self) -> &mdaw_engine::Engine {
-        self.old_audio()
-            .expect("this session does not run on the Rust engine")
-            .engine()
-    }
-
-    /// See [`Session::engine`].
-    pub fn engine_mut(&mut self) -> &mut mdaw_engine::Engine {
-        self.audio
-            .as_any_mut()
-            .downcast_mut::<OldAudio>()
-            .expect("this session does not run on the Rust engine")
-            .engine_mut()
-    }
-
-    fn old_audio(&self) -> Option<&OldAudio> {
-        self.audio.as_any().downcast_ref::<OldAudio>()
-    }
-
     /// Starts auditioning a note on `track` (the piano roll does, while a key is held).
     pub fn preview_on(&mut self, track: TrackId, pitch: u8, vel: u8) {
         self.audio.live().note_on(track, PREVIEW_KEY, pitch, vel);
@@ -403,15 +380,6 @@ impl Session {
         }
         self.keep_plugins();
         self.record();
-    }
-
-    /// Hosts plugins from now on, on the Rust engine: tracks whose plugins are installed here
-    /// are heard. Without this, every track with plugins is silent. Other engines find their
-    /// plugins themselves; for them this does nothing.
-    pub fn enable_plugins(&mut self, host: mdaw_plugin::Host) {
-        if let Some(old) = self.audio.as_any_mut().downcast_mut::<OldAudio>() {
-            old.enable_plugins(host);
-        }
     }
 
     pub fn plugins_enabled(&self) -> bool {
@@ -535,12 +503,7 @@ impl Session {
         }
     }
 
-    /// Whether a plugin device crashed or failed, and waits to be restarted.
-    pub fn plugin_crashed(&self, track: TrackId, device: DeviceId) -> bool {
-        matches!(self.device_status(track, device), DeviceStatus::Failed(_))
-    }
-
-    /// Starts a crashed plugin again, with its last settings.
+    /// Starts a plugin that failed to load again, with the settings the document has.
     pub fn restart_plugin(&mut self, track: TrackId, device: DeviceId) {
         self.audio.restart_plugin(track, device);
     }
@@ -899,6 +862,11 @@ impl Session {
         &self.notices
     }
 
+    /// Tells the user something, in the notice strip.
+    pub fn notify(&mut self, text: &str) {
+        notice(&mut self.notices, text);
+    }
+
     pub fn dismiss_notice(&mut self, index: usize) {
         if index < self.notices.len() {
             self.notices.remove(index);
@@ -1208,7 +1176,8 @@ fn record_displaced(displaced: &mut Vec<Displaced>, event: Event) {
 /// A built-in device of this kind, as a new one is made.
 pub fn builtin_kind(kind: BuiltinKind) -> DeviceKind {
     let dsp_version = match kind {
-        BuiltinKind::Pocket => pocket::DSP_VERSION,
+        // The old Pocket's (`mdaw-dsp`), for documents that still have it; no engine plays it.
+        BuiltinKind::Pocket => 1,
         BuiltinKind::TwoOsc => mdaw_model::two_osc::DSP_VERSION,
     };
     DeviceKind::Builtin { kind, dsp_version }

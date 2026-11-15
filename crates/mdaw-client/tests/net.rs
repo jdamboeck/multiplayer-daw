@@ -1,8 +1,7 @@
 //! A real server and real clients in one process, talking QUIC over loopback. Only the audio
-//! device and the window are missing.
+//! device and the window are missing: the clients run on `SilentAudio`.
 
-use mdaw_client::{Session, Status, Who};
-use mdaw_engine::Engine;
+use mdaw_client::{Session, SilentAudio, Status, Who};
 use mdaw_model::{
     BuiltinKind, Clip, ClipId, ClipProp, Device, DeviceKind, EntityRef, MixProp, Note, NoteId, NoteProp, Op,
     PluginFormat, Project, ShellProp, Tick, TrackContent, TrackId, TrackShell,
@@ -32,13 +31,13 @@ fn who(name: &str) -> Who {
 }
 
 fn join(server: &Server, name: &str) -> Session {
-    let engine = Engine::manual(48_000, false);
+    let engine = SilentAudio::manual();
     Session::join(server.join_info().clone(), who(name), engine, Arc::new(|| {})).unwrap()
 }
 
 /// A client that keeps its unconfirmed edits in an outbox under `profile`, as the app does.
 fn join_kept(server: &Server, name: &str, profile: &Path) -> Session {
-    let engine = Engine::manual(48_000, false);
+    let engine = SilentAudio::manual();
     let outbox = mdaw_client::outbox::Outbox::dir_for(profile, server.join_info());
     Session::join_with_outbox(
         server.join_info().clone(),
@@ -469,7 +468,7 @@ fn what_one_drags_is_locked_for_the_others() {
 fn joining_fails_with_a_reason() {
     let dir = tempfile::tempdir().unwrap();
     let server = serve(dir.path(), "127.0.0.1:0");
-    let engine = || Engine::manual(48_000, false);
+    let engine = || SilentAudio::manual();
 
     let mut wrong_token = server.join_info().clone();
     wrong_token.token = "0".repeat(32);
@@ -563,7 +562,7 @@ fn joining_a_server_that_is_not_there_gives_up_with_a_reason() {
     let info = server.join_info().clone();
     server.stop();
     let started = Instant::now();
-    let error = Session::join(info, who("zed"), Engine::manual(48_000, false), Arc::new(|| {}))
+    let error = Session::join(info, who("zed"), SilentAudio::manual(), Arc::new(|| {}))
         .err()
         .expect("nobody answers");
     assert!(error.to_string().contains("could not join"), "{error}");
@@ -666,8 +665,8 @@ fn an_edit_past_the_limits_is_refused_at_once() {
     // 32 devices fill the track, the next is one too many.
     let device = |ann: &mut Session| {
         let kind = DeviceKind::Builtin {
-            kind: BuiltinKind::Pocket,
-            dsp_version: mdaw_dsp::pocket::DSP_VERSION,
+            kind: BuiltinKind::TwoOsc,
+            dsp_version: mdaw_model::two_osc::DSP_VERSION,
         };
         Op::DeviceAdd {
             track,
@@ -807,4 +806,52 @@ fn an_upload_the_server_refuses_takes_back_its_edit_and_blocks_nothing() {
     until(&mut [&mut ann], "the outbox is emptied", |_| {
         outbox_len(&server, profile.path()) == 0
     });
+}
+
+/// Settings the server never got are refused, and taken back where they were made; the device
+/// keeps the settings it had for everyone. (Was part of the old `tests/plugins.rs`.)
+#[test]
+fn settings_the_server_never_got_are_refused_and_taken_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = serve(dir.path(), "127.0.0.1:0");
+    let (mut ann, mut ben) = (join(&server, "ann"), join(&server, "ben"));
+    let (track, _, _) = add_track(&mut ann, "Lead");
+    let device = ann.ids().device();
+    let plugin = Device::new(
+        device,
+        DeviceKind::Plugin {
+            format: PluginFormat::Clap,
+            id: "org.example.synth".into(),
+            name: "Synth".into(),
+            state: None,
+        },
+    );
+    assert!(ann.edit(vec![Op::DeviceAdd {
+        track,
+        device: plugin,
+        after: None,
+    }]));
+    settle(&mut [&mut ann, &mut ben]);
+
+    let nowhere = mdaw_proto::blob_hash(b"never uploaded");
+    assert!(ben.edit(vec![Op::DeviceSetState {
+        track,
+        id: device,
+        state: Some(nowhere),
+    }]));
+    until(&mut [&mut ann, &mut ben], "the edit is refused", |s| {
+        s[1].notices().iter().any(|n| n.contains("not accepted"))
+    });
+    settle(&mut [&mut ann, &mut ben]);
+    for session in [&ann, &ben] {
+        let kind = &session
+            .project()
+            .track(track)
+            .unwrap()
+            .content
+            .device(device)
+            .unwrap()
+            .kind;
+        assert!(matches!(kind, DeviceKind::Plugin { state: None, .. }), "{kind:?}");
+    }
 }

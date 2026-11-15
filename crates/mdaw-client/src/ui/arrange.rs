@@ -15,7 +15,7 @@ use super::{
     MAX_DB, MIN_DB, TimeAxis, db_to_gain, gain_to_db, paint_grid, paint_playhead, paint_ruler, snap_ceil,
     snap_floor, snap_round,
 };
-use crate::plugins::TrackSound;
+use crate::audio::TrackSound;
 use crate::{DawApp, Focus, theme};
 
 pub const HEADER_W: f32 = 232.0;
@@ -645,7 +645,7 @@ fn header(app: &mut DawApp, ui: &mut Ui, rect: Rect, clip: Rect, id: TrackId, tr
                 TrackSound::Builtin | TrackSound::Live => None,
                 TrackSound::NotInstalled => Some(("plugin not installed", theme::WARN)),
                 TrackSound::Silent => Some(("no sound here", theme::WARN)),
-                TrackSound::Crashed => Some(("plugin crashed", theme::METER_HOT)),
+                TrackSound::Failed => Some(("plugin failed", theme::METER_HOT)),
                 TrackSound::Loading => Some(("loading plugin…", theme::TEXT_DIM)),
             };
             if let Some((label, color)) = sound {

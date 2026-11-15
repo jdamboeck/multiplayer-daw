@@ -54,7 +54,7 @@ use mdaw_tracktion::{Config, Engine, EngineState, EntityKind, Event, Problem, St
 
 use crate::audio::{
     Audio, DeviceStatus, EditorState, LiveSink, ParamEntry, PluginEntry, SavedState, TrackSound,
-    track_sound_from,
+    has_old_pocket, is_old_pocket, track_sound_from,
 };
 use crate::clock;
 use crate::engine_queue::{Class, EngineQueue, JobInfo, Key, Picked, Spec};
@@ -383,6 +383,27 @@ fn plugin_devices(project: &Project) -> impl Iterator<Item = (TrackId, &mdaw_mod
     })
 }
 
+/// The project as the engine is to play it: without the old Pocket, which is not played any
+/// more (`mdaw-tracktion` would approximate it with 4OSC). Cheap when there is none.
+fn without_old_pocket(project: &Project) -> Project {
+    let mut project = project.clone();
+    let old: Vec<TrackId> = project
+        .tracks
+        .iter()
+        .filter(|(_, t)| t.content.devices.iter().any(is_old_pocket))
+        .map(|(id, _)| *id)
+        .collect();
+    for id in old {
+        if let Some(track) = project.tracks.get_mut(&id) {
+            let track = Arc::make_mut(track);
+            Arc::make_mut(&mut track.content)
+                .devices
+                .retain(|d| !is_old_pocket(d));
+        }
+    }
+    project
+}
+
 struct TeLive(Arc<Engine>);
 
 impl LiveSink for TeLive {
@@ -641,6 +662,9 @@ impl TracktionAudio {
         let Some(d) = project.track(track).and_then(|t| t.content.device(device)) else {
             return DeviceStatus::Loading;
         };
+        if is_old_pocket(d) {
+            return DeviceStatus::NotInstalled;
+        }
         if matches!(d.kind, DeviceKind::Builtin { .. }) {
             return DeviceStatus::Builtin;
         }
@@ -742,7 +766,7 @@ impl Audio for TracktionAudio {
                 let now = state_in(project, ahead.track, *device);
                 !ahead.handed_over && now == Some(ahead.before)
             });
-            shared.view = Some(project.clone());
+            shared.view = Some(without_old_pocket(project));
             !std::mem::replace(&mut shared.sync_queued, true)
         };
         if queue {
@@ -949,6 +973,9 @@ impl Audio for TracktionAudio {
         let Some(t) = project.track(track) else {
             return TrackSound::Silent;
         };
+        if has_old_pocket(project, track) {
+            return TrackSound::Silent;
+        }
         let shared = lock(&self.shared);
         track_sound_from(
             t.content

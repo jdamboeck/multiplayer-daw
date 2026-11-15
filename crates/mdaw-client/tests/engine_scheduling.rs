@@ -3,7 +3,7 @@
 //! pile up, a plugin window that cannot open ends closed with a word to the user, and shutting
 //! down does not wait for a scan. One engine per process, so one test, in steps.
 //!
-//! Needs the `tracktion` feature. The test plugins (`test-gui.clap`, `test-stateless.clap`,
+//! The test plugins (`test-gui.clap`, `test-stateless.clap`,
 //! `bad-hang.clap`, native/tracktion-bridge/test/bad_clap.c) are built next to the plugin
 //! scanner and copied to `target/phase5-scratch/engine-scheduling/clap`. No window is opened:
 //! `DISPLAY` is removed first.

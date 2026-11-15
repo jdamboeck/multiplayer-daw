@@ -1,9 +1,9 @@
 [workspace]
 resolver = "3"
 members = ["crates/*", "xtask"]
-# Everything but the Tracktion bridge crates, which build native code with CMake (submodules,
-# a C++ toolchain, ~10 minutes cold). Plain `cargo build` / `cargo test` leave them out;
-# `-p mdaw-tracktion` or `--workspace` take them in. New crates must be added here too.
+# Everything but the Tracktion bridge crates. The client depends on them, so plain `cargo build`
+# builds their native part too (CMake, submodules, a C++ toolchain, ~10 minutes cold); their own
+# tests run with `-p mdaw-tracktion` or `--workspace`. New crates must be added here too.
 default-members = [
     "crates/mdaw-client",
     "crates/mdaw-dsp",

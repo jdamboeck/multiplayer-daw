@@ -1,5 +1,5 @@
 //! The whole client headlessly on Tracktion Engine: pointer and key events in, document and a
-//! render out. One engine per process, so one test. Needs the `tracktion` feature. No audio
+//! render out. One engine per process, so one test. No audio
 //! device: playing is what the transport was asked for; sound is checked by rendering.
 
 use egui::{Key, Pos2, vec2};

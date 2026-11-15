@@ -20,10 +20,10 @@ Options:
   --listen <addr>   Where the server listens (default: 127.0.0.1:7464).
   --release         Use optimised builds.
   --no-plugins      Clients load no plugins; tracks with plugins are silent in them.
-  --test-synth      Clients also offer the built-in test synth (Rust engine only).
-  --tracktion       Build the client with Tracktion Engine (`--features mdaw-client/tracktion`;
-                    needs the native build, see docs/tracktion-integration.md) and play
-                    through it. Without it the clients use the Rust engine.
+  --test-synth      Clients also offer the test synth (mdaw-test-plugin as a CLAP file, put
+                    first on the clients' CLAP_PATH), a plugin that can be told to fail.
+  --tracktion       Accepted and ignored: clients always play through Tracktion Engine (the
+                    build needs the native part, see docs/tracktion-integration.md).
 
 The pieces can be mixed: `cargo xtask server` in one terminal and `cargo xtask client Ann` in
 others gives the same setup as `demo`, with a server that can be stopped and started alone.
@@ -40,8 +40,6 @@ struct Options {
     no_plugins: bool,
     /// Clients offer the test synth.
     test_synth: bool,
-    /// Clients play through Tracktion Engine.
-    tracktion: bool,
 }
 
 fn main() -> ExitCode {
@@ -54,15 +52,19 @@ fn main() -> ExitCode {
         listen: "127.0.0.1:7464".into(),
         no_plugins: false,
         test_synth: false,
-        tracktion: false,
     };
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "-h" | "--help" => {
+                print!("{USAGE}");
+                return ExitCode::SUCCESS;
+            }
             "--fresh" => options.fresh = true,
             "--release" => options.release = true,
             "--no-plugins" | "--no-clap" => options.no_plugins = true,
             "--test-synth" => options.test_synth = true,
-            "--tracktion" => options.tracktion = true,
+            // The default now; kept so that older command lines still work.
+            "--tracktion" => {}
             "--listen" => match args.next() {
                 Some(addr) => options.listen = addr,
                 None => return fail("--listen needs an address"),
@@ -190,15 +192,12 @@ fn build(options: &Options) -> Result<()> {
     let release = options.release;
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let mut command = Command::new(cargo);
-    command.current_dir(root()).args([
-        "build",
-        "-p",
-        "mdaw-server",
-        "-p",
-        "mdaw-client",
-        "-p",
-        "mdaw-plugin",
-    ]);
+    command
+        .current_dir(root())
+        .args(["build", "-p", "mdaw-server", "-p", "mdaw-client"]);
+    if options.test_synth {
+        command.args(["-p", "mdaw-test-plugin"]);
+    }
     // Cargo describes xtask itself to this process. Passed on, that description makes build
     // scripts that watch it (ring's does) rebuild on every switch between xtask and plain cargo.
     for (name, _) in std::env::vars_os() {
@@ -219,18 +218,36 @@ fn build(options: &Options) -> Result<()> {
     if release {
         command.arg("--release");
     }
-    if options.tracktion {
-        command.args(["--features", "mdaw-client/tracktion"]);
-    }
     match command.status() {
         Ok(status) if status.success() => {}
         Ok(status) => return Err(format!("the build failed with {status}")),
         Err(err) => return Err(format!("could not run cargo: {err}")),
     }
-    if options.tracktion {
-        copy_scanner(release)?;
+    copy_scanner(release)?;
+    if options.test_synth {
+        copy_test_synth(release)?;
     }
     Ok(())
+}
+
+/// The folder the clients find the test synth in, as a CLAP file. Not in the demo folder,
+/// which `--fresh` clears after the build.
+fn test_synth_dir() -> PathBuf {
+    target_dir().join("demo-clap")
+}
+
+/// Puts the test synth the build made into [`test_synth_dir`] as `mdaw-test-synth.clap`.
+fn copy_test_synth(release: bool) -> Result<()> {
+    let profile = if release { "release" } else { "debug" };
+    let from = target_dir()
+        .join(profile)
+        .join(format!("libmdaw_test_plugin{}", std::env::consts::DLL_SUFFIX));
+    let dir = test_synth_dir();
+    std::fs::create_dir_all(&dir).map_err(|err| format!("creating {}: {err}", dir.display()))?;
+    let to = dir.join("mdaw-test-synth.clap");
+    std::fs::copy(&from, &to)
+        .map(|_| ())
+        .map_err(|err| format!("copying {} to {}: {err}", from.display(), to.display()))
 }
 
 /// Puts the plugin scanner the native build made next to the client, where a package has it,
@@ -290,7 +307,12 @@ fn start_client(name: &str, join: &str, options: &Options) -> Result<Child> {
         command.arg("--no-plugins");
     }
     if options.test_synth {
-        command.arg("--test-synth");
+        let mut path = vec![test_synth_dir()];
+        if let Some(more) = std::env::var_os("CLAP_PATH") {
+            path.extend(std::env::split_paths(&more));
+        }
+        let path = std::env::join_paths(path).map_err(|err| format!("CLAP_PATH: {err}"))?;
+        command.env("CLAP_PATH", path);
     }
     command
         .spawn()

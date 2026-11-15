@@ -473,3 +473,52 @@ impl PluginNotePortsImpl for MainThread<'_> {
 }
 
 clack_export_entry!(SinglePluginEntry<TestSynth>);
+
+/// Copies the test synth, as built for this workspace, into `dir` as `mdaw-test-synth.clap`, and
+/// returns `dir`: a folder for `CLAP_PATH`. For tests: it finds the library next to the running
+/// executable (`target/<profile>/deps/libmdaw_test_plugin.so`, or one folder up). A test that
+/// has this crate as a dev-dependency got it built with itself; only if it is missing is it
+/// built here, since a second cargo build during a test run would overwrite the rlib (a
+/// `cdylib` crate's files carry no hash) under the feet of the run. Tests copying at once are
+/// safe: each copies to a name of its own and renames.
+pub fn clap_folder(dir: &std::path::Path) -> std::path::PathBuf {
+    use std::path::PathBuf;
+    let exe = std::env::current_exe().expect("the running executable");
+    let mut profile: PathBuf = exe.parent().expect("the executable's folder").into();
+    if profile.ends_with("deps") {
+        profile.pop();
+    }
+    let name = format!(
+        "{}mdaw_test_plugin{}",
+        std::env::consts::DLL_PREFIX,
+        std::env::consts::DLL_SUFFIX
+    );
+    let candidates = [profile.join("deps").join(&name), profile.join(&name)];
+    let built = match candidates.iter().find(|p| p.is_file()) {
+        Some(built) => built.clone(),
+        None => {
+            let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+            let mut build = std::process::Command::new(cargo);
+            build.args(["build", "-p", "mdaw-test-plugin"]);
+            if profile.ends_with("release") {
+                build.arg("--release");
+            }
+            let status = build.status().expect("run cargo");
+            assert!(status.success(), "building the test plugin");
+            candidates[1].clone()
+        }
+    };
+    std::fs::create_dir_all(dir).unwrap_or_else(|e| panic!("create {}: {e}", dir.display()));
+    let file = dir.join("mdaw-test-synth.clap");
+    let bytes = std::fs::read(&built).unwrap_or_else(|e| panic!("read {}: {e}", built.display()));
+    if std::fs::read(&file).ok().as_deref() != Some(&bytes[..]) {
+        let part = dir.join(format!(
+            "mdaw-test-synth.clap.{}.{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&part, &bytes).unwrap_or_else(|e| panic!("write {}: {e}", part.display()));
+        std::fs::rename(&part, &file).unwrap_or_else(|e| panic!("rename to {}: {e}", file.display()));
+    }
+    dir.to_path_buf()
+}

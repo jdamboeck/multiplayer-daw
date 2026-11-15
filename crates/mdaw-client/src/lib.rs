@@ -6,8 +6,7 @@
 
 mod app;
 pub mod audio;
-pub mod audio_old;
-#[cfg(feature = "tracktion")]
+pub mod audio_silent;
 pub mod audio_tracktion;
 pub mod clock;
 pub mod engine_queue;
@@ -15,7 +14,6 @@ mod link;
 pub mod live;
 pub mod midi;
 pub mod outbox;
-pub mod plugins;
 pub mod profile;
 mod record;
 mod session;
@@ -25,6 +23,6 @@ pub mod ui;
 
 pub use app::{DawApp, Focus, Selection, Tab};
 pub use audio::{Audio, DeviceStatus, EditorState, ParamEntry, PluginEntry, TrackSound};
-pub use audio_old::OldAudio;
+pub use audio_silent::SilentAudio;
 pub use link::{Fetched, Fetcher, Upload, Waker, Who};
 pub use session::{Displaced, Session, Status, builtin_kind};

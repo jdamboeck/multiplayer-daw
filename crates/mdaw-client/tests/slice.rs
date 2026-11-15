@@ -2,7 +2,7 @@
 //! and clients that are `mdaw-slice` processes (one engine per process), each with its own
 //! profile and its own engine, no window and no audio device.
 //!
-//! Needs the `tracktion` feature. The CLAP test synth is built and copied into a scratch folder
+//! The CLAP test synth is built and copied into a scratch folder
 //! that the clients' `CLAP_PATH` points at (an empty one for a client without it). Scratch files
 //! go to `target/phase5-scratch/slice/`.
 
@@ -16,7 +16,6 @@ use mdaw_server::{Config, Server};
 
 const Q: i64 = 960;
 const RATE: f64 = 48_000.0;
-const SYNTH: &str = "clap:org.mdaw.test-synth";
 
 fn target_dir() -> PathBuf {
     // .../target/debug/mdaw-slice
@@ -33,30 +32,9 @@ fn scratch() -> PathBuf {
     dir
 }
 
-/// A folder with the test synth as a CLAP file. The test synth is a dev-dependency, so the build
-/// of this test made its library (`deps/`). Only if it is missing is it built here: a second
-/// cargo build of it during a test run would overwrite its rlib (a `cdylib` crate's files carry
-/// no hash) under the feet of the run.
+/// A folder with the test synth as a CLAP file.
 fn clap_dir() -> PathBuf {
-    let mut built = target_dir().join("debug/deps/libmdaw_test_plugin.so");
-    if !built.is_file() {
-        let status = Command::new(env!("CARGO"))
-            .args(["build", "-p", "mdaw-test-plugin"])
-            .status()
-            .unwrap();
-        assert!(status.success(), "building the test plugin");
-        built = target_dir().join("debug/libmdaw_test_plugin.so");
-    }
-    let dir = scratch().join("clap");
-    std::fs::create_dir_all(&dir).unwrap();
-    // Copied to a new name and renamed, as tests running at once copy it too.
-    let file = dir.join("mdaw-test-synth.clap");
-    let part = dir.join(format!("mdaw-test-synth.clap.{:?}", std::thread::current().id()));
-    if !file.is_file() || std::fs::read(&file).ok() != std::fs::read(&built).ok() {
-        std::fs::copy(&built, &part).unwrap_or_else(|e| panic!("copy {}: {e}", built.display()));
-        std::fs::rename(&part, &file).unwrap();
-    }
-    dir
+    mdaw_test_plugin::clap_folder(&scratch().join("clap"))
 }
 
 fn empty_clap_dir() -> PathBuf {
@@ -304,7 +282,7 @@ fn build_song(ann: &mut Client) -> u64 {
         "add-track Synth",
         "add-clip Synth s 4 4",
         "add-notes Synth s 0:48,1:55",
-        &format!("add-plugin Synth {SYNTH}"),
+        &format!("add-plugin Synth clap:{}", mdaw_test_plugin::ID),
     ] {
         ann.cmd(line);
     }

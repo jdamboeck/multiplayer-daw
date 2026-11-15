@@ -55,7 +55,7 @@ $S play                     # eight seconds of MIDI through the default audio de
 $S render --out demo.wav    # the same, rendered to a file without a device
 ```
 
-The Rust build and tests do not depend on it yet.
+The client builds it itself (through `mdaw-tracktion-sys`).
 
 ## Downloads
 
@@ -65,34 +65,22 @@ for Linux x86-64 and Windows x86-64. The Linux build needs PipeWire and ALSA lib
 
 ## Run
 
+The client plays through Tracktion Engine, so the build needs the native part above (`cargo`
+runs it; the first time takes about ten minutes):
+
 ```sh
-cargo run -p mdaw-client      # a local project; falls back to a silent engine if no audio device opens
+cargo run -p mdaw-client      # a local project; runs without sound if the engine does not start
 cargo xtask demo              # a server and two clients (Ann, Ben) on this machine
-cargo test --workspace --exclude mdaw-tracktion --exclude mdaw-tracktion-sys
+cargo test                    # the client's tests, on Tracktion where they need sound
 ```
 
-The client plays through the Rust engine unless it is built with the `tracktion` feature, which
-needs the native build above (`cargo` runs it; the first time takes about ten minutes):
-
-```sh
-cargo run -p mdaw-client --features tracktion          # Tracktion Engine on the default device
-cargo run -p mdaw-client --features tracktion -- --old-engine   # same build, Rust engine, to compare
-cargo xtask demo --tracktion                           # server and two clients on Tracktion
-cargo test -p mdaw-client --features tracktion         # adds the slice and UI tests on Tracktion
-```
-
-The feature is off by default, so plain `cargo build`, `cargo test` and CI need no C++ toolchain.
-With it, the client hosts VST3, LV2 and CLAP plugins (scanned at startup, in child processes) and
-keeps its engine settings in `<profile>/engine/`.
+The client hosts VST3, LV2 and CLAP plugins (scanned at startup, in child processes, by
+`mdaw-plugin-scan` next to `mdaw`) and keeps its engine settings in `<profile>/engine/`.
+`--no-plugins` starts one without plugins, in which their tracks are silent; `cargo xtask demo
+--test-synth` puts the test synth on the clients' `CLAP_PATH`.
 
 Double-click an empty lane to create a clip, double-click a clip to edit its notes, Space plays,
 Ctrl+Z undoes.
-
-Clients load the CLAP plugins installed in the usual folders (and in `CLAP_PATH`), plus a
-built-in test synth; `--no-plugins` starts one without plugins, in which their tracks are
-silent. On Linux every plugin runs in a helper process of its own (`mdaw-plugin-host`, which must
-sit next to `mdaw`), so a plugin that crashes or hangs takes only itself down;
-`MDAW_PLUGINS_IN_PROCESS=1` runs them inside `mdaw` instead.
 
 The pieces of the demo by hand, for another machine or a server that outlives its clients:
 
