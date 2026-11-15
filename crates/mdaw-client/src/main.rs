@@ -64,7 +64,6 @@ impl eframe::App for Shell {
     /// Runs before every frame, and also while the window is hidden or covered: the session's
     /// work happens here, so it goes on while nothing is drawn.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.app.session.pump_plugins();
         self.app.logic();
         if let Some(wait) = self.app.session.next_frame_in() {
             ctx.request_repaint_after(wait);

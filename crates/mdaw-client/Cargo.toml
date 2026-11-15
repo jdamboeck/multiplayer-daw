@@ -20,7 +20,6 @@ anyhow.workspace = true
 getrandom.workspace = true
 imbl.workspace = true
 postcard.workspace = true
-serde.workspace = true
 quinn.workspace = true
 tokio.workspace = true
 eframe.workspace = true

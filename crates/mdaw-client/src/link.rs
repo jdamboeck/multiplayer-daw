@@ -41,12 +41,6 @@ pub enum LinkEvent {
     Refused(RefuseReason),
     /// The answer to [`Link::put`].
     Stored { hash: BlobHash, outcome: Upload },
-    /// The answer to [`Link::get`]: the blob, or `None` if the server lacks it or the
-    /// download failed.
-    Fetched {
-        hash: BlobHash,
-        bytes: Option<Arc<[u8]>>,
-    },
     /// A message too large for the server to accept; it was not sent.
     TooLarge(ClientMsg),
 }
@@ -71,7 +65,6 @@ enum Out {
     Msg(u64, ClientMsg),
     Rejoin,
     Put(BlobHash, Arc<[u8]>),
-    Get(BlobHash),
     GetThen(BlobHash, Fetched),
 }
 
@@ -144,11 +137,6 @@ impl Link {
     /// arrives as [`LinkEvent::Stored`].
     pub fn put(&self, hash: BlobHash, bytes: Arc<[u8]>) {
         let _ = self.out.send(Out::Put(hash, bytes));
-    }
-
-    /// Downloads a blob. The outcome arrives as [`LinkEvent::Fetched`].
-    pub fn get(&self, hash: BlobHash) {
-        let _ = self.out.send(Out::Get(hash));
     }
 
     /// A handle to download blobs from another thread.
@@ -346,15 +334,6 @@ impl Task {
                                 Err(_) => Upload::Failed,
                             };
                             let _ = events.send(LinkEvent::Stored { hash, outcome });
-                            waker();
-                        });
-                    }
-                    Some(Out::Get(hash)) => {
-                        let (connection, events, waker) = (connection.clone(), events.clone(), waker.clone());
-                        tokio::spawn(async move {
-                            let bytes = mdaw_net::get_blob(&connection, hash).await.ok().flatten();
-                            let bytes = bytes.map(Arc::from);
-                            let _ = events.send(LinkEvent::Fetched { hash, bytes });
                             waker();
                         });
                     }

@@ -8,7 +8,6 @@
 //! nothing here travels.
 
 use std::any::Any;
-use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -121,11 +120,6 @@ pub trait Audio: Any {
     /// Housekeeping, once per UI frame, with the current view. Returns what the user should be
     /// told.
     fn frame(&mut self, project: &Project) -> Vec<String>;
-    /// Chores between frames, as often as possible (plugins that live on this thread). Returns
-    /// what the user should be told.
-    fn pump(&mut self) -> Vec<String> {
-        Vec::new()
-    }
     /// When the main loop has to run again although nothing happens on screen.
     fn next_frame_in(&self) -> Option<Duration> {
         None
@@ -177,40 +171,30 @@ pub trait Audio: Any {
     /// Sets a parameter of a running plugin, as a user turning its knob (`value` in the units of
     /// [`ParamEntry::value`]). It reaches the document with the plugin's next saved state.
     fn set_plugin_param(&mut self, track: TrackId, device: DeviceId, param: &str, value: f64);
+    /// Whether the plugin has a window of its own.
     fn has_editor(&self, track: TrackId, device: DeviceId) -> bool;
+    /// Whether the plugin's window is open: [`Audio::editor_state`] is `Open`.
     fn editor_open(&self, track: TrackId, device: DeviceId) -> bool;
     /// Where the plugin's window is, the moments between asking and the engine's answer
-    /// included. An engine that opens windows at once has only `Open` and `Closed`.
-    fn editor_state(&self, track: TrackId, device: DeviceId) -> EditorState {
-        if self.editor_open(track, device) {
-            EditorState::Open
-        } else {
-            EditorState::Closed
-        }
-    }
-    /// Opens or closes the plugin's own window (an engine may do it later; see
-    /// [`Audio::editor_state`]).
+    /// included.
+    fn editor_state(&self, track: TrackId, device: DeviceId) -> EditorState;
+    /// Opens or closes the plugin's own window. The engine does it on its own thread: until it
+    /// answers, [`Audio::editor_state`] says `Opening` or `Closing`.
     fn toggle_editor(&mut self, track: TrackId, device: DeviceId, title: &str) -> Result<(), String>;
     /// Starts a plugin that failed to load again, with the settings the document has.
     fn restart_plugin(&mut self, track: TrackId, device: DeviceId);
 
     // ---- plugin settings and the document
 
-    /// A way to download blobs straight from the engine's own thread. An engine that takes it
-    /// downloads what it needs itself, and [`Audio::wanted_blobs`] gives nothing.
-    fn set_fetcher(&mut self, _fetcher: crate::link::Fetcher) {}
-    /// State blobs the engine needs and that are not in `asked` yet.
-    fn wanted_blobs(&mut self, asked: &HashSet<BlobHash>) -> Vec<BlobHash>;
-    /// A blob asked for arrived, or (`None`) cannot be had.
-    fn blob_arrived(&mut self, hash: BlobHash, bytes: Option<Arc<[u8]>>);
+    /// How the engine downloads the state blobs it needs, from its own thread, in a session
+    /// with a server. Without one (a local session) only the states saved here are at hand.
+    fn set_fetcher(&mut self, fetcher: crate::link::Fetcher);
     /// The states of plugins whose settings changed here and differ from what `project` holds:
     /// they belong in the document. `now`: look at once, without waiting for the usual pace.
     fn changed_states(&mut self, project: &Project, now: bool) -> Vec<((TrackId, DeviceId), SavedState)>;
 
     /// Renders ticks `[from, to)` of the project to a wav file, without the device.
-    fn render(&mut self, _path: &Path, _from: Tick, _to: Tick) -> Result<(), String> {
-        Err("this engine does not render to files".into())
-    }
+    fn render(&mut self, path: &Path, from: Tick, to: Tick) -> Result<(), String>;
 }
 
 /// How a track is heard, from the statuses of its devices.

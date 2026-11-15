@@ -3,7 +3,7 @@
 //! Playback is this client's own: play, stop, seek and loop act on the local engine and nothing
 //! about them goes over the network. The engine is whatever stands behind [`Audio`].
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -90,8 +90,6 @@ pub struct Session {
     /// Pending transactions and the blobs they name, on disk. `None` when nothing is kept: the
     /// local mode, or a session joined without a place for it.
     outbox: Option<Outbox>,
-    /// Blobs being downloaded.
-    fetching: HashSet<BlobHash>,
     live: Live,
     /// Recording is armed: notes this player plays while the transport runs are kept.
     recording: bool,
@@ -194,12 +192,7 @@ impl Session {
                 // The link would keep trying, but a first attempt that fails is more likely a
                 // wrong join string than a server about to come back.
                 Some(LinkEvent::Down(reason)) => bail!("could not join: {reason}"),
-                Some(
-                    LinkEvent::Msg(_)
-                    | LinkEvent::Stored { .. }
-                    | LinkEvent::Fetched { .. }
-                    | LinkEvent::TooLarge(_),
-                ) => {}
+                Some(LinkEvent::Msg(_) | LinkEvent::Stored { .. } | LinkEvent::TooLarge(_)) => {}
                 None => bail!("could not join: the server did not answer"),
             }
         };
@@ -274,7 +267,6 @@ impl Session {
             uploads: HashMap::new(),
             outgoing: Vec::new(),
             outbox: None,
-            fetching: HashSet::new(),
             live,
             recording: false,
             take: Take::default(),
@@ -494,15 +486,6 @@ impl Session {
         self.audio.plugin_params(track, device, limit)
     }
 
-    /// Gives running plugins what they expect from the main loop: their timers, the callbacks
-    /// they asked for, their windows' events. Call as often as possible, also between frames
-    /// and while the window is hidden; [`Session::frame`] does it too.
-    pub fn pump_plugins(&mut self) {
-        for text in self.audio.pump() {
-            notice(&mut self.notices, &text);
-        }
-    }
-
     /// Starts a plugin that failed to load again, with the settings the document has.
     pub fn restart_plugin(&mut self, track: TrackId, device: DeviceId) {
         self.audio.restart_plugin(track, device);
@@ -537,10 +520,6 @@ impl Session {
         }
     }
 
-    pub fn plugin_editor_open(&self, track: TrackId, device: DeviceId) -> bool {
-        self.audio.editor_open(track, device)
-    }
-
     /// Where a plugin's window is, while it opens or closes too.
     pub fn plugin_editor_state(&self, track: TrackId, device: DeviceId) -> EditorState {
         self.audio.editor_state(track, device)
@@ -556,19 +535,9 @@ impl Session {
         self.device_status(track, device) == DeviceStatus::Running
     }
 
-    /// Fetches the state blobs the engine needs, and puts the settings of plugins changed here
-    /// into the document.
+    /// Puts the settings of plugins changed here into the document. (The engine downloads the
+    /// settings it needs itself, with the fetcher it was given on joining.)
     fn keep_plugins(&mut self) {
-        if let Backend::Remote(remote) = &self.backend
-            && remote.status == Status::Online
-        {
-            let wanted = self.audio.wanted_blobs(&self.fetching);
-            for hash in wanted {
-                self.fetching.insert(hash);
-                crate::trace::step(|| format!("asks for settings {}", crate::trace::short(&hash)));
-                remote.link.get(hash);
-            }
-        }
         self.put_plugin_states(false);
     }
 
@@ -1065,11 +1034,6 @@ impl Session {
                     // It goes again with the next connection.
                     Upload::Failed => {}
                 },
-                LinkEvent::Fetched { hash, bytes } => {
-                    self.fetching.remove(&hash);
-                    crate::trace::step(|| format!("download {} arrived", crate::trace::short(&hash)));
-                    self.audio.blob_arrived(hash, bytes);
-                }
                 LinkEvent::Msg(ServerMsg::Rejected { txn, reason }) => {
                     // Refused again after a restart of this client, it was taken back before.
                     if self.replica.on_rejected(txn) {

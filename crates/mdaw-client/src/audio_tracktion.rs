@@ -127,9 +127,7 @@ struct Shared {
     /// engine for that device: that would put the plugin back to its old settings for the
     /// moment between the read and the edit that records it.
     ahead: HashMap<DeviceId, Ahead>,
-    /// State blobs the engine needs and does not have.
-    wanted: HashSet<BlobHash>,
-    /// Downloads blobs for the worker, straight to it; without, the session downloads them.
+    /// Downloads blobs for the worker, straight to it; none in a local session.
     fetcher: Option<crate::link::Fetcher>,
     /// Blobs being downloaded by the fetcher.
     fetching: HashSet<BlobHash>,
@@ -1078,23 +1076,6 @@ impl Audio for TracktionAudio {
         lock(&self.shared).fetcher = Some(fetcher);
     }
 
-    fn wanted_blobs(&mut self, asked: &HashSet<BlobHash>) -> Vec<BlobHash> {
-        let shared = lock(&self.shared);
-        if shared.fetcher.is_some() {
-            return Vec::new();
-        }
-        shared.wanted.difference(asked).copied().collect()
-    }
-
-    fn blob_arrived(&mut self, hash: BlobHash, bytes: Option<Arc<[u8]>>) {
-        // No longer wanted from here on, so that the next frame does not ask for it again
-        // while the worker has yet to take it.
-        lock(&self.shared).wanted.remove(&hash);
-        if let Some(bytes) = bytes {
-            self.send(Job::Blob(hash, bytes));
-        }
-    }
-
     fn changed_states(&mut self, project: &Project, now: bool) -> Vec<((TrackId, DeviceId), SavedState)> {
         if now {
             self.capture_due(true);
@@ -1516,9 +1497,9 @@ impl Worker {
             }
         }
         let mut shared = lock(&self.shared);
-        shared.wanted.extend(wanted.iter().copied());
-        // With a fetcher the download starts here, on the worker, and comes back to it: no
-        // round trip through the window's thread, which may run seldom while it is not shown.
+        // The download starts here, on the worker, and comes back to it: no round trip through
+        // the window's thread, which may run seldom while it is not shown. A local session has
+        // no fetcher: what it does not have here cannot be had.
         if let Some(fetcher) = shared.fetcher.clone() {
             for hash in wanted {
                 if !shared.fetching.insert(hash) {
@@ -1535,9 +1516,7 @@ impl Worker {
                         match bytes {
                             Some(bytes) => submit(&queue, Job::Blob(hash, bytes)),
                             None => {
-                                let mut shared = lock(&back);
-                                shared.wanted.remove(&hash);
-                                shared.fetching.remove(&hash);
+                                lock(&back).fetching.remove(&hash);
                             }
                         }
                     }),
@@ -1725,11 +1704,7 @@ impl Worker {
 
     fn blob(&mut self, hash: BlobHash, bytes: Arc<[u8]>) {
         self.blobs.insert(hash, bytes);
-        {
-            let mut shared = lock(&self.shared);
-            shared.wanted.remove(&hash);
-            shared.fetching.remove(&hash);
-        }
+        lock(&self.shared).fetching.remove(&hash);
         let Some(project) = &self.synced else { return };
         let waiting: Vec<(TrackId, DeviceId)> = plugin_devices(project)
             .filter(|(_, d)| matches!(&d.kind, DeviceKind::Plugin { state: Some(s), .. } if *s == hash))

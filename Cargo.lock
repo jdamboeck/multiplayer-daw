@@ -2400,7 +2400,6 @@ dependencies = [
  "midir",
  "postcard",
  "quinn",
- "serde",
  "tempfile",
  "tokio",
 ]
@@ -2425,7 +2424,6 @@ dependencies = [
  "quinn",
  "rcgen",
  "rustls",
- "serde",
  "sha2",
  "tempfile",
  "tokio",
@@ -2466,7 +2464,6 @@ dependencies = [
 name = "mdaw-sync"
 version = "0.2.0"
 dependencies = [
- "imbl",
  "mdaw-model",
  "mdaw-proto",
  "proptest",

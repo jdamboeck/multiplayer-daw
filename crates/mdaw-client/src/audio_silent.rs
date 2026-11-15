@@ -9,16 +9,15 @@
 //! it shows but does not play.
 
 use std::any::Any;
-use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use mdaw_model::{
-    BlobHash, BuiltinKind, DeviceId, PluginFormat, Project, TempoMap, Tick, TickRange, TrackId,
-};
+use mdaw_model::{BuiltinKind, DeviceId, PluginFormat, Project, TempoMap, Tick, TickRange, TrackId};
 
-use crate::audio::{Audio, DeviceStatus, LiveSink, ParamEntry, PluginEntry, SavedState, TrackSound};
+use crate::audio::{
+    Audio, DeviceStatus, EditorState, LiveSink, ParamEntry, PluginEntry, SavedState, TrackSound,
+};
 use crate::clock;
 
 /// The notes played live and not let go yet: `(track, key, pitch)`.
@@ -269,17 +268,18 @@ impl Audio for SilentAudio {
         false
     }
 
+    fn editor_state(&self, _track: TrackId, _device: DeviceId) -> EditorState {
+        EditorState::Closed
+    }
+
     fn toggle_editor(&mut self, _track: TrackId, _device: DeviceId, _title: &str) -> Result<(), String> {
         Ok(())
     }
 
     fn restart_plugin(&mut self, _track: TrackId, _device: DeviceId) {}
 
-    fn wanted_blobs(&mut self, _asked: &HashSet<BlobHash>) -> Vec<BlobHash> {
-        Vec::new()
-    }
-
-    fn blob_arrived(&mut self, _hash: BlobHash, _bytes: Option<Arc<[u8]>>) {}
+    /// It plays no plugins, so it needs no settings.
+    fn set_fetcher(&mut self, _fetcher: crate::link::Fetcher) {}
 
     fn changed_states(&mut self, _project: &Project, _now: bool) -> Vec<((TrackId, DeviceId), SavedState)> {
         Vec::new()
