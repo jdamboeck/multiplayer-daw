@@ -75,6 +75,10 @@ public:
     /// steps for EngineThread::call (steps, gapMs) with that gap between them.
     static constexpr int teardownGapMs = 300;
     Steps clearSteps();
+    /// A clear without the steps when nothing has changed the edit since it was made (see
+    /// editChanged): true if that was the case and the project is now clear, false if
+    /// clearSteps() must run.
+    bool clearIfUnchanged();
     /// Stops playback, closes editors, drops the edit and closes the device. What is left for
     /// the destructor is the engine.
     Steps shutDownSteps();
@@ -183,6 +187,10 @@ private:
     std::map<uint64_t, Tempo> tempos;
     std::map<uint64_t, std::unique_ptr<Editor>> editors;
 
+    /// Set by every call that changes the edit or may leave something in it (the transport
+    /// included); cleared when a new edit is made. While it is clear, a clear needs no new edit
+    /// (clearIfUnchanged).
+    bool editChanged = false;
     bool wantPlaying = false;
     bool deviceManagerInitialised = false;
     bool ownChange = false;   // set while the application's own call changes parameters

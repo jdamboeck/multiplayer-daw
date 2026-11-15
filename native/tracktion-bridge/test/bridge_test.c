@@ -403,6 +403,66 @@ static double now (void)
     return (double) t.tv_sec + (double) t.tv_nsec / 1.0e9;
 }
 
+/* A clear, timed in seconds (negative if it failed). */
+static double timedClear (mdaw_engine* e)
+{
+    double start = now();
+    mdaw_status s = mdaw_project_clear (e);
+    double took = now() - start;
+    return s == MDAW_OK ? took : -1.0;
+}
+
+static int projectEmpty (mdaw_engine* e)
+{
+    return mdaw_project_has (e, MDAW_ENTITY_TRACK, TRACK) == 0 && mdaw_project_has (e, MDAW_ENTITY_CLIP, CLIP) == 0
+           && mdaw_project_has (e, MDAW_ENTITY_DEVICE, SYNTH) == 0 && mdaw_project_has (e, MDAW_ENTITY_TEMPO, TEMPO0) == 0;
+}
+
+/* A clear of an edit nothing has changed returns at once; after any change it replaces the edit
+ * (two teardown gaps of 300 ms). Either way the project is empty afterwards, and the same
+ * project renders the same (the built-in synth varies by a few tenths of a percent from render
+ * to render; 5 % allowed). On a new engine. */
+static void clearChecks (mdaw_engine* e, mdaw_note* notes)
+{
+    double took = timedClear (e);
+    measure ("clear_unchanged_seconds", took);
+    check (took >= 0.0 && took < 0.05 && projectEmpty (e), "clear_unchanged_returns_at_once");
+    build (e, notes);
+    Wav w = render (e, "after_kept_edit", 0, 8 * Q);
+    double keptPeak = peakOf (&w);
+    measure ("after_kept_edit_peak", keptPeak);
+    freeWav (&w);
+
+    took = timedClear (e);
+    measure ("clear_after_build_seconds", took);
+    check (took >= 0.5 && projectEmpty (e), "clear_after_build_full");
+    took = timedClear (e);
+    check (took >= 0.0 && took < 0.05, "clear_twice_returns_at_once");
+
+    /* Each single change makes the next clear a full one. */
+    check (mdaw_master_set_gain (e, 0.5f) == MDAW_OK, "clear_master_gain");
+    took = timedClear (e);
+    measure ("clear_after_master_gain_seconds", took);
+    check (took >= 0.5, "clear_after_master_gain_full");
+    check (mdaw_tempo_put (e, TEMPO0, 0, 90000) == MDAW_OK, "clear_tempo_put");
+    took = timedClear (e);
+    check (took >= 0.5 && projectEmpty (e), "clear_after_tempo_full");
+    check (mdaw_track_add (e, TRACK, 0, "T") == MDAW_OK, "clear_track_add");
+    took = timedClear (e);
+    check (took >= 0.5 && projectEmpty (e), "clear_after_track_add_full");
+    check (mdaw_transport_seek (e, 4 * Q) == MDAW_OK, "clear_seek");
+    took = timedClear (e);
+    check (took >= 0.5, "clear_after_seek_full");
+
+    build (e, notes);
+    w = render (e, "after_new_edit", 0, 8 * Q);
+    double newPeak = peakOf (&w);
+    measure ("after_new_edit_peak", newPeak);
+    check (keptPeak > 0.05 && fabs (newPeak - keptPeak) < 0.05 * keptPeak, "kept_edit_renders_as_new_one");
+    freeWav (&w);
+    check (timedClear (e) >= 0.5 && projectEmpty (e), "clear_after_render");
+}
+
 static char* failedJson (mdaw_engine* e)
 {
     size_t n = mdaw_plugins_failed (e, NULL, 0);
@@ -1506,6 +1566,7 @@ int main (void)
     if (e != NULL)
     {
         quarterNotes (notes, 1000);
+        clearChecks (e, notes);
         build (e, notes);
         w = render (e, "second_life", 0, 8 * Q);
         measure ("second_life_peak", peakOf (&w));

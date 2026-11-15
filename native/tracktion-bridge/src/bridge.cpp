@@ -215,8 +215,14 @@ mdaw_status mdaw_project_clear (mdaw_engine* engine)
     return guarded ([engine]
     {
         if (engine == nullptr) argumentError ("engine is NULL");
+        // An edit nothing has changed is kept: no teardown, no gaps. Decided on the message
+        // thread; whatever comes in after this call is wiped by the full clear below anyway.
+        bool done = false;
+        engine->thread.call ([&] { done = engine->project->clearIfUnchanged(); }, "project clear");
+        if (done)
+            return;
         // Making the steps touches nothing; running them happens on the message thread.
-        engine->thread.call (engine->project->clearSteps(), Project::teardownGapMs, "project clear");
+        engine->thread.call (engine->project->clearSteps(), Project::teardownGapMs, "project clear (new edit)");
     });
 }
 

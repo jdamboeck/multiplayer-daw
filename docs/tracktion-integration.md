@@ -191,7 +191,8 @@ These were all found by running into them.
    gone; when JUCE unloads the library the process crashes (5 of 5 runs). Loading each module
    once with `RTLD_NODELETE` before use fixes it (5 of 5 pass).
 7. **Drain the message loop before and after destroying an edit** (about 300 ms), or VST3
-   teardown can crash.
+   teardown can crash. So the bridge's `mdaw_project_clear` takes about 600 ms, except on an
+   edit nothing has changed since it was made (a new engine, a second clear): that one it keeps.
 8. **A parameter reaches the plugin with the next processed block.** Set a value, save
    immediately, and the saved state has the old value. Tracktion passes the value to JUCE's
    parameter at once, on the message thread; what the format does with it then:

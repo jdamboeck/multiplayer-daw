@@ -512,7 +512,9 @@ impl Engine {
         unsafe { sys::mdaw_project_has(self.ptr(), kind.raw(), id) == 1 }
     }
 
-    /// Removes everything: tracks, tempo points, mappings. Playback stops.
+    /// Removes everything: tracks, tempo points, mappings. Playback stops. Takes about 600 ms
+    /// (the edit is replaced), unless nothing has changed the edit since it was made (a new
+    /// engine, or right after a clear): then it returns at once, with the same result.
     pub fn clear(&self) -> Result<(), Error> {
         // SAFETY: valid handle.
         check(unsafe { sys::mdaw_project_clear(self.ptr()) })

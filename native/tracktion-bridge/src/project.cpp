@@ -362,8 +362,23 @@ Project::Steps Project::clearSteps()
             retireEdit();
         },
         [this] { retiring.reset(); },
-        [this] { edit = makeEdit(); }
+        [this]
+        {
+            edit = makeEdit();
+            editChanged = false;   // only once there is a new edit: without one, every clear is full
+        }
     };
+}
+
+bool Project::clearIfUnchanged()
+{
+    if (editChanged || edit == nullptr)
+        return false;
+    // The edit is as makeEdit() left it: no tracks or tempo points, tempo 120, master at 0 dB,
+    // transport stopped at 0, loop off. A new one would be the same, so only the bridge's own
+    // state goes (there is none either, but the wish to play and the like are reset as well).
+    forgetProject();
+    return true;
 }
 
 /// Drops everything the application's ids point at, and the wish to play.
@@ -458,6 +473,7 @@ bool Project::has (int32_t kind, uint64_t id) const
 //==============================================================================
 void Project::tempoPut (uint64_t id, int64_t tick, uint32_t milliBpm)
 {
+    editChanged = true;
     if (id == 0) fail (MDAW_ERR_ARGUMENT, "tempo id 0");
     if (tick < 0) fail (MDAW_ERR_ARGUMENT, "negative tempo position");
     const double bpm = milliBpm / 1000.0;
@@ -474,6 +490,7 @@ void Project::tempoPut (uint64_t id, int64_t tick, uint32_t milliBpm)
 
 void Project::tempoRemove (uint64_t id)
 {
+    editChanged = true;
     if (tempos.erase (id) > 0)
         rebuildTempoMap();
 }
@@ -506,6 +523,7 @@ void Project::rebuildTempoMap()
 
 void Project::masterSetGain (float gain)
 {
+    editChanged = true;
     if (! std::isfinite (gain) || gain < 0.0f) fail (MDAW_ERR_ARGUMENT, "gain must be 0 or more");
     if (auto vol = edit->getMasterVolumePlugin())
         vol->setSliderPos (te::gainToVolumeFaderPosition (gain));
@@ -514,6 +532,7 @@ void Project::masterSetGain (float gain)
 //==============================================================================
 void Project::trackAdd (uint64_t id, uint64_t after, const juce::String& name)
 {
+    editChanged = true;
     if (id == 0) fail (MDAW_ERR_ARGUMENT, "track id 0");
     if (tracks.count (id) > 0)
         return;
@@ -535,6 +554,7 @@ void Project::trackAdd (uint64_t id, uint64_t after, const juce::String& name)
 
 void Project::trackRemove (uint64_t id)
 {
+    editChanged = true;
     auto it = tracks.find (id);
     if (it == tracks.end())
         return;
@@ -554,6 +574,7 @@ void Project::trackRemove (uint64_t id)
 
 void Project::trackMove (uint64_t id, uint64_t after)
 {
+    editChanged = true;
     auto* t = track (id);
     if (t == nullptr || after == id)
         return;
@@ -571,12 +592,14 @@ void Project::trackMove (uint64_t id, uint64_t after)
 
 void Project::trackSetName (uint64_t id, const juce::String& name)
 {
+    editChanged = true;
     if (auto* t = track (id))
         t->setName (name);
 }
 
 void Project::trackSetMix (uint64_t id, float gain, float pan, bool mute)
 {
+    editChanged = true;
     if (! std::isfinite (gain) || gain < 0.0f) fail (MDAW_ERR_ARGUMENT, "gain must be 0 or more");
     if (! std::isfinite (pan) || pan < -1.0f || pan > 1.0f) fail (MDAW_ERR_ARGUMENT, "pan must be -1 to 1");
     auto* t = track (id);
@@ -611,6 +634,7 @@ void Project::trackLiveNote (uint64_t id, int pitch, int velocity)
 //==============================================================================
 void Project::clipAdd (uint64_t trackId, uint64_t id, int64_t start, int64_t length, const juce::String& name)
 {
+    editChanged = true;
     if (id == 0) fail (MDAW_ERR_ARGUMENT, "clip id 0");
     if (start < 0 || length <= 0) fail (MDAW_ERR_ARGUMENT, "clip start must be 0 or more and length more than 0");
     if (clips.count (id) > 0)
@@ -626,6 +650,7 @@ void Project::clipAdd (uint64_t trackId, uint64_t id, int64_t start, int64_t len
 
 void Project::clipRemove (uint64_t id)
 {
+    editChanged = true;
     auto it = clips.find (id);
     if (it == clips.end())
         return;
@@ -636,6 +661,7 @@ void Project::clipRemove (uint64_t id)
 
 void Project::clipSetRange (uint64_t id, int64_t start, int64_t length)
 {
+    editChanged = true;
     if (start < 0 || length <= 0) fail (MDAW_ERR_ARGUMENT, "clip start must be 0 or more and length more than 0");
     if (auto* c = clip (id))
     {
@@ -647,6 +673,7 @@ void Project::clipSetRange (uint64_t id, int64_t start, int64_t length)
 
 void Project::clipSetName (uint64_t id, const juce::String& name)
 {
+    editChanged = true;
     if (auto* c = clip (id))
         c->clip->setName (name);
 }
@@ -666,6 +693,7 @@ std::map<uint64_t, te::MidiNote*> notesById (te::MidiList& seq)
 
 void Project::notesPut (uint64_t clipId, const mdaw_note* notes, size_t count)
 {
+    editChanged = true;
     // All or nothing: check every note before changing any.
     for (size_t i = 0; i < count; ++i)
     {
@@ -703,6 +731,7 @@ void Project::notesPut (uint64_t clipId, const mdaw_note* notes, size_t count)
 
 void Project::notesRemove (uint64_t clipId, const uint64_t* ids, size_t count)
 {
+    editChanged = true;
     auto* c = clip (clipId);
     if (c == nullptr)
         return;
@@ -736,6 +765,7 @@ int Project::insertIndexFor (te::AudioTrack& t, uint64_t after, const te::Plugin
 
 void Project::deviceAdd (uint64_t trackId, uint64_t id, uint64_t after, const juce::String& format, const juce::String& identifier)
 {
+    editChanged = true;
     if (id == 0) fail (MDAW_ERR_ARGUMENT, "device id 0");
     if (devices.count (id) > 0)
         return;
@@ -809,11 +839,13 @@ void Project::removeDevice (uint64_t id)
 
 void Project::deviceRemove (uint64_t id)
 {
+    editChanged = true;
     removeDevice (id);
 }
 
 void Project::deviceMove (uint64_t id, uint64_t after)
 {
+    editChanged = true;
     auto* d = device (id);
     if (d == nullptr || after == id)
         return;
@@ -840,6 +872,7 @@ void Project::deviceMove (uint64_t id, uint64_t after)
 
 void Project::deviceSetBypass (uint64_t id, bool bypass)
 {
+    editChanged = true;
     if (auto* d = device (id))
         d->plugin->setEnabled (! bypass);
 }
@@ -849,6 +882,7 @@ void Project::deviceSetBypass (uint64_t id, bool bypass)
 // (deliverParameterSets).
 void Project::deviceSetParam (uint64_t id, const juce::String& paramId, float value)
 {
+    editChanged = true;
     if (! std::isfinite (value) || value < 0.0f || value > 1.0f) fail (MDAW_ERR_ARGUMENT, "parameter value must be 0..1");
     auto* d = device (id);
     if (d == nullptr)
@@ -953,12 +987,14 @@ juce::MemoryBlock Project::deviceGetState (uint64_t id)
 
 void Project::deviceSetState (uint64_t id, const void* data, size_t size)
 {
+    editChanged = true;
     if (auto* d = device (id))
         restoreState (*d, data, size);
 }
 
 void Project::deviceResetState (uint64_t id)
 {
+    editChanged = true;
     auto* d = device (id);
     if (d == nullptr)
         return;
@@ -1152,6 +1188,7 @@ void Project::parameterMoved (Device& d, te::AutomatableParameter& p)
 //==============================================================================
 void Project::deviceShowEditor (uint64_t id, bool show, uint64_t token)
 {
+    editChanged = true;
     if (! show)
     {
         closeEditor (id, false);
@@ -1480,6 +1517,7 @@ void Project::startTransportIfWanted()
 
 void Project::play()
 {
+    editChanged = true;
     wantPlaying = true;
     shared.playing = 1;
     startTransportIfWanted();
@@ -1493,6 +1531,7 @@ void Project::stopTransport()
 
 void Project::stop()
 {
+    editChanged = true;
     wantPlaying = false;
     shared.playing = 0;
     stopTransport();
@@ -1500,6 +1539,7 @@ void Project::stop()
 
 void Project::seek (int64_t tick)
 {
+    editChanged = true;
     if (tick < 0) fail (MDAW_ERR_ARGUMENT, "negative position");
     const auto t = timeOf (tick);
     edit->getTransport().setPosition (t);
@@ -1512,6 +1552,7 @@ void Project::seek (int64_t tick)
 
 void Project::setLoop (int64_t start, int64_t end)
 {
+    editChanged = true;
     if (start < 0 || end < 0) fail (MDAW_ERR_ARGUMENT, "negative loop position");
     loopStart = start;
     loopEnd = end;
@@ -1614,6 +1655,7 @@ void Project::audioDeviceSet (const juce::String& backend, const juce::String& o
 //==============================================================================
 void Project::render (const juce::File& file, int64_t start, int64_t end, double sampleRate)
 {
+    editChanged = true;
     if (start < 0 || end <= start) fail (MDAW_ERR_ARGUMENT, "render range must be non-empty and not negative");
     if (! (sampleRate >= 8000.0 && sampleRate <= 384000.0)) fail (MDAW_ERR_ARGUMENT, "sample rate out of range");
     if (! file.getParentDirectory().isDirectory()) fail (MDAW_ERR_IO, "no folder " + file.getParentDirectory().getFullPathName());
