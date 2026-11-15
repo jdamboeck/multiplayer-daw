@@ -4,7 +4,8 @@ description = "Desktop client."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+# Links JUCE 8 (AGPLv3) through the Tracktion bridge; see README, "License".
+license = "AGPL-3.0-only"
 publish.workspace = true
 
 [lints]
