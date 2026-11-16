@@ -1518,7 +1518,17 @@ the code by the text quoted.
 - `crates/mdaw-client/src/lib.rs` (`pub mod plugin_guard;`, in the alphabetical list)
 - `crates/mdaw-client/src/audio_tracktion.rs`
 - `crates/mdaw-client/tests/plugin_session.rs` (one new test)
+- `crates/mdaw-client/tests/slice.rs` (`edits_survive_a_crash_and_arrive_once` only, see below)
 - `docs/decisions/0002-plugin-hosting.md`
+
+**The crash test in `slice.rs`.** `edits_survive_a_crash_and_arrive_once` kills Ann's client
+with `ann.crash()` within a second or two of starting it, while the CLAP test synth is still
+within `SETTLE`. With the guard in, that is the second limit above: the next start switches the
+synth off for Ann, and her render is silent where Ben's sounds. The test is about edits, not
+plugins, so make it stay clear of the guard: before each `ann.crash()` in that test, wait until
+more than 5 s (`SETTLE`, plus a margin such as 0.5 s) have passed since that Ann client was
+started, with a one-line comment saying why. Change nothing else in the file. Any other failing
+test still means stop and report.
 - `docs/manual-tests/foundation.md` (section C)
 
 ### Step 1. The guard: `crates/mdaw-client/src/plugin_guard.rs`
