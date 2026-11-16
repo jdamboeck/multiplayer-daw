@@ -100,6 +100,14 @@ fn main() -> ExitCode {
     let started = Instant::now();
     mdaw_client::trace::set_name(&args.name);
     let frame_every = args.frame_every;
+    // Held until main returns, so no other client uses this profile meanwhile.
+    let _profile_lock = match profile::lock(&args.profile) {
+        Ok(lock) => lock,
+        Err(err) => {
+            eprintln!("mdaw-slice: {err:#}");
+            return ExitCode::FAILURE;
+        }
+    };
     let mut options = TracktionOptions::new(args.profile.join("engine"));
     options.open_audio_device = args.device;
     options.enable_plugins = args.plugins;

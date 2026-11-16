@@ -8,6 +8,7 @@ use crate::link::Who;
 
 const KEY_FILE: &str = "user.key";
 const NAME_FILE: &str = "name";
+const LOCK_FILE: &str = "lock";
 
 /// The profile directory used when none is given.
 pub fn default_dir() -> Option<PathBuf> {
@@ -24,6 +25,40 @@ pub fn default_dir() -> Option<PathBuf> {
         var("XDG_CONFIG_HOME").or_else(|| var("HOME").map(|home| home.join(".config")))
     };
     base.map(|base| base.join("mdaw"))
+}
+
+/// Held for as long as this process uses the profile: other processes cannot lock it
+/// meanwhile. The operating system lets go when the process ends, however it ends.
+pub struct ProfileLock {
+    _file: std::fs::File,
+}
+
+/// Locks the profile in `dir` (created if missing) for this process. Fails with a message
+/// for the user when another process holds it.
+pub fn lock(dir: &Path) -> Result<ProfileLock> {
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let path = dir.join(LOCK_FILE);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
+            "mdaw is already running with the profile in {}; --profile <dir> chooses another",
+            dir.display()
+        ),
+        Err(std::fs::TryLockError::Error(err)) => {
+            eprintln!(
+                "warning: could not lock {} ({err}); nothing stops a second mdaw from using this profile",
+                path.display()
+            );
+        }
+    }
+    Ok(ProfileLock { _file: file })
 }
 
 /// Reads the profile in `dir`, creating what is missing. A `name` given here replaces the
@@ -103,5 +138,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(KEY_FILE), "not a key").unwrap();
         assert!(open(dir.path(), None).is_err());
+    }
+
+    #[test]
+    fn a_locked_profile_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let _first = lock(dir.path()).unwrap();
+        let err = lock(dir.path()).err().expect("a second lock must fail");
+        assert!(format!("{err:#}").contains("already running"), "{err:#}");
+    }
+
+    #[test]
+    fn the_lock_is_free_again_when_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = lock(dir.path()).unwrap();
+        drop(first);
+        lock(dir.path()).unwrap();
     }
 }

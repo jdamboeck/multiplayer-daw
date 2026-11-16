@@ -635,6 +635,52 @@ fn a_plugin_this_client_lacks_does_not_hold_the_guard_open() {
     server.stop();
 }
 
+/// A second client on a profile that a running client holds is refused at once, with a
+/// message, instead of sharing its file of unsent edits and its plugin guard.
+#[test]
+fn a_second_client_on_one_profile_is_refused() {
+    let clap = clap_dir();
+    let base = tempfile::tempdir_in(scratch()).unwrap();
+    let server = serve(&base.path().join("server"), "127.0.0.1:0");
+    let profile = base.path().join("ann");
+    let ann = Client::start(&server, "Ann", &profile, &clap);
+
+    let mut second = Command::new(env!("CARGO_BIN_EXE_mdaw-slice"))
+        .args([
+            "--join",
+            &server.join_info().to_string(),
+            "--name",
+            "Ann again",
+            "--profile",
+        ])
+        .arg(&profile)
+        .env("CLAP_PATH", &clap)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start a second mdaw-slice");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = second.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = second.kill();
+            panic!("the second client on Ann's profile did not exit");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(&mut second.stderr.take().unwrap(), &mut stderr).unwrap();
+    println!("RESULT second client: {status:?} {stderr:?}");
+    assert!(!status.success(), "the second client must fail");
+    assert!(stderr.contains("already running"), "stderr: {stderr}");
+
+    ann.quit();
+    server.stop();
+}
+
 /// Point 3 with audio devices: both clients play on their own device, and their playheads
 /// move independently. Opens the default device twice and makes sound.
 #[test]

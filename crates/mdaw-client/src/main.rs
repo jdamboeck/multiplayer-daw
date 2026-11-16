@@ -93,6 +93,14 @@ fn main() -> ExitCode {
         eprintln!("mdaw: no place for the profile; pass --profile <dir>");
         return ExitCode::FAILURE;
     };
+    // Held until main returns, so no other mdaw uses this profile meanwhile.
+    let _profile_lock = match profile_dir.as_deref().map(profile::lock).transpose() {
+        Ok(lock) => lock,
+        Err(err) => {
+            eprintln!("mdaw: {err:#}");
+            return ExitCode::FAILURE;
+        }
+    };
     let audio = tracktion_audio(&engine_dir, !args.no_plugins).unwrap_or_else(|err| {
         eprintln!("mdaw: {err}; running without sound");
         Box::new(SilentAudio::new())
