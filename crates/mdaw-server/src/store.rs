@@ -59,7 +59,8 @@ impl Store {
     }
 
     /// Copies a store of an older version to `<path>.v<version>` before it is migrated, unless
-    /// that copy exists already.
+    /// that copy exists already. The copy is written as `<path>.v<version>.part` and renamed when
+    /// whole, so a crash or a full disk during it leaves no partial backup under the final name.
     fn back_up_before_migrating(db: &Connection, path: &Path) -> Result<()> {
         let found = match db.query_row("SELECT value FROM meta WHERE key = 'format'", [], |row| {
             row.get::<_, Vec<u8>>(0)
@@ -82,9 +83,27 @@ impl Store {
         if backup.exists() {
             return Ok(());
         }
-        let backup = backup.to_str().context("a backup path that is not UTF-8")?;
-        db.execute("VACUUM INTO ?1", [backup])
-            .with_context(|| format!("copying the store to {backup} before migrating it"))?;
+        let mut part = backup.as_os_str().to_owned();
+        part.push(".part");
+        let part = std::path::PathBuf::from(part);
+        match std::fs::remove_file(&part) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                return Err(error).with_context(|| format!("removing a leftover {}", part.display()));
+            }
+            _ => {}
+        }
+        let part_str = part.to_str().context("a backup path that is not UTF-8")?;
+        db.execute("VACUUM INTO ?1", [part_str])
+            .with_context(|| format!("copying the store to {part_str} before migrating it"))?;
+        std::fs::rename(&part, &backup)
+            .with_context(|| format!("renaming {} to {}", part.display(), backup.display()))?;
+        let dir = match path.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir,
+            _ => Path::new("."),
+        };
+        std::fs::File::open(dir)
+            .and_then(|dir| dir.sync_all())
+            .with_context(|| format!("syncing {}", dir.display()))?;
         Ok(())
     }
 
@@ -314,6 +333,92 @@ pub struct Run {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Writes a store at format 8 to `path`, with one event and one snapshot as format 8 holds
+    /// them.
+    fn write_store_8(path: &Path) {
+        use crate::migrate::tests::{EVENT_8, PROJECT_8};
+        let db = Connection::open(path).unwrap();
+        db.execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value BLOB NOT NULL);
+             CREATE TABLE events (seq INTEGER PRIMARY KEY, data BLOB NOT NULL);
+             CREATE TABLE snapshots (seq INTEGER PRIMARY KEY, data BLOB NOT NULL);",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO meta (key, value) VALUES ('format', ?1)",
+            [b"8".as_slice()],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO events (seq, data) VALUES (1, ?1)",
+            [EVENT_8.as_bytes()],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO snapshots (seq, data) VALUES (0, ?1)",
+            [PROJECT_8.as_bytes()],
+        )
+        .unwrap();
+    }
+
+    /// Opens a store at format 8 at `path` and checks that it reads as format 9, with its event
+    /// and its snapshot.
+    fn open_and_check_migrated(path: &Path) {
+        let store = Store::open(path).unwrap();
+        assert_eq!(store.meta("format").unwrap().as_deref(), Some(b"9".as_slice()));
+        let events = store.events_after(0, 10).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].seq, 1);
+        assert_eq!(events[0].ops.len(), 2);
+        let (seq, project) = store.latest_snapshot().unwrap().unwrap();
+        assert_eq!(seq, 0);
+        assert_eq!(project.tracks.len(), 1);
+    }
+
+    fn backup_path(path: &Path, suffix: &str) -> std::path::PathBuf {
+        let mut name = path.as_os_str().to_owned();
+        name.push(suffix);
+        name.into()
+    }
+
+    #[test]
+    fn an_old_store_is_backed_up_and_migrated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("project.sqlite");
+        write_store_8(&path);
+        open_and_check_migrated(&path);
+
+        let backup = backup_path(&path, ".v8");
+        assert!(backup.exists(), "no backup at {}", backup.display());
+        let old = Connection::open(&backup).unwrap();
+        let format: Vec<u8> = old
+            .query_row("SELECT value FROM meta WHERE key = 'format'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(format, b"8");
+        assert!(!backup_path(&path, ".v8.part").exists());
+    }
+
+    #[test]
+    fn a_partial_backup_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("project.sqlite");
+        write_store_8(&path);
+        let part = backup_path(&path, ".v8.part");
+        std::fs::write(&part, b"not a database, cut off halfway").unwrap();
+        open_and_check_migrated(&path);
+
+        assert!(!part.exists(), "{} is still there", part.display());
+        let old = Connection::open(backup_path(&path, ".v8")).unwrap();
+        let format: Vec<u8> = old
+            .query_row("SELECT value FROM meta WHERE key = 'format'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(format, b"8");
+    }
 
     #[test]
     fn stored_rows_are_json() {

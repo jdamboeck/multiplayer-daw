@@ -123,7 +123,7 @@ fn rewrite(db: &Connection, table: &str, change: fn(&mut Value)) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use mdaw_model::{ActorId, DeviceKind, Op, Project, UserId};
     use mdaw_proto::{Event, TxnId};
@@ -231,11 +231,11 @@ mod tests {
     }
 
     /// A snapshot as a version 8 store holds it: a built-in device and a plugin device.
-    const PROJECT_8: &str = r#"{"name":"Untitled","tempo":{"4294967301":{"tick":0,"milli_bpm":120000}},"master_gain":1.0,"track_order":[4294967297],"tracks":{"4294967297":{"shell":{"name":"T","color":255},"content":{"gain":1.0,"pan":0.0,"mute":false,"clips":{},"devices":[{"id":4294967298,"kind":{"Builtin":{"kind":"TwoOsc","dsp_version":1}},"params":{"3":0.25},"bypass":false},{"id":4294967299,"kind":{"Plugin":{"format":"Clap","id":"com.x.y","name":"Y","state":[7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7]}},"params":{},"bypass":false}]}}}}"#;
+    pub(crate) const PROJECT_8: &str = r#"{"name":"Untitled","tempo":{"4294967301":{"tick":0,"milli_bpm":120000}},"master_gain":1.0,"track_order":[4294967297],"tracks":{"4294967297":{"shell":{"name":"T","color":255},"content":{"gain":1.0,"pan":0.0,"mute":false,"clips":{},"devices":[{"id":4294967298,"kind":{"Builtin":{"kind":"TwoOsc","dsp_version":1}},"params":{"3":0.25},"bypass":false},{"id":4294967299,"kind":{"Plugin":{"format":"Clap","id":"com.x.y","name":"Y","state":[7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7]}},"params":{},"bypass":false}]}}}}"#;
 
     /// An event as a version 8 store holds it: a track added with a built-in device, a plugin
     /// device added, and a lost parameter change.
-    const EVENT_8: &str = r#"{"seq":1,"actor":1,"user":1,"wall_ts":5,"txn":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,9],"ops":[{"TrackAdd":{"id":4294967297,"shell":{"name":"T","color":255},"content":{"gain":1.0,"pan":0.0,"mute":false,"clips":{},"devices":[{"id":4294967298,"kind":{"Builtin":{"kind":"TwoOsc","dsp_version":1}},"params":{"3":0.25},"bypass":false}]},"after":null}},{"DeviceAdd":{"track":4294967297,"device":{"id":4294967299,"kind":{"Plugin":{"format":"Clap","id":"com.x.y","name":"Y","state":[7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7]}},"params":{},"bypass":false},"after":4294967298}}],"superseded":[{"entity":{"Device":[4294967297,4294967298]},"prop":{"Param":3},"lost":{"DeviceSetParam":{"track":4294967297,"id":4294967298,"param":3,"value":0.5}},"lost_actor":2,"lost_user":2,"lost_seq":1}]}"#;
+    pub(crate) const EVENT_8: &str = r#"{"seq":1,"actor":1,"user":1,"wall_ts":5,"txn":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,9],"ops":[{"TrackAdd":{"id":4294967297,"shell":{"name":"T","color":255},"content":{"gain":1.0,"pan":0.0,"mute":false,"clips":{},"devices":[{"id":4294967298,"kind":{"Builtin":{"kind":"TwoOsc","dsp_version":1}},"params":{"3":0.25},"bypass":false}]},"after":null}},{"DeviceAdd":{"track":4294967297,"device":{"id":4294967299,"kind":{"Plugin":{"format":"Clap","id":"com.x.y","name":"Y","state":[7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7]}},"params":{},"bypass":false},"after":4294967298}}],"superseded":[{"entity":{"Device":[4294967297,4294967298]},"prop":{"Param":3},"lost":{"DeviceSetParam":{"track":4294967297,"id":4294967298,"param":3,"value":0.5}},"lost_actor":2,"lost_user":2,"lost_seq":1}]}"#;
 
     #[test]
     fn devices_move_from_8_to_9() {
