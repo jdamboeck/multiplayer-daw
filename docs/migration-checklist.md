@@ -52,7 +52,7 @@ All done on 2026-11-13 (branch `tracktion-integration`, protocol version 6).
 | Clock sync | `mdaw-net/src/clock.rs` | no shared clock |
 | Live MIDI relay and jam | `mdaw-proto/src/midi.rs`, `mdaw-server/src/relay.rs`, `mdaw-client/src/live.rs`, `ui/live.rs` | no network MIDI; local MIDI input and recording move to Tracktion |
 | Mandatory checkout, lease renewal, force release, commit | `ClientMsg::{Checkout, LeaseRenew, Release, ForceRelease, Commit, Attach}`, refusals `CheckedOut`, `PluginTrack`, `PluginOutsideCommit`, `NotOwner`, `NotCheckedOut`, `OutOfScope`, `StemRequired`; `mdaw-sync` workspaces; server lease code; `mdaw-client/src/checkout.rs`, `ui/checkout.rs` | ordinary editing needs no checkout |
-| `spikes/clap-host` | | superseded; `docs/spikes/clap-host.md` stays as history |
+| `spikes/clap-host` | | superseded; its report is in git history |
 | Tests of the above | `tests/checkout.rs`, `tests/live.rs`, `tests/transport.rs`, parts of `tests/hub.rs`, `ui_net.rs` | go with the feature |
 
 Removing these changed the wire protocol: version 6. Data directories of earlier servers are

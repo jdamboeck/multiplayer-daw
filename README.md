@@ -2,11 +2,8 @@
 
 Prototype of a server/client DAW for collaborative editing. Working name.
 
-- `docs/pre-plan.md`: product model and decisions so far.
-- `docs/plan.md`: prototype implementation plan and milestones.
 - `docs/protocol.md`: the wire protocol and sync rules as built.
 - `docs/manual-tests/`: test protocols to run through by hand after a milestone.
-- `docs/spikes/`: spike reports.
 - `docs/architecture.md`: the shape of the project — Tracktion Engine for local audio, Rust for
   everything shared — and what the audit of 2026-11-12 found.
 - `docs/tracktion-integration.md`: pinned versions, how to build the native part, test results.
@@ -14,34 +11,9 @@ Prototype of a server/client DAW for collaborative editing. Working name.
 
 ## Status
 
-- **M0** done: workspace, CI and the CLAP hosting spike (`docs/spikes/clap-host.md`).
-- **M1** done: single-user local DAW. Arrangement, piano roll, the built-in Pocket synth and undo, with
-  every edit already going through a txn on a loopback replica.
-- **M2** done: server and live sync. Several clients edit one project over QUIC, see who is there and
-  what the others hold, keep working through a lost connection, and can bring back an edit that lost
-  against a concurrent one.
-- **M3** done: shared clock and transport. Play, stop, seek and loop are for everyone at once, on the
-  same sample as far as the clocks allow; a client can unlink to play on its own.
-- **M4** done: checkout, commit and changelog samples. A track can be checked out and worked on
-  alone, then committed with rendered samples that everyone can play from the changelog; tempo
-  changes during a checkout can be undone by the commit, and a checkout someone else ends leaves
-  its owner a fork.
-- **M5** done: live MIDI. Notes from the computer keyboard or a MIDI device are heard by everyone
-  as they arrive; recording turns them into a clip. A checked-out track hears only its owner.
-- **M6** done: plugins and stems. CLAP plugins go onto a track through a checkout; the commit
-  carries their state and a stem. Clients with the plugin run it, the others play the stem. The
-  host sits behind a format-neutral interface, so VST3 can be added as another backend.
-
-M3 to M6 describe history. On branch `tracktion-integration` (2026-11-13) the shared transport
-and clock sync, live MIDI over the network, checkout/commit with changelog samples, and stems
-were removed: people collaborate on the project, not on the audio clock. Every edit, plugins
-included, is an ordinary transaction; each client plays the project on its own; a client
-without a plugin hears nothing from that track and says so.
-
-On 2026-11-15 the Rust audio engine (`mdaw-engine`, `mdaw-dsp`, `mdaw-plugin`) was removed: the
-client plays through Tracktion Engine and hosts VST3, LV2 and CLAP plugins, examined in a separate
-scanner process (`docs/retire-rust-engine.md`). Data directories, projects and unsent edits of
-earlier versions are not readable (protocol 11, store 7).
+Several clients edit one project over QUIC; each plays it on its own machine through Tracktion
+Engine and hosts VST3, LV2 and CLAP plugins. Linux only. How the pieces fit together:
+`docs/architecture.md`.
 
 **Linux only.** The bridge to Tracktion builds on Linux only so far; there is no Windows build
 until it is ported.
@@ -58,14 +30,7 @@ cargo build
 ```
 
 `cargo` builds the native part itself, in `target/native` (the first time takes about ten
-minutes; afterwards it is incremental). The Tracktion spike, a native test program:
-
-```sh
-cmake --build target/native --target mdaw-te-spike
-S=target/native/spike/mdaw-te-spike_artefacts/RelWithDebInfo/mdaw-te-spike
-$S play                     # eight seconds of MIDI through the default audio device
-$S render --out demo.wav    # the same, rendered to a file without a device
-```
+minutes; afterwards it is incremental).
 
 ## Downloads
 

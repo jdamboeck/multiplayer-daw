@@ -36,8 +36,8 @@ endif()
 add_subdirectory("${MDAW_TE_DIR}/modules/juce" juce EXCLUDE_FROM_ALL)
 add_subdirectory("${MDAW_TE_DIR}/modules" tracktion EXCLUDE_FROM_ALL)
 
-# What every target that compiles the JUCE and Tracktion modules is built with. One list, so
-# that the spike and the bridge cannot drift apart.
+# What every target that compiles the JUCE and Tracktion modules is built with: one list for
+# every target built on the engine.
 add_library(mdaw_engine_config INTERFACE)
 target_compile_definitions(mdaw_engine_config INTERFACE
     JUCE_PLUGINHOST_VST3=1
@@ -80,8 +80,3 @@ endif()
 
 add_subdirectory(clap-format)
 add_subdirectory(tracktion-bridge)
-
-option(MDAW_BUILD_SPIKE "Build the native Tracktion spike application" ON)
-if(MDAW_BUILD_SPIKE)
-    add_subdirectory(spike)
-endif()

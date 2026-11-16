@@ -65,15 +65,11 @@ git -c url."https://github.com/".insteadOf="git@github.com:" \
 Then `cargo build`. The build script of `mdaw-tracktion-sys` configures `target/native` the first
 time (CMake, Ninja if it is there, `RelWithDebInfo` for every Cargo profile, so a release build
 shares the folder) and builds the bridge and the scanner in it; the first build takes about ten
-minutes. The same folder by hand, for the spike and the C tests:
+minutes. The same folder by hand, for the C tests:
 
 ```sh
 cmake -S native -B target/native -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
-cmake --build target/native --target mdaw-te-spike
 ```
-
-The spike binary is
-`target/native/spike/mdaw-te-spike_artefacts/RelWithDebInfo/mdaw-te-spike`.
 
 The native code is built with `-g1` (function names and line numbers for backtraces, no local
 variables), and Cargo builds dependencies with line tables only, so that the test binaries stay
@@ -95,20 +91,9 @@ tested there.
 
 ## The spike
 
-`native/spike/` is a console program that drives Tracktion the way the bridge will. Every
-command prints `RESULT key=value` lines and exits non-zero if a check fails.
-
-```sh
-S=target/native/spike/mdaw-te-spike_artefacts/RelWithDebInfo/mdaw-te-spike
-$S devices                         # audio and MIDI devices per backend
-$S play [--type JACK] [--device <name>] [--rate <hz>] [--block <n>]   # play, stop, seek, edit while playing
-$S saveload                        # build an edit, save, reload, compare
-$S render --out demo.wav           # offline render, no device opened
-$S scan --format VST3|CLAP|LV2 [--oop]            # --oop: scan in a child process
-$S plugin  --file <path> --format <fmt> [--param <name>] [--list-params]
-$S latency --file <path> --format <fmt> [--set Name=value]   # e.g. Mix=0, so the plugin passes its input through
-$S editor  --file <path> --format <fmt> [--hold <ms>]
-```
+The spike was a console program in the `spike` folder of `native/` that drove Tracktion the way
+the bridge would; it was removed on 2026-11-16 and is still in git history before that commit.
+What it measured stays here.
 
 The demo for "MIDI playback and offline render": `play` plays an eight-second MIDI clip through
 Tracktion's built-in FourOsc synth on the default device; `render` writes the same edit to a
