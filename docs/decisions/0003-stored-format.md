@@ -49,6 +49,18 @@ event's encoding is far below the commit itself (about 0.25 ms, `tests/commit_be
 
 The client's outbox stays postcard, tied to the protocol version.
 
+## Adding a migration
+
+Bump `STORE_VERSION` in `crates/mdaw-server/src/store.rs` and append one `Step` to `STEPS` in
+`crates/mdaw-server/src/migrate.rs`; a compile-time check keeps the two in step. Write the step's
+two functions, one for an event row and one for a snapshot row, against `serde_json::Value`,
+never against the current types. Add a test that feeds a literal row of the old version through
+the step and decodes the result with the current types. When the server opens an older store it
+first copies the database to `project.db.v<old version>` (unless that copy exists), then runs
+every step from the store's version on in one transaction, checks that every row decodes, and
+writes the new version; if any row does not decode, nothing changes and the server refuses to
+start.
+
 ## Consequences
 
 - Adding a field with a default, the common case, needs nothing but the field.

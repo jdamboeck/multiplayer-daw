@@ -4,6 +4,7 @@
 
 mod blobs;
 mod hub;
+mod migrate;
 mod sequencer;
 mod server;
 mod store;

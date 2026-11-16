@@ -7,6 +7,7 @@
 //! (`tests/commit_bench.rs`), which is far more than people editing together produce; so each
 //! transaction is committed on its own, without grouping.
 
+use crate::migrate;
 use anyhow::{Context, Result, bail};
 use mdaw_model::{ActorId, Project, UserId};
 use mdaw_proto::{Event, RejectReason, TxnId};
@@ -22,6 +23,9 @@ fn int(n: u64) -> i64 {
 /// Bumped by every change to the stored format that is not free; see
 /// `docs/decisions/0003-stored-format.md`.
 const STORE_VERSION: u32 = 8;
+
+// The version and the migration steps cannot drift apart.
+const _: () = assert!(STORE_VERSION == migrate::FIRST + migrate::STEPS.len() as u32);
 
 fn encode<T: serde::Serialize>(value: &T) -> Result<Vec<u8>> {
     serde_json::to_vec(value).context("encoding for the store")
@@ -50,7 +54,38 @@ impl Store {
         // Every commit is on disk before it returns: events are acknowledged and broadcast only
         // after theirs.
         db.pragma_update(None, "synchronous", "FULL")?;
+        Self::back_up_before_migrating(&db, path).with_context(|| format!("in {}", path.display()))?;
         Self::init(db).with_context(|| format!("in {}", path.display()))
+    }
+
+    /// Copies a store of an older version to `<path>.v<version>` before it is migrated, unless
+    /// that copy exists already.
+    fn back_up_before_migrating(db: &Connection, path: &Path) -> Result<()> {
+        let found = match db.query_row("SELECT value FROM meta WHERE key = 'format'", [], |row| {
+            row.get::<_, Vec<u8>>(0)
+        }) {
+            Ok(found) => found,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(()),
+            // A new file: `init` has not created the table yet.
+            Err(error) if error.to_string().contains("no such table") => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        let Ok(version) = String::from_utf8_lossy(&found).parse::<u32>() else {
+            return Ok(());
+        };
+        if version >= STORE_VERSION {
+            return Ok(());
+        }
+        let mut backup = path.as_os_str().to_owned();
+        backup.push(format!(".v{version}"));
+        let backup = std::path::PathBuf::from(backup);
+        if backup.exists() {
+            return Ok(());
+        }
+        let backup = backup.to_str().context("a backup path that is not UTF-8")?;
+        db.execute("VACUUM INTO ?1", [backup])
+            .with_context(|| format!("copying the store to {backup} before migrating it"))?;
+        Ok(())
     }
 
     /// A store that is gone when dropped.
@@ -85,11 +120,19 @@ impl Store {
                          move the data directory away to start a new project."
                     ),
                     Ok(version) if version == STORE_VERSION => {}
+                    Ok(version) if (migrate::FIRST..STORE_VERSION).contains(&version) => migrate::run(
+                        &store.db,
+                        version,
+                        &migrate::STEPS[(version - migrate::FIRST) as usize..],
+                    )?,
                     Ok(version) if version > STORE_VERSION => bail!(
                         "the project was written by a newer server (format {found}, this server reads up to \
                          {STORE_VERSION})."
                     ),
-                    Ok(_) => bail!("format {found} cannot be migrated"),
+                    Ok(_) => bail!(
+                        "the project was written in format {found}, from before formats could be migrated: \
+                         move the data directory away to start a new project."
+                    ),
                 }
             }
         }
