@@ -95,7 +95,8 @@ pub enum Op {
         id: DeviceId,
         after: Option<DeviceId>,
     },
-    /// `value: None` returns the parameter to its default.
+    /// Sets a parameter of a built-in device; `value: None` returns it to its default. Does
+    /// nothing on a plugin device, whose settings are its state.
     DeviceSetParam {
         track: TrackId,
         id: DeviceId,
@@ -107,7 +108,7 @@ pub enum Op {
         id: DeviceId,
         bypass: bool,
     },
-    /// Only meaningful for CLAP devices.
+    /// Sets a plugin device's saved state. Does nothing on a built-in device.
     DeviceSetState {
         track: TrackId,
         id: DeviceId,
@@ -342,9 +343,10 @@ impl Op {
                 id,
                 param,
                 value: Some(_),
-            } => content(track)
-                .and_then(|c| c.device(*id))
-                .is_some_and(|d| !d.params.contains_key(param) && d.params.len() >= MAX_PARAMS_PER_DEVICE),
+            } => content(track).and_then(|c| c.device(*id)).is_some_and(|d| {
+                d.params()
+                    .is_some_and(|p| !p.contains_key(param) && p.len() >= MAX_PARAMS_PER_DEVICE)
+            }),
             _ => false,
         };
         if full {
@@ -519,30 +521,29 @@ fn check_clip(clip: &Clip) -> Result<(), Invalid> {
 }
 
 fn check_device(device: &Device) -> Result<(), Invalid> {
-    if let DeviceKind::Plugin {
-        id: plugin_id, name, ..
-    } = &device.kind
-    {
-        if plugin_id.is_empty() || plugin_id.len() > MAX_PLUGIN_ID_BYTES {
-            return Err(Invalid("bad plugin id"));
+    match &device.kind {
+        DeviceKind::Plugin { id, name, .. } => {
+            if id.is_empty() || id.len() > MAX_PLUGIN_ID_BYTES {
+                return Err(Invalid("bad plugin id"));
+            }
+            if name.len() > MAX_NAME_BYTES {
+                return Err(Invalid("plugin name too long"));
+            }
         }
-        if name.len() > MAX_NAME_BYTES {
-            return Err(Invalid("plugin name too long"));
-        }
-    }
-    if device.params.len() > MAX_PARAMS_PER_DEVICE {
-        return Err(Invalid("too many parameters"));
-    }
-    if !device.params.values().all(|v| v.is_finite()) {
-        return Err(Invalid("parameter value is not finite"));
-    }
-    if let DeviceKind::Builtin {
-        kind: BuiltinKind::TwoOsc,
-        ..
-    } = &device.kind
-    {
-        for (param, value) in &device.params {
-            two_osc::check(*param, *value)?;
+        DeviceKind::Builtin { kind, params } => {
+            if params.len() > MAX_PARAMS_PER_DEVICE {
+                return Err(Invalid("too many parameters"));
+            }
+            if !params.values().all(|v| v.is_finite()) {
+                return Err(Invalid("parameter value is not finite"));
+            }
+            match kind {
+                BuiltinKind::TwoOsc => {
+                    for (param, value) in params {
+                        two_osc::check(*param, *value)?;
+                    }
+                }
+            }
         }
     }
     Ok(())

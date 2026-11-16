@@ -1153,12 +1153,12 @@ fn record_displaced(displaced: &mut Vec<Displaced>, event: Event) {
     }
 }
 
-/// A built-in device of this kind, as a new one is made.
+/// A built-in device of this kind, as a new one is made: every parameter at its default.
 pub fn builtin_kind(kind: BuiltinKind) -> DeviceKind {
-    let dsp_version = match kind {
-        BuiltinKind::TwoOsc => mdaw_model::two_osc::DSP_VERSION,
-    };
-    DeviceKind::Builtin { kind, dsp_version }
+    DeviceKind::Builtin {
+        kind,
+        params: imbl::OrdMap::new(),
+    }
 }
 
 /// The op that adds an instrument track named after its position, with the built-in

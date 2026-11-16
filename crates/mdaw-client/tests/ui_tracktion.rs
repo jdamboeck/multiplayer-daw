@@ -208,7 +208,7 @@ fn the_window_plays_through_tracktion() {
     }
     let knob = h.get_by_label("FILTER Freq").rect().center();
     drag(&mut h, knob, knob + vec2(0.0, 120.0));
-    let freq = instrument(&h).params.get(&two_osc::id::FILTER_FREQ).copied();
+    let freq = instrument(&h).param(two_osc::id::FILTER_FREQ);
     println!("RESULT freq={freq:?}");
     assert!(
         freq.is_some_and(|c| c < 1000.0),
@@ -227,7 +227,7 @@ fn the_window_plays_through_tracktion() {
     h.key_press_modifiers(egui::Modifiers::COMMAND, Key::Z);
     h.run_steps(3);
     assert_eq!(
-        instrument(&h).params.get(&two_osc::id::FILTER_FREQ),
+        instrument(&h).param(two_osc::id::FILTER_FREQ),
         None,
         "the drag was one undo step"
     );
@@ -238,7 +238,7 @@ fn the_window_plays_through_tracktion() {
     );
 
     // SUB On, clicked: an edit, and more low end.
-    let sub_on = |h: &App| instrument(h).params.get(&two_osc::id::SUB_ON).copied();
+    let sub_on = |h: &App| instrument(h).param(two_osc::id::SUB_ON);
     let toggle = h.get_by_label("SUB On").rect().center();
     click(&mut h, toggle);
     assert_eq!(sub_on(&h), Some(1.0), "SUB On is an edit");

@@ -186,13 +186,7 @@ fn engine_jobs_are_scheduled() {
         &mut project,
         synth_track,
         "4OSC",
-        Device::new(
-            synth,
-            DeviceKind::Builtin {
-                kind: BuiltinKind::TwoOsc,
-                dsp_version: mdaw_model::two_osc::DSP_VERSION,
-            },
-        ),
+        Device::builtin(synth, BuiltinKind::TwoOsc),
     );
     audio.set_project(&project);
     let t = Instant::now();

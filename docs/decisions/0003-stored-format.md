@@ -61,6 +61,9 @@ every step from the store's version on in one transaction, checks that every row
 writes the new version; if any row does not decode, nothing changes and the server refuses to
 start.
 
+The step from 8 to 9 in `mdaw-server/src/migrate.rs` is the worked example: it moves a field and
+removes two.
+
 ## Consequences
 
 - Adding a field with a default, the common case, needs nothing but the field.

@@ -18,7 +18,60 @@ pub(crate) struct Step {
 pub(crate) const FIRST: u32 = 8;
 
 /// `STEPS[i]` brings a store from version `FIRST + i` to `FIRST + i + 1`.
-pub(crate) const STEPS: &[Step] = &[];
+pub(crate) const STEPS: &[Step] = &[Step {
+    event: event_8_to_9,
+    project: project_8_to_9,
+}];
+
+/// Version 8 to 9: a device's parameter values move into the built-in kind; a plugin
+/// device's (never used) go; `dsp_version` goes.
+fn device_8_to_9(device: &mut Value) {
+    let params = device.as_object_mut().and_then(|d| d.remove("params"));
+    if let Some(builtin) = device.pointer_mut("/kind/Builtin").and_then(Value::as_object_mut) {
+        builtin.remove("dsp_version");
+        builtin.insert("params".into(), params.unwrap_or_else(|| serde_json::json!({})));
+    }
+}
+
+/// The devices of a track's content, as stored (`{"gain":..,"devices":[..],..}`).
+fn content_8_to_9(content: &mut Value) {
+    if let Some(devices) = content.get_mut("devices").and_then(Value::as_array_mut) {
+        devices.iter_mut().for_each(device_8_to_9);
+    }
+}
+
+/// An op is stored as `{"<Variant>": {..}}`. Two variants carry devices.
+fn op_8_to_9(op: &mut Value) {
+    if let Some(content) = op.pointer_mut("/TrackAdd/content") {
+        content_8_to_9(content);
+    }
+    if let Some(device) = op.pointer_mut("/DeviceAdd/device") {
+        device_8_to_9(device);
+    }
+}
+
+fn event_8_to_9(event: &mut Value) {
+    if let Some(ops) = event.get_mut("ops").and_then(Value::as_array_mut) {
+        ops.iter_mut().for_each(op_8_to_9);
+    }
+    if let Some(superseded) = event.get_mut("superseded").and_then(Value::as_array_mut) {
+        for entry in superseded {
+            if let Some(lost) = entry.get_mut("lost") {
+                op_8_to_9(lost);
+            }
+        }
+    }
+}
+
+fn project_8_to_9(project: &mut Value) {
+    if let Some(tracks) = project.get_mut("tracks").and_then(Value::as_object_mut) {
+        for track in tracks.values_mut() {
+            if let Some(content) = track.get_mut("content") {
+                content_8_to_9(content);
+            }
+        }
+    }
+}
 
 /// Runs `steps` over a store of version `from`, checks that every row then decodes with the
 /// current types, and writes the new version, all in one SQLite transaction: on any error
@@ -72,7 +125,7 @@ fn rewrite(db: &Connection, table: &str, change: fn(&mut Value)) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mdaw_model::{ActorId, Op, Project, UserId};
+    use mdaw_model::{ActorId, DeviceKind, Op, Project, UserId};
     use mdaw_proto::{Event, TxnId};
     use rusqlite::OptionalExtension;
 
@@ -175,5 +228,81 @@ mod tests {
         let db = store();
         run(&db, 8, &[]).unwrap();
         assert_eq!(format(&db).as_deref(), Some("8"));
+    }
+
+    /// A snapshot as a version 8 store holds it: a built-in device and a plugin device.
+    const PROJECT_8: &str = r#"{"name":"Untitled","tempo":{"4294967301":{"tick":0,"milli_bpm":120000}},"master_gain":1.0,"track_order":[4294967297],"tracks":{"4294967297":{"shell":{"name":"T","color":255},"content":{"gain":1.0,"pan":0.0,"mute":false,"clips":{},"devices":[{"id":4294967298,"kind":{"Builtin":{"kind":"TwoOsc","dsp_version":1}},"params":{"3":0.25},"bypass":false},{"id":4294967299,"kind":{"Plugin":{"format":"Clap","id":"com.x.y","name":"Y","state":[7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7]}},"params":{},"bypass":false}]}}}}"#;
+
+    /// An event as a version 8 store holds it: a track added with a built-in device, a plugin
+    /// device added, and a lost parameter change.
+    const EVENT_8: &str = r#"{"seq":1,"actor":1,"user":1,"wall_ts":5,"txn":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,9],"ops":[{"TrackAdd":{"id":4294967297,"shell":{"name":"T","color":255},"content":{"gain":1.0,"pan":0.0,"mute":false,"clips":{},"devices":[{"id":4294967298,"kind":{"Builtin":{"kind":"TwoOsc","dsp_version":1}},"params":{"3":0.25},"bypass":false}]},"after":null}},{"DeviceAdd":{"track":4294967297,"device":{"id":4294967299,"kind":{"Plugin":{"format":"Clap","id":"com.x.y","name":"Y","state":[7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7]}},"params":{},"bypass":false},"after":4294967298}}],"superseded":[{"entity":{"Device":[4294967297,4294967298]},"prop":{"Param":3},"lost":{"DeviceSetParam":{"track":4294967297,"id":4294967298,"param":3,"value":0.5}},"lost_actor":2,"lost_user":2,"lost_seq":1}]}"#;
+
+    #[test]
+    fn devices_move_from_8_to_9() {
+        let mut project: Value = serde_json::from_str(PROJECT_8).unwrap();
+        project_8_to_9(&mut project);
+        let project = serde_json::from_value::<Project>(project).unwrap();
+        let track = project.tracks.values().next().unwrap();
+        let devices = &track.content.devices;
+        assert_eq!(devices[0].param(3), Some(0.25));
+        assert!(matches!(
+            devices[1].kind,
+            DeviceKind::Plugin { state: Some(_), .. }
+        ));
+        assert!(devices[1].params().is_none());
+
+        let mut event: Value = serde_json::from_str(EVENT_8).unwrap();
+        event_8_to_9(&mut event);
+        let event = serde_json::from_value::<Event>(event).unwrap();
+        let Op::TrackAdd { content, .. } = &event.ops[0] else {
+            panic!("not a TrackAdd: {:?}", event.ops[0]);
+        };
+        assert_eq!(content.devices[0].param(3), Some(0.25));
+        let Op::DeviceAdd { device, .. } = &event.ops[1] else {
+            panic!("not a DeviceAdd: {:?}", event.ops[1]);
+        };
+        assert!(matches!(device.kind, DeviceKind::Plugin { .. }));
+        assert!(matches!(
+            event.superseded[0].lost,
+            Op::DeviceSetParam {
+                param: 3,
+                value: Some(0.5),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_version_8_store_opens() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value BLOB NOT NULL);
+             CREATE TABLE events (seq INTEGER PRIMARY KEY, data BLOB NOT NULL);
+             CREATE TABLE snapshots (seq INTEGER PRIMARY KEY, data BLOB NOT NULL);",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO meta (key, value) VALUES ('format', ?1)",
+            [b"8".as_slice()],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO events (seq, data) VALUES (1, ?1)",
+            [EVENT_8.as_bytes()],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO snapshots (seq, data) VALUES (0, ?1)",
+            [PROJECT_8.as_bytes()],
+        )
+        .unwrap();
+        run(&db, 8, STEPS).unwrap();
+        assert_eq!(format(&db).as_deref(), Some("9"));
+        let events = all(&db, "events");
+        assert_eq!(events.len(), 1);
+        serde_json::from_slice::<Event>(&events[0].1).unwrap();
+        let snapshots = all(&db, "snapshots");
+        assert_eq!(snapshots.len(), 1);
+        serde_json::from_slice::<Project>(&snapshots[0].1).unwrap();
     }
 }

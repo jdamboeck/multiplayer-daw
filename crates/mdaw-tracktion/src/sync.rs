@@ -8,8 +8,8 @@
 //! The model is built from `imbl` persistent collections and `Arc`s, so unchanged parts of two
 //! states share memory. Whatever is shared is skipped without looking inside: a single changed
 //! note costs a walk down to its clip and one `notes_put` call. Values are read from `after`, as
-//! in [`crate::apply`], whose mapping (built-in devices on 4osc, CLAP parameter ranges, what is reported
-//! as a [`Problem`]) is the same here.
+//! in [`crate::apply`], whose mapping (built-in devices on 4osc, what is reported as a [`Problem`]) is
+//! the same here.
 
 use crate::apply::{
     BlobResolver, Problem, Sync, effective_tempo, ordered_tracks, raw_clip, raw_device, raw_note, raw_tempo,
@@ -253,12 +253,11 @@ fn devices(sync: &mut Sync<'_>, track: TrackId, old: &TrackContent, new: &TrackC
         if was.bypass != device.bypass {
             engine.device_set_bypass(raw_device(device.id), device.bypass)?;
         }
-        match &device.kind {
-            DeviceKind::Builtin { .. } => {
-                if was.params != device.params {
-                    let changed: Vec<u32> = was
-                        .params
-                        .diff(&device.params)
+        match (&was.kind, &device.kind) {
+            (DeviceKind::Builtin { params: old, .. }, DeviceKind::Builtin { params: new, .. }) => {
+                if old != new {
+                    let changed: Vec<u32> = old
+                        .diff(new)
                         .map(|item| match item {
                             DiffItem::Remove(param, _) | DiffItem::Add(param, _) => *param,
                             DiffItem::Update { new: (param, _), .. } => *param,
@@ -267,32 +266,15 @@ fn devices(sync: &mut Sync<'_>, track: TrackId, old: &TrackContent, new: &TrackC
                     sync.put_builtin_changes(track, device, changed)?;
                 }
             }
-            DeviceKind::Plugin { state, .. } => {
-                let state_was = match &was.kind {
-                    DeviceKind::Plugin { state, .. } => *state,
-                    DeviceKind::Builtin { .. } => None,
-                };
-                if state_was != *state {
-                    match state {
-                        Some(blob) => sync.put_state(track, device.id, *blob),
-                        None => engine.device_reset_state(raw_device(device.id))?,
-                    }
-                    // The parameter values go on top of the state, as on a load.
-                    sync.put_params(track, device)?;
-                } else if was.params != device.params {
-                    let params = engine.device_params(raw_device(device.id))?;
-                    for item in was.params.diff(&device.params) {
-                        let (param, value) = match item {
-                            DiffItem::Remove(param, _) => (*param, None),
-                            DiffItem::Add(param, value)
-                            | DiffItem::Update {
-                                new: (param, value), ..
-                            } => (*param, Some(*value)),
-                        };
-                        sync.put_param(track, device.id, &params, param, value)?;
-                    }
+            (DeviceKind::Plugin { state: old, .. }, DeviceKind::Plugin { state: new, .. }) if old != new => {
+                match new {
+                    Some(blob) => sync.put_state(track, device.id, *blob),
+                    None => engine.device_reset_state(raw_device(device.id))?,
                 }
             }
+            // A plugin's state that did not change; or another kind under the same id, which was
+            // removed and put anew above (`renew`).
+            _ => {}
         }
     }
     // Order of what the engine has.

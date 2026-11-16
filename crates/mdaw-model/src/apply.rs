@@ -299,21 +299,23 @@ pub fn apply(project: &mut Project, op: &Op) -> Option<Op> {
             param,
             value,
         } => {
+            // A plugin device has no parameters in the document: `params()` is `None` there,
+            // and the op does nothing.
             let old = project
                 .tracks
                 .get(track)?
                 .content
                 .device(*id)?
-                .params
+                .params()?
                 .get(param)
                 .copied();
             if old == *value {
                 return None;
             }
-            let device = device_mut(project, *track, *id)?;
+            let params = device_mut(project, *track, *id)?.params_mut()?;
             match value {
-                Some(v) => device.params.insert(*param, *v),
-                None => device.params.remove(param),
+                Some(v) => params.insert(*param, *v),
+                None => params.remove(param),
             };
             Some(Op::DeviceSetParam {
                 track: *track,

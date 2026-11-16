@@ -1,11 +1,13 @@
 # mdaw protocol
 
-What client and server say to each other, as built. Protocol version **11**. The types live in
+What client and server say to each other, as built. Protocol version **12**. The types live in
 `mdaw-proto` (`lib.rs` for transactions and events, `wire.rs` for messages) and in `mdaw-model`
 (ops); this text explains the rules around them. People share the project — tracks, clips,
 notes, devices, tempo — and nothing else: each client plays it back on its own, and nothing
 about playback travels.
 
+Version 12 puts a device's settings into its kind: a built-in device has parameter values, a
+plugin device has its state; `dsp_version` is gone.
 Version 11 removes the Rust engine's synth (`BuiltinKind::Pocket`), which renumbers `TwoOsc` in
 the wire and store formats; data directories, projects and the client's unsent edits of
 version 10 and earlier are not readable (see "Server storage" and "What the client does").
@@ -265,13 +267,15 @@ undo step and reaches the others like any edit.
 ## Built-in devices
 
 ```
-DeviceKind::Builtin { kind: BuiltinKind, dsp_version: u16 }
+Device { id, kind, bypass }
+DeviceKind::Builtin { kind: BuiltinKind, params: map of u32 to f64 }
 BuiltinKind = TwoOsc   // new kinds are added at the end
 ```
 
 A built-in device's settings are its `params`: plain values by parameter id. A missing entry is
-the parameter's default; `DeviceSetParam { value: None }` puts it back there. The parameter ids
-are part of the format: they are never renumbered or reused.
+the parameter's default; `DeviceSetParam { value: None }` puts it back there. `DeviceSetParam`
+acts on built-in devices only; on a plugin device it changes nothing. The parameter ids are part
+of the format: they are never renumbered or reused.
 
 - **`TwoOsc`** is the built-in instrument on the Tracktion engine, a front for Tracktion's 4OSC
   synth; users see it as "Pocket". Two oscillators, a sub oscillator that can be switched on,
@@ -281,7 +285,7 @@ are part of the format: they are never renumbered or reused.
   into their labels, switches 0 or 1, so the engine gets them without loss. The server refuses
   a value outside a parameter's range, a fraction for a choice, switch or tuning in semitones,
   and an id the table does not have (`Invalid`), in `DeviceAdd`, `TrackAdd` and
-  `DeviceSetParam`. `dsp_version` is 1.
+  `DeviceSetParam`.
 
 Up to version 10 there was also `Pocket`, the synth of the Rust engine (removed with that engine
 in version 11); projects that have it are not readable.
@@ -306,9 +310,8 @@ PluginFormat = Clap | Vst3 | Lv2   // new formats are added at the end
   makes sound from notes. Picking another replaces it in the same transaction; plugins that
   change sound (effects) come after it. The client keeps to this; the server does not check it.
 - **State.** The plugin's settings are its own state, an opaque blob; `id` names the plugin
-  within its format (CLAP: plugin id; VST3: class id, 32 hex digits; LV2: URI). The device's
-  `params` are not written by the client for plugins (for CLAP they are applied on top of the
-  state if a document has them). Turning a plugin's knobs, in its own window or in the generic
+  within its format (CLAP: plugin id; VST3: class id, 32 hex digits; LV2: URI). A plugin
+  device has no parameter values in the document. Turning a plugin's knobs, in its own window or in the generic
   controls, changes the running instance, and its state reaches the document as
   `DeviceSetState` (which waits for the upload of the blob, see "What the client does"). The
   engine reports a parameter changed or a preset loaded in the plugin's window; a generic slider
@@ -375,7 +378,7 @@ transaction is committed by itself, without grouping several into one commit.
 
 Blobs are files in `blobs/`, named by their hash in hex.
 
-The format entry is the store version, now `8`. How it changes is in
+The format entry is the store version, now `9`. How it changes is in
 `docs/decisions/0003-stored-format.md`.
 
 A client whose outgoing queue reaches 4096 messages is disconnected and resumes later.

@@ -29,13 +29,7 @@ fn base() -> Project {
         },
         Op::DeviceAdd {
             track: TRACK(),
-            device: Device::new(
-                DEVICE(),
-                DeviceKind::Builtin {
-                    kind: BuiltinKind::TwoOsc,
-                    dsp_version: two_osc::DSP_VERSION,
-                },
-            ),
+            device: Device::builtin(DEVICE(), BuiltinKind::TwoOsc),
             after: None,
         },
         Op::ClipAdd {
@@ -98,9 +92,7 @@ fn param(project: &Project) -> Option<f64> {
         .track(TRACK())?
         .content
         .device(DEVICE())?
-        .params
-        .get(&two_osc::id::FILTER_FREQ)
-        .copied()
+        .param(two_osc::id::FILTER_FREQ)
 }
 
 /// A server reduced to its ordering job.

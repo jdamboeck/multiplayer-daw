@@ -663,16 +663,10 @@ fn an_edit_past_the_limits_is_refused_at_once() {
     settle(&mut [&mut ann, &mut ben]);
 
     // 32 devices fill the track, the next is one too many.
-    let device = |ann: &mut Session| {
-        let kind = DeviceKind::Builtin {
-            kind: BuiltinKind::TwoOsc,
-            dsp_version: mdaw_model::two_osc::DSP_VERSION,
-        };
-        Op::DeviceAdd {
-            track,
-            device: Device::new(ann.ids().device(), kind),
-            after: None,
-        }
+    let device = |ann: &mut Session| Op::DeviceAdd {
+        track,
+        device: Device::builtin(ann.ids().device(), BuiltinKind::TwoOsc),
+        after: None,
     };
     for _ in 0..32 {
         let op = device(&mut ann);

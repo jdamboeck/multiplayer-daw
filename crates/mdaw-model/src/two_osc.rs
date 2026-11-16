@@ -10,9 +10,6 @@
 use crate::op::Invalid;
 use imbl::OrdMap;
 
-/// The `dsp_version` a new device of this kind carries.
-pub const DSP_VERSION: u16 = 1;
-
 /// How a knob's travel maps to a continuous value.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Curve {
@@ -513,22 +510,24 @@ mod tests {
 
     #[test]
     fn ops_with_values_out_of_range_are_refused() {
-        use crate::{ActorId, BuiltinKind, Device, DeviceKind, IdGen, Op, Project, TrackContent, TrackShell};
+        use crate::{ActorId, BuiltinKind, Device, IdGen, Op, Project, TrackContent, TrackShell};
         let mut ids = IdGen::new(ActorId(1));
         let (track, device) = (ids.track(), ids.device());
-        let kind = DeviceKind::Builtin {
-            kind: BuiltinKind::TwoOsc,
-            dsp_version: DSP_VERSION,
-        };
-        let mut synth = Device::new(device, kind);
-        synth.params.insert(id::FILTER_FREQ, 2.0);
+        let mut synth = Device::builtin(device, BuiltinKind::TwoOsc);
+        synth
+            .params_mut()
+            .expect("a built-in device")
+            .insert(id::FILTER_FREQ, 2.0);
         let add = |synth: Device| Op::DeviceAdd {
             track,
             device: synth,
             after: None,
         };
         assert!(add(synth.clone()).validate().is_err());
-        synth.params.insert(id::FILTER_FREQ, 200.0);
+        synth
+            .params_mut()
+            .expect("a built-in device")
+            .insert(id::FILTER_FREQ, 200.0);
         assert!(add(synth.clone()).validate().is_ok());
 
         let mut project = Project::default();

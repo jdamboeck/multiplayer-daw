@@ -279,7 +279,8 @@ fn two_osc_panel(app: &mut DawApp, ui: &mut Ui, track: TrackId, device: &Device)
         &[Group::Sub, Group::Filter],
         &[Group::FilterEnv, Group::AmpEnv, Group::Global],
     ];
-    let values = two_osc::Values::from_map(&device.params);
+    let Some(params) = device.params() else { return };
+    let values = two_osc::Values::from_map(params);
     ui.horizontal_top(|ui| {
         builtin_header(app, ui, track, device);
         ui.separator();

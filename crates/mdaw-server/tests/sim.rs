@@ -708,7 +708,6 @@ fn concurrent_edits_of_a_track_with_a_plugin_converge() {
     let plugin = content.device(device).unwrap();
     // Each pair of edits writes the same property; the later one (client 2's) wins each.
     assert!(matches!(&plugin.kind, DeviceKind::Plugin { .. }));
-    assert_eq!(plugin.params.get(&1), Some(&9.0));
     assert!(matches!(plugin.kind, DeviceKind::Plugin { state: None, .. }));
     assert_eq!(content.gain, 1.0 / 8.0);
     let (_, clip, note) = notes(doc)[0];

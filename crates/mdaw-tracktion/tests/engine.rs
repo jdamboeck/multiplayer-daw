@@ -255,14 +255,11 @@ fn build_model(ids_gen: &mut IdGen) -> (Project, Vec<Op>, Ids) {
         first: [ids_gen.note(), ids_gen.note(), ids_gen.note(), ids_gen.note()],
         late: ids_gen.note(),
     };
-    let mut synth = Device::new(
-        ids.synth,
-        DeviceKind::Builtin {
-            kind: BuiltinKind::TwoOsc,
-            dsp_version: two_osc::DSP_VERSION,
-        },
-    );
-    synth.params.insert(two_osc::id::OSC1_WAVE, 1.0);
+    let mut synth = Device::builtin(ids.synth, BuiltinKind::TwoOsc);
+    synth
+        .params_mut()
+        .expect("a built-in device")
+        .insert(two_osc::id::OSC1_WAVE, 1.0);
     let mut ops = vec![
         Op::TempoPut {
             id: ids.tempo,
@@ -571,13 +568,7 @@ fn other_ops(world: &mut World, ids: &Ids, ids_gen: &mut IdGen) {
     );
     let problems = world.op(Op::DeviceAdd {
         track: ids.track,
-        device: Device::new(
-            extra,
-            DeviceKind::Builtin {
-                kind: BuiltinKind::TwoOsc,
-                dsp_version: two_osc::DSP_VERSION,
-            },
-        ),
+        device: Device::builtin(extra, BuiltinKind::TwoOsc),
         after: Some(ids.synth),
     });
     assert!(problems.is_empty(), "device add: {problems:?}");
@@ -822,14 +813,11 @@ fn sync_by_difference(world: &World, ids_gen: &mut IdGen) {
     // One oscillator only (OSC 2 Wave None): two free-running oscillators sum to a level that
     // changes by some 3 dB from render to render, one does not.
     let instrument = |id| {
-        let mut device = Device::new(
-            id,
-            DeviceKind::Builtin {
-                kind: BuiltinKind::TwoOsc,
-                dsp_version: two_osc::DSP_VERSION,
-            },
-        );
-        device.params.insert(two_osc::id::OSC2_WAVE, 0.0);
+        let mut device = Device::builtin(id, BuiltinKind::TwoOsc);
+        device
+            .params_mut()
+            .expect("a built-in device")
+            .insert(two_osc::id::OSC2_WAVE, 0.0);
         device
     };
     let (t1, t2, t3) = (ids_gen.track(), ids_gen.track(), ids_gen.track());
@@ -1187,7 +1175,7 @@ fn builtin_instrument(world: &mut World, ids_gen: &mut IdGen) {
     };
     let kind = DeviceKind::Builtin {
         kind: BuiltinKind::TwoOsc,
-        dsp_version: two_osc::DSP_VERSION,
+        params: Default::default(),
     };
     for op in [
         Op::TempoPut {
@@ -1489,9 +1477,18 @@ fn builtin_instrument(world: &mut World, ids_gen: &mut IdGen) {
             track,
             device: {
                 let mut device = Device::new(synth, kind.clone());
-                device.params.insert(id::OSC2_WAVE, 0.0);
-                device.params.insert(id::FILTER_FREQ, 900.0);
-                device.params.insert(id::AMP_RELEASE, 0.8);
+                device
+                    .params_mut()
+                    .expect("a built-in device")
+                    .insert(id::OSC2_WAVE, 0.0);
+                device
+                    .params_mut()
+                    .expect("a built-in device")
+                    .insert(id::FILTER_FREQ, 900.0);
+                device
+                    .params_mut()
+                    .expect("a built-in device")
+                    .insert(id::AMP_RELEASE, 0.8);
                 device
             },
             after: None,
@@ -1527,8 +1524,8 @@ fn builtin_instrument(world: &mut World, ids_gen: &mut IdGen) {
 }
 
 /// Step 8: plugin devices. One whose plugin is not installed is left out and reported; the
-/// CLAP test synth is found by its CLAP id and plays; its parameters follow the model
-/// (plain values in the plugin's own range) and its state comes back through the blob resolver.
+/// CLAP test synth is found by its CLAP id and plays; its state comes back through the blob
+/// resolver.
 fn plugins(world: &mut World, ids_gen: &mut IdGen) {
     let engine = &world.engine;
     engine.plugins_scan("CLAP").expect("scan CLAP");
@@ -1631,74 +1628,6 @@ fn plugins(world: &mut World, ids_gen: &mut IdGen) {
         "clap: text of an unknown parameter"
     );
 
-    // Level 0.1 (plain = normalised for 0..1): a fifth of the default level.
-    let set = |param: u32, value: Option<f64>| Op::DeviceSetParam {
-        track,
-        id: synth,
-        param,
-        value,
-    };
-    let problems = world.op(set(0, Some(0.1)));
-    assert!(problems.is_empty(), "clap: level op applied: {problems:?}");
-    let quiet = render(&world.engine, "clap_level_low", 8 * Q).channel_peaks().0;
-    let ratio = quiet / base_left;
-    println!("clap: level 0.1 gives {ratio:.3} of the default level's peak");
-    assert!(
-        (0.17..0.23).contains(&ratio),
-        "clap: level 0.1 is a fifth ({ratio})"
-    );
-
-    // Balance -1 (plain), normalised 0: left only. A plain value used as normalised would
-    // have been clamped to 0 as well, so -0.5 is checked too: normalised 0.25.
-    world.op(set(1, Some(-1.0)));
-    let (left, right) = render(&world.engine, "clap_balance_left", 8 * Q).channel_peaks();
-    assert!(
-        left > 0.01 && right < left * 0.01,
-        "clap: balance -1 is left only ({left} / {right})"
-    );
-    world.op(set(1, Some(-0.5)));
-    let value = world.engine.device_get_param(raw, "1").expect("balance");
-    assert!(
-        (value - 0.25).abs() < 1e-4,
-        "clap: balance -0.5 is normalised 0.25 ({value})"
-    );
-    let (left, right) = render(&world.engine, "clap_balance_half", 8 * Q).channel_peaks();
-    assert!(
-        (right / left - 0.5).abs() < 0.05,
-        "clap: balance -0.5 halves the right ({left} / {right})"
-    );
-    // Out of range in the model: clamped to the plugin's range.
-    world.op(set(1, Some(-7.0)));
-    let value = world.engine.device_get_param(raw, "1").expect("balance");
-    assert!(value.abs() < 1e-6, "clap: balance below range clamped ({value})");
-
-    // A model with stored parameter values, loaded whole: the values are applied.
-    let incremental = render(&world.engine, "clap_incremental", 8 * Q).channel_peaks();
-    let problems = world.load();
-    assert!(
-        problems
-            .iter()
-            .all(|p| matches!(p, Problem::DeviceSkipped { device, .. } if *device == missing)),
-        "clap: reload problems: {problems:?}"
-    );
-    let reloaded = render(&world.engine, "clap_reloaded", 8 * Q).channel_peaks();
-    println!("clap: incremental {incremental:?}, reloaded {reloaded:?}");
-    assert!(
-        (reloaded.0 / incremental.0 - 1.0).abs() < 0.05 && reloaded.1 < reloaded.0 * 0.01,
-        "clap: the loaded params match the incremental ones"
-    );
-    let level = world.engine.device_get_param(raw, "0").expect("level");
-    assert!((level - 0.1).abs() < 1e-4, "clap: level loaded ({level})");
-
-    // Back to the defaults (value None): level 0.5, centred.
-    world.op(set(0, None));
-    world.op(set(1, None));
-    let (left, right) = render(&world.engine, "clap_defaults", 8 * Q).channel_peaks();
-    assert!(
-        (left / base_left - 1.0).abs() < 0.05 && (right / base_right - 1.0).abs() < 0.05,
-        "clap: back to the default level ({left} / {right} vs {base_left} / {base_right})"
-    );
-
     // A state, through the resolver.
     world
         .engine
@@ -1745,19 +1674,6 @@ fn plugins(world: &mut World, ids_gen: &mut IdGen) {
     assert!(
         (left / base_left - 1.0).abs() < 0.05,
         "clap: the reset synth sounds at the default level ({left} vs {base_left})"
-    );
-
-    // A stored parameter value stays on top of a reset, as on a load.
-    world.op(set(0, Some(0.1)));
-    world.op(Op::DeviceSetState {
-        track,
-        id: synth,
-        state: None,
-    });
-    let level = world.engine.device_get_param(raw, "0").expect("clap get level");
-    assert!(
-        (level - 0.1).abs() < 1e-4,
-        "clap: model value kept over the reset ({level})"
     );
 }
 

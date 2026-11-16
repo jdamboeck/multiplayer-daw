@@ -12,16 +12,15 @@
 //! [`Problem`]. Model data the engine has no use for (project name, track colour,
 //! stems) is ignored without a report.
 //!
-//! A plugin device's settings are its state blob and its parameter values; the state is applied
-//! first, then the values (which the model keeps in the plugin's own units, converted here with
-//! the range the engine reports).
+//! A plugin device's settings are its state blob. The built-in instrument's are its parameter
+//! values.
 //!
 //! The built-in instrument (`BuiltinKind::TwoOsc`) is played by the engine's own synth,
 //! Tracktion's 4osc: it is a front for 4osc whose values are 4osc's own (see
 //! [`crate::two_osc`]).
 
 use crate::two_osc::{self as two_osc_map, Target};
-use crate::{Engine, EntityKind, Error, Note as EngineNote, ParamInfo, PluginInfo, Status};
+use crate::{Engine, EntityKind, Error, Note as EngineNote, PluginInfo, Status};
 use mdaw_model::two_osc::Values as TwoOscValues;
 use mdaw_model::{
     BlobHash, BuiltinKind, ClipId, Device, DeviceId, DeviceKind, MAX_MILLI_BPM, MAX_TICK, MIN_MILLI_BPM,
@@ -49,9 +48,7 @@ pub enum Problem {
         plugin: String,
         reason: String,
     },
-    /// A device parameter the engine cannot be given: one the plugin does not have, or one the
-    /// built-in instrument does not have (the engine takes all of its own, see
-    /// [`crate::two_osc`]).
+    /// A parameter the built-in instrument does not have.
     ParamNotMapped {
         track: TrackId,
         device: DeviceId,
@@ -166,9 +163,8 @@ pub fn add_device(
     Ok(sync.problems)
 }
 
-/// Gives a plugin device the state `project` holds for it (its blob has arrived), then its
-/// parameter values on top, as on a load. Does nothing for a built-in device or one the
-/// engine lacks.
+/// Gives a plugin device the state `project` holds for it (its blob has arrived). Does nothing
+/// for a built-in device or one the engine lacks.
 pub fn restore_device_state(
     engine: &Engine,
     project: &Project,
@@ -192,8 +188,6 @@ pub fn restore_device_state(
         // No saved state: the plugin as it starts.
         None => engine.device_reset_state(raw_device(device))?,
     }
-    // The parameter values go on top of the state, as when the project is loaded.
-    sync.put_params(track, found)?;
     Ok(sync.problems)
 }
 
@@ -464,25 +458,9 @@ impl<'a> Sync<'a> {
                 if let Some(blob) = state {
                     self.put_state(track, device.id, *blob);
                 }
-                self.put_params(track, device)?;
             }
         }
         Ok(true)
-    }
-
-    /// Gives a plugin device the parameter values the model holds for it.
-    pub(crate) fn put_params(&mut self, track: TrackId, device: &Device) -> Result<(), Error> {
-        if device.params.is_empty() {
-            return Ok(());
-        }
-        let params = match &device.kind {
-            DeviceKind::Plugin { .. } => self.engine.device_params(raw_device(device.id))?,
-            DeviceKind::Builtin { .. } => return self.put_builtin(track, device),
-        };
-        for (param, value) in &device.params {
-            self.put_param(track, device.id, &params, *param, Some(*value))?;
-        }
-        Ok(())
     }
 
     /// Sets the engine's synth up from all of a built-in device's parameters, defaults included.
@@ -506,13 +484,13 @@ impl<'a> Sync<'a> {
     ) -> Result<(), Error> {
         let DeviceKind::Builtin {
             kind: BuiltinKind::TwoOsc,
-            ..
+            params: held,
         } = &device.kind
         else {
             return Ok(());
         };
         let raw = raw_device(device.id);
-        let values = TwoOscValues::from_map(&device.params);
+        let values = TwoOscValues::from_map(held);
         let mut state = false;
         for param in params {
             match two_osc_map::target(param) {
@@ -542,8 +520,11 @@ impl<'a> Sync<'a> {
     /// Sets 4osc up as the built-in instrument (`BuiltinKind::TwoOsc`, see [`crate::two_osc`]):
     /// first the settings that are part of its state, then every parameter.
     fn put_two_osc(&mut self, track: TrackId, device: &Device) -> Result<(), Error> {
+        let Some(held) = device.params() else {
+            return Ok(());
+        };
         let raw = raw_device(device.id);
-        let values = TwoOscValues::from_map(&device.params);
+        let values = TwoOscValues::from_map(held);
         self.put_two_osc_state(raw, &values)?;
         for p in &mdaw_model::two_osc::PARAMS {
             if let Some(Target::Param {
@@ -561,7 +542,7 @@ impl<'a> Sync<'a> {
             self.engine
                 .device_set_param(raw, four_osc, range.normalise(*plain) as f32)?;
         }
-        for param in device.params.keys() {
+        for param in held.keys() {
             if two_osc_map::target(*param).is_none() {
                 self.problems.push(Problem::ParamNotMapped {
                     track,
@@ -587,31 +568,6 @@ impl<'a> Sync<'a> {
             self.engine.device_set_state(raw, &patched)?;
         }
         Ok(())
-    }
-
-    /// Sets one parameter of a plugin device. `plain` is the model's value, in the plugin's own
-    /// units; `None` is the parameter's default. `params` is the device's list from the engine.
-    pub(crate) fn put_param(
-        &mut self,
-        track: TrackId,
-        device: DeviceId,
-        params: &[ParamInfo],
-        param: u32,
-        plain: Option<f64>,
-    ) -> Result<(), Error> {
-        let id = param.to_string();
-        let found = params.iter().find(|p| p.id == id);
-        let value = found.and_then(|p| match plain {
-            Some(plain) => Some(p.normalise(plain)),
-            None => p.default,
-        });
-        let Some(value) = value else {
-            self.problems
-                .push(Problem::ParamNotMapped { track, device, param });
-            return Ok(());
-        };
-        self.engine
-            .device_set_param(raw_device(device), &id, value as f32)
     }
 
     /// A state the plugin refuses is a problem, not an error: the plugin is in the engine either

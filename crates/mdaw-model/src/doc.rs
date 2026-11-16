@@ -137,8 +137,6 @@ pub struct Note {
 pub struct Device {
     pub id: DeviceId,
     pub kind: DeviceKind,
-    /// Parameter values by parameter ID. A missing entry means the parameter's default.
-    pub params: OrdMap<u32, f64>,
     pub bypass: bool,
 }
 
@@ -147,16 +145,52 @@ impl Device {
         Self {
             id,
             kind,
-            params: OrdMap::new(),
             bypass: false,
         }
+    }
+
+    /// A built-in device with every parameter at its default.
+    pub fn builtin(id: DeviceId, kind: BuiltinKind) -> Self {
+        Self::new(
+            id,
+            DeviceKind::Builtin {
+                kind,
+                params: OrdMap::new(),
+            },
+        )
+    }
+
+    /// The parameter values of a built-in device; `None` for a plugin, whose settings are
+    /// its state.
+    pub fn params(&self) -> Option<&OrdMap<u32, f64>> {
+        match &self.kind {
+            DeviceKind::Builtin { params, .. } => Some(params),
+            DeviceKind::Plugin { .. } => None,
+        }
+    }
+
+    pub fn params_mut(&mut self) -> Option<&mut OrdMap<u32, f64>> {
+        match &mut self.kind {
+            DeviceKind::Builtin { params, .. } => Some(params),
+            DeviceKind::Plugin { .. } => None,
+        }
+    }
+
+    /// The value a built-in device holds for a parameter; `None` if it is at its default, or
+    /// the device is a plugin.
+    pub fn param(&self, id: u32) -> Option<f64> {
+        self.params()?.get(&id).copied()
     }
 }
 
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub enum DeviceKind {
-    /// Deterministic built-in: only params are synced and every client renders it.
-    Builtin { kind: BuiltinKind, dsp_version: u16 },
+    /// The engine's own instrument: only its parameter values are synced, by parameter ID. A
+    /// missing entry means the parameter's default.
+    Builtin {
+        kind: BuiltinKind,
+        params: OrdMap<u32, f64>,
+    },
     /// A plugin installed on the client's machine: its state is an opaque blob. A client that
     /// lacks the plugin gets no sound from the device.
     Plugin {

@@ -22,7 +22,7 @@ fn int(n: u64) -> i64 {
 
 /// Bumped by every change to the stored format that is not free; see
 /// `docs/decisions/0003-stored-format.md`.
-const STORE_VERSION: u32 = 8;
+const STORE_VERSION: u32 = 9;
 
 // The version and the migration steps cannot drift apart.
 const _: () = assert!(STORE_VERSION == migrate::FIRST + migrate::STEPS.len() as u32);

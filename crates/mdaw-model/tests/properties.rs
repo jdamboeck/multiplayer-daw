@@ -63,7 +63,7 @@ fn clip() -> impl Strategy<Value = Clip> {
 }
 
 /// The parameters the generated ops use: ids and whole values the built-in instrument takes
-/// (`two_osc::check`), so that a device carrying them is valid whatever its kind.
+/// (`two_osc::check`).
 fn param() -> impl Strategy<Value = (u32, f64)> {
     use two_osc::id;
     (
@@ -74,9 +74,9 @@ fn param() -> impl Strategy<Value = (u32, f64)> {
 
 fn device() -> impl Strategy<Value = Device> {
     let kind = prop_oneof![
-        Just(DeviceKind::Builtin {
+        prop::collection::vec(param(), 0..3).prop_map(|params| DeviceKind::Builtin {
             kind: BuiltinKind::TwoOsc,
-            dsp_version: mdaw_model::two_osc::DSP_VERSION
+            params: params.into_iter().collect(),
         }),
         prop::option::of(any::<[u8; 32]>().prop_map(BlobHash)).prop_map(|state| DeviceKind::Plugin {
             format: PluginFormat::Clap,
@@ -85,18 +85,7 @@ fn device() -> impl Strategy<Value = Device> {
             state
         }),
     ];
-    (
-        device_id(),
-        kind,
-        prop::collection::vec(param(), 0..3),
-        any::<bool>(),
-    )
-        .prop_map(|(id, kind, params, bypass)| Device {
-            id,
-            kind,
-            params: params.into_iter().collect(),
-            bypass,
-        })
+    (device_id(), kind, any::<bool>()).prop_map(|(id, kind, bypass)| Device { id, kind, bypass })
 }
 
 fn content() -> impl Strategy<Value = TrackContent> {
