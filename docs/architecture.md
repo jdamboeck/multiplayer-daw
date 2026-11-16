@@ -1,8 +1,8 @@
 # Architecture
 
-Status: 2026-11-15, branch `tracktion-integration` (from `m1-local-daw` at `379f0a1`). The Rust
-audio engine is gone (phase 7, `docs/retire-rust-engine.md`): the client plays through Tracktion
-only. "What the audit found" is the audit of 2026-11-12, with what became of each point.
+Status: 2026-11-16, branch `client-ui`, after the foundation plan (`docs/foundation-plan.md`).
+The Rust audio engine is gone (phase 7, `docs/retire-rust-engine.md`): the client plays through
+Tracktion only. "What the audit found" is the audit of 2026-11-12, with what became of each point.
 
 The guiding rule: **collaborate on the project, not on the audio clock.** People share a
 project — tracks, clips, notes, instruments, plugin settings, automation, tempo, audio files.
@@ -56,9 +56,9 @@ link JUCE 8 (README, "License").
 | Part | Lines | What it does |
 |---|---|---|
 | `mdaw-model` | 2.1k | Project, typed stable IDs (`EntityId = actor << 32 | counter`), `Tick` at 960 PPQ, the `Op` enum and `apply`, the built-in instrument's parameter table (`two_osc.rs`) |
-| `mdaw-proto` | 0.4k | Wire messages (protocol version 11), `Txn { id: TxnId, base_seq, ops }`, blobs |
+| `mdaw-proto` | 0.4k | Wire messages (protocol version 12), `Txn { id: TxnId, base_seq, ops }`, blobs |
 | `mdaw-sync` | 0.4k | Client replica: optimistic ops, rebase on server events |
-| `mdaw-server` | 1.5k | Hub, sequencer, SQLite store (format `7/11`), receipts |
+| `mdaw-server` | 1.5k | Hub, sequencer, SQLite store (format 9, JSON), receipts |
 | `mdaw-net` | 0.5k | QUIC (quinn) |
 | `mdaw-client` | 10.2k | egui app: arrange, piano roll, devices, changelog; the outbox; the engine worker and its scheduler; MIDI input (midir) and the clock for recording |
 | `mdaw-tracktion-sys` | 0.4k | Declarations of the bridge's C header; its build script runs the CMake build in `target/native` |
@@ -134,6 +134,8 @@ These are confirmed in the code, not suspected.
   never recreate it; structural edits that cannot be ordered unambiguously are rejected and the
   client rebases.
 - No CRDTs. No checkout for ordinary edits.
+- The server stores JSON and its stored format changes by rule, with a migration step for each
+  change that is not free (ADR 0003, `docs/decisions/0003-stored-format.md`).
 
 ## Engine target
 
