@@ -59,6 +59,7 @@ use crate::audio::{
 use crate::clock;
 use crate::engine_queue::{Class, EngineQueue, JobInfo, Key, Picked, Spec};
 use crate::link::Waker;
+use crate::plugin_guard::{PluginGuard, PluginKey};
 
 /// A plugin's settings are read this long after its last change...
 const CAPTURE_QUIET: Duration = Duration::from_millis(500);
@@ -79,6 +80,10 @@ const TRACE_SLOW: Duration = Duration::from_millis(250);
 /// A reported position older than this is not carried forward: the engine's thread is
 /// busy, and the playhead waits for it rather than run ahead on a guess.
 const POSITION_AGE_MAX: f64 = 0.1;
+/// A plugin started this long ago, with the client still running, is past its first moments.
+const SETTLE: Duration = Duration::from_secs(5);
+/// What a device of a switched-off plugin says.
+const OFF_REASON: &str = "switched off, because mdaw ended while starting it; Try again switches it on";
 
 /// How to start the engine.
 #[derive(Clone, Debug)]
@@ -143,6 +148,9 @@ struct Shared {
     looked: HashSet<DeviceId>,
     /// Plugin windows open, for the trace.
     open_editors: usize,
+    /// When the plugins started last are past their first moments (see `Worker::guard`); the
+    /// window's thread then asks the worker to forget that they were starting.
+    settle_at: Option<Instant>,
 }
 
 /// The engine's answer to opening or closing a plugin's window.
@@ -201,6 +209,8 @@ enum Job {
     CatalogChanged {
         last: bool,
     },
+    /// The plugins started are past their first moments.
+    Settled,
 }
 
 /// What may take the place of a queued job, or keeps one more from being queued.
@@ -214,6 +224,7 @@ enum Coalesce {
     Catalog(bool),
     Look(DeviceId),
     Params(DeviceId),
+    Settled,
 }
 
 impl Coalesce {
@@ -225,7 +236,7 @@ impl Coalesce {
             | Coalesce::Retry(d)
             | Coalesce::Look(d)
             | Coalesce::Params(d) => Some(*d),
-            Coalesce::OutputGain | Coalesce::Catalog(_) => None,
+            Coalesce::OutputGain | Coalesce::Catalog(_) | Coalesce::Settled => None,
         }
     }
 }
@@ -264,6 +275,7 @@ fn spec(job: &Job) -> Spec<Coalesce> {
         }
         Job::Look(_, d) => Spec::background(Coalesce::Look(*d), "look"),
         Job::Params(d) => Spec::background(Coalesce::Params(*d), "params"),
+        Job::Settled => Spec::ordered(Normal, Key::Global, "settled").unique(Coalesce::Settled),
     }
 }
 
@@ -320,6 +332,7 @@ pub struct TracktionAudio {
     looked_at: Instant,
     /// Devices looked at as if their windows were open (for tests; see [`TracktionAudio::watch`]).
     watched: HashSet<DeviceId>,
+    settings_dir: PathBuf,
 }
 
 fn lock(shared: &Mutex<Shared>) -> MutexGuard<'_, Shared> {
@@ -474,6 +487,33 @@ impl TracktionAudio {
             eprintln!("mdaw: {notice}");
             lock(&shared).notices.push(notice);
         }
+        let guard = if options.enable_plugins {
+            match PluginGuard::open(&options.settings_dir) {
+                Ok((guard, newly_off)) => {
+                    if !newly_off.is_empty() {
+                        let names: Vec<String> = newly_off
+                            .iter()
+                            .map(|(format, id)| format!("{} {id}", format.name()))
+                            .collect();
+                        lock(&shared).notices.push(format!(
+                            "mdaw ended while starting these plugins the last time: {}. They are \
+                             switched off on this computer, and tracks that use them are silent \
+                             here. \"Try again\" in the device tab switches one on.",
+                            names.join(", ")
+                        ));
+                    }
+                    Some(guard)
+                }
+                Err(err) => {
+                    lock(&shared).notices.push(format!(
+                        "Plugins that fail cannot be remembered on this computer: {err}."
+                    ));
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let queue = Arc::new(Queue::new());
         let worker = Worker {
             engine: engine.clone(),
@@ -484,6 +524,7 @@ impl TracktionAudio {
             output_gain: 1.0,
             looks: HashMap::new(),
             applied: HashMap::new(),
+            guard,
         };
         let worker = std::thread::Builder::new()
             .name("mdaw-engine-worker".into())
@@ -527,6 +568,7 @@ impl TracktionAudio {
             looked_at: Instant::now(),
             watched: HashSet::new(),
             params_asked: HashMap::new(),
+            settings_dir: options.settings_dir.clone(),
         })
     }
 
@@ -760,6 +802,9 @@ impl Drop for TracktionAudio {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
+        // Ending in the normal way is not a crash: plugins still in their first moments are
+        // not to blame.
+        PluginGuard::ended_normally(&self.settings_dir);
     }
 }
 
@@ -813,6 +858,11 @@ impl Audio for TracktionAudio {
             && (state.position_tick == tick || at.elapsed() > Duration::from_secs(1))
         {
             self.seek.set(None);
+        }
+        // Plugins started a while ago are past their first moments: the worker forgets them.
+        let settle = lock(&self.shared).settle_at;
+        if settle.is_some_and(|at| at <= Instant::now()) {
+            self.send(Job::Settled);
         }
         // The engine's answers about windows are taken before its events are drained: an answer
         // is written after the call that showed the window returned, and the window's
@@ -883,18 +933,28 @@ impl Audio for TracktionAudio {
     }
 
     fn next_frame_in(&self) -> Option<Duration> {
-        let busy = {
+        let (busy, settle) = {
             let shared = lock(&self.shared);
-            shared.scanning || shared.sync_queued || !shared.captured.is_empty()
+            (
+                shared.scanning || shared.sync_queued || !shared.captured.is_empty(),
+                shared.settle_at,
+            )
         };
-        if !self.pending.is_empty() || busy {
+        let work = if !self.pending.is_empty() || busy {
             Some(Duration::from_millis(100))
         } else if !self.editors.is_empty() || !self.watched.is_empty() {
             // Changes made in a plugin's window come as events, or are found by looking.
             Some(Duration::from_millis(50))
         } else {
             None
-        }
+        };
+        // Not sooner than 100 ms, also once it has passed: the worker may be busy for a while
+        // before it takes the job, and the window must not spin until then.
+        let settle = settle.map(|at| {
+            at.saturating_duration_since(Instant::now())
+                .max(Duration::from_millis(100))
+        });
+        [work, settle].into_iter().flatten().min()
     }
 
     fn play(&mut self) {
@@ -1284,6 +1344,9 @@ struct Worker {
     looks: HashMap<DeviceId, (BlobHash, Option<BlobHash>)>,
     /// The number of the last set carried out per parameter (see [`Worker::read_params`]).
     applied: HashMap<(DeviceId, String), u64>,
+    /// Which plugins are switched off here, and which are being started; `None` when plugins
+    /// are off or the guard's files cannot be used.
+    guard: Option<PluginGuard>,
 }
 
 impl Worker {
@@ -1392,8 +1455,35 @@ impl Worker {
             Job::Look(track, device) => self.look(track, device),
             Job::Blob(hash, bytes) => self.blob(hash, bytes),
             Job::Retry { track, device } => {
-                self.retry(track, device);
-                self.publish_statuses(&[]);
+                if self.switch_on(device) {
+                    // The device is not in the synced project: a sync from the view adds it,
+                    // marking its start like any other.
+                    self.sync();
+                } else {
+                    self.retry(track, device);
+                    self.publish_statuses(&[]);
+                }
+            }
+            Job::Settled => {
+                let due = {
+                    let mut shared = lock(&self.shared);
+                    match shared.settle_at {
+                        Some(at) if at <= Instant::now() => {
+                            shared.settle_at = None;
+                            true
+                        }
+                        // Not set, or a newer start moved it: the window asks again then.
+                        _ => false,
+                    }
+                };
+                if due
+                    && let Some(guard) = &mut self.guard
+                    && let Err(err) = guard.settled()
+                {
+                    self.notice(format!(
+                        "Plugins that fail cannot be remembered on this computer: {err}."
+                    ));
+                }
             }
             Job::Render {
                 path,
@@ -1500,6 +1590,7 @@ impl Worker {
             })
         };
         let Some(view) = view else { return };
+        let view = without_off(view, self.guard.as_ref());
         let restated: Vec<DeviceId> = plugin_devices(&view)
             .filter(|(track, d)| {
                 let now = state_in(&view, *track, d.id);
@@ -1507,6 +1598,7 @@ impl Worker {
             })
             .map(|(_, d)| d.id)
             .collect();
+        let marked = self.mark_starting(&view);
         let engine = self.engine.clone();
         let result = {
             let blobs = self.resolver();
@@ -1548,11 +1640,17 @@ impl Worker {
                             })
                             .collect();
                         lock(&self.shared).statuses = statuses;
+                        if marked {
+                            self.started();
+                        }
                         return;
                     }
                 }
             }
         };
+        if marked {
+            self.started();
+        }
         let gain_changed = self
             .synced
             .as_ref()
@@ -1569,6 +1667,37 @@ impl Worker {
             self.master_gain();
         }
         self.publish_statuses(&problems);
+    }
+
+    /// Notes the plugins of `project` that the engine does not have, and so is about to
+    /// start, on the disk. True if there are any: the caller says when they have started.
+    fn mark_starting(&mut self, project: &Project) -> bool {
+        let Some(guard) = &mut self.guard else {
+            return false;
+        };
+        let engine = &self.engine;
+        let starting: Vec<PluginKey> = plugin_devices(project)
+            .filter(|(_, d)| !engine.has(EntityKind::Device, raw_device(d.id)))
+            .filter_map(|(_, d)| match &d.kind {
+                DeviceKind::Plugin { format, id, .. } => Some((*format, id.clone())),
+                DeviceKind::Builtin { .. } => None,
+            })
+            .collect();
+        if starting.is_empty() {
+            return false;
+        }
+        if let Err(err) = guard.starting(starting) {
+            lock(&self.shared).notices.push(format!(
+                "Plugins that fail cannot be remembered on this computer: {err}."
+            ));
+        }
+        true
+    }
+
+    /// The plugins marked were started, or could not be: from now they have `SETTLE` to show
+    /// that they do not take the client down.
+    fn started(&self) {
+        lock(&self.shared).settle_at = Some(Instant::now() + SETTLE);
     }
 
     /// Works out how each plugin device of the synced project is doing.
@@ -1636,6 +1765,17 @@ impl Worker {
             };
             statuses.insert(device.id, status);
         }
+        // Devices of switched-off plugins are not in the synced project (`without_off`); the
+        // view the session gave still has them.
+        if let (Some(guard), Some(view)) = (&self.guard, &shared.view) {
+            for (_, device) in plugin_devices(view) {
+                if let DeviceKind::Plugin { format, id, .. } = &device.kind
+                    && guard.is_off(*format, id)
+                {
+                    statuses.insert(device.id, DeviceStatus::Failed(OFF_REASON.into()));
+                }
+            }
+        }
         shared.statuses = statuses;
     }
 
@@ -1663,13 +1803,44 @@ impl Worker {
         }
     }
 
+    /// If `device`'s plugin is switched off, switches it on again. True if it was.
+    fn switch_on(&mut self, device: DeviceId) -> bool {
+        let kind = {
+            let shared = lock(&self.shared);
+            shared.view.as_ref().and_then(|view| {
+                plugin_devices(view)
+                    .find(|(_, d)| d.id == device)
+                    .map(|(_, d)| d.kind.clone())
+            })
+        };
+        let (Some(guard), Some(DeviceKind::Plugin { format, id, .. })) = (&mut self.guard, kind) else {
+            return false;
+        };
+        if !guard.is_off(format, &id) {
+            return false;
+        }
+        if let Err(err) = guard.switch_on(format, &id) {
+            lock(&self.shared).notices.push(format!(
+                "Plugins that fail cannot be remembered on this computer: {err}."
+            ));
+        }
+        true
+    }
+
     /// Tries to put a device that is not in the engine into it again.
-    fn retry(&self, track: TrackId, device: DeviceId) -> Vec<Problem> {
-        let Some(project) = &self.synced else {
+    fn retry(&mut self, track: TrackId, device: DeviceId) -> Vec<Problem> {
+        let Some(project) = self.synced.clone() else {
             return Vec::new();
         };
-        let blobs = self.resolver();
-        match mdaw_tracktion::add_device(&self.engine, project, track, device, &blobs) {
+        let marked = self.mark_starting(&project);
+        let result = {
+            let blobs = self.resolver();
+            mdaw_tracktion::add_device(&self.engine, &project, track, device, &blobs)
+        };
+        if marked {
+            self.started();
+        }
+        match result {
             Ok(problems) => problems,
             Err(e) => {
                 self.notice(format!("The plugin could not be started: {}", e.message));
@@ -1824,6 +1995,26 @@ impl Worker {
         }
         result
     }
+}
+
+/// `view` without the plugin devices whose plugin is switched off, so that the engine is
+/// never asked to start them. Tracks without such a device are not touched and stay shared.
+fn without_off(mut view: Project, guard: Option<&PluginGuard>) -> Project {
+    let Some(guard) = guard else { return view };
+    let is_off = |d: &mdaw_model::Device| matches!(&d.kind, DeviceKind::Plugin { format, id, .. } if guard.is_off(*format, id));
+    let tracks: Vec<TrackId> = view
+        .tracks
+        .iter()
+        .filter(|(_, t)| t.content.devices.iter().any(is_off))
+        .map(|(id, _)| *id)
+        .collect();
+    for id in tracks {
+        if let Some(track) = view.tracks.get_mut(&id) {
+            let content: &mut TrackContent = Arc::make_mut(&mut Arc::make_mut(track).content);
+            content.devices.retain(|d| !is_off(d));
+        }
+    }
+    view
 }
 
 /// Sets a plugin device's state in a project, as if by `DeviceSetState`.

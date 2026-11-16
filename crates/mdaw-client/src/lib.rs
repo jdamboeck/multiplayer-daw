@@ -14,6 +14,7 @@ mod link;
 pub mod live;
 pub mod midi;
 pub mod outbox;
+pub mod plugin_guard;
 pub mod profile;
 mod record;
 mod session;

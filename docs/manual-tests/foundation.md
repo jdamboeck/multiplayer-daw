@@ -61,6 +61,29 @@ its own terminal: `cargo xtask server`, `cargo xtask client Ann`, `cargo xtask c
       Expect: the file is empty (size 0), and `target/demo/profiles/ann/projects/*/blobs` holds
       no files.
 
+## C. A plugin that takes mdaw down
+
+A plugin that was being started when mdaw last ended is switched off on this computer, and
+"Try again" in its device tab switches it on. A plugin counts as started 5 seconds after it was
+loaded. No plugin at hand crashes on demand after loading (the bridge's `bad-crash.clap` crashes
+while it is examined, so the scan already refuses it), so these steps kill the client by hand.
+
+- [ ] **C.1** Start the client, put any plugin on a track, and within 5 seconds kill the client
+      (`kill -9 <pid>`, or `pkill -9 mdaw`). Start it again.
+      Expect: a notice names the plugin; the track says "plugin failed"; the device tab gives
+      the reason (switched off, because mdaw ended while starting it); the other tracks play.
+- [ ] **C.2** In the device tab, press "Try again". Then restart the client the normal way.
+      Expect: the plugin loads and sounds; after the restart it is still on.
+- [ ] **C.3** Put a plugin on a track and close the window the normal way right away. Start
+      again.
+      Expect: nothing is switched off.
+- [ ] **C.4** Put a plugin on a track, wait ten seconds, kill the client, start it.
+      Expect: nothing is switched off.
+- [ ] **C.5** With two clients on a server (`cargo xtask server`, `cargo xtask client Ann`,
+      `cargo xtask client Ben`): switch Ann's plugin off as in C.1.
+      Expect: Ben, who has the plugin, still hears the track; nothing about it reached the
+      document.
+
 ## Findings
 
 | Step | What happened | Expected instead |

@@ -73,9 +73,11 @@ transactions are to be kept durably on the client and resubmitted (phase 5).
   longer kept in the tree until then; that phase recovers them from git history.*
 
 Item 1 is built and tested (`mdaw-plugin-scan`, with plugins that crash and hang on purpose).
+Item 2 is built in the client (2026-11-16: `mdaw-client/src/plugin_guard.rs`; see the addendum on
+the crash marker below). Item 3 is built with the bridge's stall event
+(`MDAW_EVENT_AUDIO_STALLED`), which the client shows as a notice naming the loaded plugins.
 Item 4 is built and tested (2026-11-13: the client's outbox, `mdaw-client/src/outbox.rs`; see
-"What the client does" in `docs/protocol.md`). Items 2 and 3 are designed, not built. Item 5 is in
-the bridge.
+"What the client does" in `docs/protocol.md`). Item 5 is in the bridge.
 
 ## Addendum 2026-11-15: responsiveness and plugin windows (ABI 5)
 
@@ -123,6 +125,34 @@ client's tests to it"); it was removed in the next one, `82dbaa4`. The helper is
 tree: `git checkout 7521840 -- crates/mdaw-plugin`. As it stands there it depends on `mdaw-dsp`
 and `mdaw-engine` (also in that commit) and on the workspace dependency `rtrb`; its other
 dependencies are in its own `Cargo.toml`.
+
+## Addendum 2026-11-16: the crash marker (failure policy, item 2)
+
+Built in the Rust client (`mdaw-client/src/plugin_guard.rs`, used by `audio_tracktion.rs`); the
+bridge, its header and `mdaw-tracktion` are unchanged. Two text files in the engine's settings
+folder (`TracktionOptions::settings_dir`; for the client `<profile>/engine`), one plugin per line
+as `<format name><TAB><plugin id>`:
+
+- `plugins-starting`: the plugins being started. It is written, and forced to the disk, before
+  the engine is asked to add a plugin, and removed 5 s after that call returned with the client
+  still running, or when the client ends the normal way. A client that dies in between leaves it
+  behind.
+- `plugins-off`: the plugins switched off because an earlier run left them in
+  `plugins-starting`. On the next start the client moves them there, says which in a notice, and
+  never asks the engine to start them: their devices show as failed with that reason, and the
+  rest of the project plays.
+
+The marker goes by time, not by counted blocks as item 2 first said, because the bridge does not
+report when a plugin has processed its first blocks. Two limits follow:
+
+- a plugin that crashes later than 5 s after it was started, or hangs the audio and is killed by
+  hand after more than 5 s, is not caught;
+- a client that is killed for another reason within 5 s of starting plugins switches those
+  plugins off wrongly. The notice says which, and "Try again" brings each back.
+
+The list is per computer and not in the document: other participants still hear the plugin.
+"Try again" in the device tab switches a plugin on again; it is then started like any other,
+and marked as starting again.
 
 ## Consequences
 

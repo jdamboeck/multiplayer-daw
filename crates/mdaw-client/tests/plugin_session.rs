@@ -309,3 +309,61 @@ fn a_plugin_that_will_not_take_its_settings_is_reported_not_played_wrong() {
         "it plays on with its own settings, on the right: {left} {right}"
     );
 }
+
+/// A plugin that was being started when mdaw last ended is switched off on this computer: its
+/// device fails with that reason and a notice names it. "Try again" switches it on, and once it
+/// has run for a while nothing is left marked as starting.
+#[test]
+fn a_plugin_that_was_starting_when_mdaw_ended_is_switched_off() {
+    let _engine = support::tracktion();
+    clap();
+    let dir = scratch().join("engine-guard");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("plugins-starting"),
+        format!("CLAP\t{}\n", mdaw_test_plugin::ID),
+    )
+    .unwrap();
+    let mut options = TracktionOptions::new(&dir);
+    options.scan = vec![PluginFormat::Clap];
+    let audio = TracktionAudio::new(options).expect("the engine starts");
+    let mut session = Session::starter(audio);
+    let synth = test_synth(&mut session);
+    let track = session.project().ordered_tracks().next().unwrap().0;
+    assert!(session.add_plugin(track, &synth));
+    let device = plugin_device(&session, track).expect("a plugin device");
+
+    until(
+        &mut session,
+        "the plugin is switched off",
+        |s| matches!(s.device_status(track, device), DeviceStatus::Failed(reason) if reason.contains("switched off")),
+    );
+    println!("RESULT: {:?}", session.notices());
+    assert!(
+        session.notices().iter().any(|n| n.contains(mdaw_test_plugin::ID)),
+        "{:?}",
+        session.notices()
+    );
+    assert!(dir.join("plugins-off").exists());
+    assert!(!dir.join("plugins-starting").exists());
+    assert_eq!(session.track_sound(track), TrackSound::Failed);
+
+    session.restart_plugin(track, device);
+    until(&mut session, "the plugin runs", |s| {
+        s.plugin_running(track, device)
+    });
+    assert!(!dir.join("plugins-off").exists());
+    four_notes(&mut session, track);
+    let [left, right] = listen(&mut session, "switched-on");
+    println!("RESULT: left={left:.5} right={right:.5}");
+    assert!(left > 0.02 && right > 0.02, "the track sounds: {left} {right}");
+
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while Instant::now() < deadline {
+        session.frame();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!dir.join("plugins-starting").exists());
+    drop(session);
+}

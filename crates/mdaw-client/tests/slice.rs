@@ -481,6 +481,8 @@ fn edits_survive_a_crash_and_arrive_once() {
     let mut ann = Client::start(&server, "Ann", &ann_profile, &clap);
     let mut ben = Client::start(&server, "Ben", &base.path().join("ben"), &clap);
     let seq = build_song(&mut ann);
+    // Ann's synth starts with the song: from here the plugin guard's settle time runs.
+    let ann_started = Instant::now();
     ben.wait_seq(seq);
 
     // Offline: two edits, then a crash.
@@ -490,15 +492,20 @@ fn edits_survive_a_crash_and_arrive_once() {
     ann.cmd("set-note Keys k 0 pitch 59");
     let pending: u64 = ann.get("seq", "unconfirmed").parse().unwrap();
     assert_eq!(pending, 2, "5: two edits waiting");
+    // Past the plugin guard's 5 s settle time, so the crash does not switch the synth off.
+    std::thread::sleep(Duration::from_millis(6000).saturating_sub(ann_started.elapsed()));
     ann.crash();
 
     let server = serve(&data, &addr);
     let mut ann = Client::start(&server, "Ann", &ann_profile, &clap);
+    let ann_started = Instant::now();
     let after_restart = ann.seq();
     assert_eq!(after_restart, seq + 2, "5: the offline edits arrived once");
     ben.wait_seq(seq + 2);
 
     // Online: an edit, and a crash right after sending it.
+    // Past the plugin guard's 5 s settle time, so the crash does not switch the synth off.
+    std::thread::sleep(Duration::from_millis(6000).saturating_sub(ann_started.elapsed()));
     ann.cmd("add-notes Keys k 2.5:74");
     ann.crash();
     let mut ann = Client::start(&server, "Ann", &ann_profile, &clap);
