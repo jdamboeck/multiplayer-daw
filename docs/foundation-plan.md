@@ -288,6 +288,14 @@ One commit.
    `cargo test -p mdaw-tracktion --test engine`. **If anything fails, stop and report** (rule
    4): it would be a real difference between the two paths.
 
+   One known, accepted difference: in `builtin_instrument`, the assertion
+   `assert_eq!(state_calls, 3, ...)` after `set(world, id::SUB_ON, Some(1.0))` becomes
+   `assert_eq!(state_calls, 4, ...)`. Through `sync_project` the same change makes one more
+   engine call: the `engine.has` per device in the ordering step of `sync.rs`'s `devices`
+   (the state is still read once and written once). Change only the number, and make the
+   message say "is the device there, read the state, write it, is it there for the order".
+   Any other failure still means stop and report.
+
 2. `apply.rs`: change `Sync::device_predecessor` to take the track's content instead of a
    project:
 
