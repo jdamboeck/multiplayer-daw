@@ -333,6 +333,9 @@ pub struct TracktionAudio {
     /// Devices looked at as if their windows were open (for tests; see [`TracktionAudio::watch`]).
     watched: HashSet<DeviceId>,
     settings_dir: PathBuf,
+    /// The plugin guard was opened: only then is the crash marker this client's to clear. A
+    /// start with plugins off, or one whose guard failed to open, leaves the marker alone.
+    guarded: bool,
 }
 
 fn lock(shared: &Mutex<Shared>) -> MutexGuard<'_, Shared> {
@@ -544,6 +547,7 @@ impl TracktionAudio {
         } else {
             None
         };
+        let guarded = guard.is_some();
         let queue = Arc::new(Queue::new());
         let worker = Worker {
             engine: engine.clone(),
@@ -599,6 +603,7 @@ impl TracktionAudio {
             watched: HashSet::new(),
             params_asked: HashMap::new(),
             settings_dir: options.settings_dir.clone(),
+            guarded,
         })
     }
 
@@ -833,8 +838,10 @@ impl Drop for TracktionAudio {
             let _ = worker.join();
         }
         // Ending in the normal way is not a crash: plugins still in their first moments are
-        // not to blame.
-        PluginGuard::ended_normally(&self.settings_dir);
+        // not to blame. Only a client that opened the guard clears its marker.
+        if self.guarded {
+            PluginGuard::ended_normally(&self.settings_dir);
+        }
     }
 }
 

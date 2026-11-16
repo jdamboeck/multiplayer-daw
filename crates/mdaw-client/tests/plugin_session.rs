@@ -367,3 +367,38 @@ fn a_plugin_that_was_starting_when_mdaw_ended_is_switched_off() {
     assert!(!dir.join("plugins-starting").exists());
     drop(session);
 }
+
+/// A start with plugins off (the natural way back in after a crash) does not open the guard, so
+/// its normal end leaves the crash marker for the next start with plugins on.
+#[test]
+fn a_start_without_plugins_keeps_the_crash_marker() {
+    let _engine = support::tracktion();
+    clap();
+    let dir = scratch().join("engine-guard-no-plugins");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let marker = format!("CLAP\t{}\n", mdaw_test_plugin::ID);
+    std::fs::write(dir.join("plugins-starting"), &marker).unwrap();
+
+    let mut options = TracktionOptions::new(&dir);
+    options.enable_plugins = false;
+    let audio = TracktionAudio::new(options).expect("the engine starts without plugins");
+    drop(audio);
+    let left = std::fs::read_to_string(dir.join("plugins-starting")).unwrap_or_default();
+    assert!(
+        left.contains(mdaw_test_plugin::ID),
+        "plugins-starting after a start without plugins: {left:?}"
+    );
+    assert!(!dir.join("plugins-off").exists());
+
+    let mut options = TracktionOptions::new(&dir);
+    options.scan = vec![PluginFormat::Clap];
+    let audio = TracktionAudio::new(options).expect("the engine starts");
+    let mut session = Session::starter(audio);
+    until(&mut session, "the crash is noticed", |s| {
+        s.notices().iter().any(|n| n.contains(mdaw_test_plugin::ID))
+    });
+    println!("RESULT: {:?}", session.notices());
+    assert!(dir.join("plugins-off").exists());
+    drop(session);
+}
