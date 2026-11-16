@@ -1442,6 +1442,8 @@ impl Worker {
                 None => mdaw_tracktion::load_project(&engine, &view, &blobs),
             }
         };
+        // After a load that failed too, `synced` is `None`: the engine holds some unknown part
+        // of the project, so the next sync loads the whole project again.
         let problems = match result {
             Ok(problems) => problems,
             Err(e) => {
@@ -1450,15 +1452,30 @@ impl Worker {
                     "The audio engine is reloading the project ({}).",
                     e.message
                 ));
-                let blobs = self.resolver();
-                match mdaw_tracktion::load_project(&engine, &view, &blobs) {
+                let loaded = {
+                    let blobs = self.resolver();
+                    mdaw_tracktion::load_project(&engine, &view, &blobs)
+                };
+                match loaded {
                     Ok(problems) => problems,
                     Err(e) => {
                         self.notice(format!(
                             "The audio engine could not load the project: {}",
                             e.message
                         ));
-                        Vec::new()
+                        self.synced = None;
+                        let statuses = plugin_devices(&view)
+                            .map(|(_, d)| {
+                                (
+                                    d.id,
+                                    DeviceStatus::Failed(
+                                        "the audio engine could not load the project".into(),
+                                    ),
+                                )
+                            })
+                            .collect();
+                        lock(&self.shared).statuses = statuses;
+                        return;
                     }
                 }
             }
