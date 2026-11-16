@@ -1,9 +1,12 @@
 //! The engine's project, derived from the canonical model (ADR 0001).
 //!
-//! [`load_project`] clears the engine and builds everything from a project. [`apply_op`] carries
-//! one model op over without a rebuild. Both read the values to send from the model state
-//! *after* the op, so applying an op twice, or an op the model ignored, leaves the engine as the
-//! model is. The engine addresses everything by the model's own ids.
+//! [`load_project`] clears the engine and builds everything from a project;
+//! [`crate::sync_project`] brings it from one state of the project to another by their
+//! difference. Two small functions put in a single device: [`add_device`] a device the engine
+//! lacks (a plugin that was not installed, or failed, at the last load or sync), and
+//! [`restore_device_state`] a plugin's state once its blob has arrived. All of them read the
+//! values to send from the project they are given, so calling them again leaves the engine as
+//! the model is. The engine addresses everything by the model's own ids.
 //!
 //! What the engine cannot take does not fail the call: it is left out and reported as a
 //! [`Problem`]. Model data the engine has no use for (project name, track colour,
@@ -21,8 +24,8 @@ use crate::two_osc::{self as two_osc_map, Target};
 use crate::{Engine, EntityKind, Error, Note as EngineNote, ParamInfo, PluginInfo, Status};
 use mdaw_model::two_osc::Values as TwoOscValues;
 use mdaw_model::{
-    BlobHash, BuiltinKind, ClipId, ClipProp, Device, DeviceId, DeviceKind, MAX_MILLI_BPM, MAX_TICK,
-    MIN_MILLI_BPM, Note, NoteId, Op, PluginFormat, Project, ShellProp, TempoId, TrackContent, TrackId,
+    BlobHash, BuiltinKind, ClipId, Device, DeviceId, DeviceKind, MAX_MILLI_BPM, MAX_TICK, MIN_MILLI_BPM,
+    Note, NoteId, PluginFormat, Project, TempoId, TrackContent, TrackId,
 };
 use std::collections::BTreeMap;
 use std::fmt;
@@ -54,8 +57,14 @@ pub enum Problem {
         device: DeviceId,
         param: u32,
     },
-    /// A plugin's saved state was not restored: the blob is not at hand, or the plugin refused
-    /// it.
+    /// A plugin's saved state is not at hand yet (its blob has to be fetched). The device runs
+    /// with the settings it has.
+    StateMissing {
+        track: TrackId,
+        device: DeviceId,
+        blob: BlobHash,
+    },
+    /// A plugin refused its saved state.
     StateNotApplied {
         track: TrackId,
         device: DeviceId,
@@ -92,6 +101,9 @@ impl fmt::Display for Problem {
             ),
             Problem::ParamNotMapped { device, param, .. } => {
                 write!(f, "{device:?}: parameter {param} cannot be given to the engine")
+            }
+            Problem::StateMissing { device, blob, .. } => {
+                write!(f, "{device:?}: state {blob:?} is not at hand")
             }
             Problem::StateNotApplied {
                 device, blob, reason, ..
@@ -132,21 +144,56 @@ pub fn load_project(
     Ok(sync.problems)
 }
 
-/// Carries one model op over to the engine, incrementally.
-///
-/// `before` and `after` are the model states on either side of `mdaw_model::apply(op)` (equal
-/// if the model ignored the op). The values sent are read from `after`; `before` is needed only
-/// for where a tempo point was. `blobs` gives plugin states by hash, for `DeviceSetState` and for
-/// devices inside `DeviceAdd` / `TrackAdd`.
-pub fn apply_op(
+/// Puts a device of `project` that the engine lacks into it, behind its nearest left
+/// neighbour the engine has: a plugin that was not installed, or failed, when the project
+/// was last brought to the engine. Does nothing if the project has no such device or the
+/// engine has it already.
+pub fn add_device(
     engine: &Engine,
-    before: &Project,
-    op: &Op,
-    after: &Project,
+    project: &Project,
+    track: TrackId,
+    device: DeviceId,
     blobs: BlobResolver<'_>,
 ) -> Result<Vec<Problem>, Error> {
     let mut sync = Sync::new(engine, blobs);
-    sync.op(before, op, after)?;
+    if let Some(c) = content(project, track)
+        && let Some(found) = c.device(device)
+        && !engine.has(EntityKind::Device, raw_device(device))
+    {
+        let behind = sync.device_predecessor(c, device);
+        sync.put_device(track, found, behind)?;
+    }
+    Ok(sync.problems)
+}
+
+/// Gives a plugin device the state `project` holds for it (its blob has arrived), then its
+/// parameter values on top, as on a load. Does nothing for a built-in device or one the
+/// engine lacks.
+pub fn restore_device_state(
+    engine: &Engine,
+    project: &Project,
+    track: TrackId,
+    device: DeviceId,
+    blobs: BlobResolver<'_>,
+) -> Result<Vec<Problem>, Error> {
+    let mut sync = Sync::new(engine, blobs);
+    let Some(found) = content(project, track).and_then(|c| c.device(device)) else {
+        return Ok(sync.problems);
+    };
+    let DeviceKind::Plugin { state, .. } = &found.kind else {
+        // The model ignores state for built-in devices.
+        return Ok(sync.problems);
+    };
+    if !engine.has(EntityKind::Device, raw_device(device)) {
+        return Ok(sync.problems);
+    }
+    match state {
+        Some(blob) => sync.put_state(track, device, *blob),
+        // No saved state: the plugin as it starts.
+        None => engine.device_reset_state(raw_device(device))?,
+    }
+    // The parameter values go on top of the state, as when the project is loaded.
+    sync.put_params(track, found)?;
     Ok(sync.problems)
 }
 
@@ -191,15 +238,6 @@ pub(crate) fn ordered_tracks(project: &Project) -> Vec<(TrackId, &TrackContent)>
         }
     }
     out
-}
-
-/// The track to put `track` behind in the engine: its left neighbour in `project`, 0 if first.
-fn track_predecessor(project: &Project, track: TrackId) -> u64 {
-    let order = ordered_tracks(project);
-    match order.iter().position(|(id, _)| *id == track) {
-        Some(index) if index > 0 => raw_track(order[index - 1].0),
-        _ => 0,
-    }
 }
 
 /// The tempo map as the model compiles it: points before 0 count as 0, and of points at one
@@ -252,147 +290,6 @@ impl<'a> Sync<'a> {
         }
     }
 
-    pub(crate) fn op(&mut self, before: &Project, op: &Op, after: &Project) -> Result<(), Error> {
-        let engine = self.engine;
-        match op {
-            // Project scope.
-            Op::ProjectSetName { .. } => {}
-            Op::MasterSetGain { .. } => engine.master_set_gain(after.master_gain)?,
-            Op::TempoPut { id, .. } | Op::TempoRemove { id } => self.tempo_changed(before, *id, after)?,
-            Op::TrackAdd { id, .. } => {
-                if after.track(*id).is_some() {
-                    self.put_track(after, *id, track_predecessor(after, *id))?;
-                }
-            }
-            Op::TrackMove { id, .. } => {
-                if after.track(*id).is_some() {
-                    engine.track_move(raw_track(*id), track_predecessor(after, *id))?;
-                }
-            }
-            Op::TrackSetShell { id, prop } => {
-                // Colour: the engine has no use for it.
-                if let (ShellProp::Name(_), Some(track)) = (prop, after.track(*id)) {
-                    engine.track_set_name(raw_track(*id), &track.shell.name)?;
-                }
-            }
-            Op::TrackRemove { id } => {
-                if after.track(*id).is_none() {
-                    engine.track_remove(raw_track(*id))?;
-                }
-            }
-
-            // Track content.
-            Op::TrackSetMix { track, .. } => {
-                if let Some(c) = content(after, *track) {
-                    engine.track_set_mix(raw_track(*track), c.gain, c.pan, c.mute)?;
-                }
-            }
-            Op::ClipAdd { track, id, .. } => {
-                if let Some(clip) = content(after, *track).and_then(|c| c.clips.get(id)) {
-                    self.put_clip(*track, *id, clip)?;
-                }
-            }
-            Op::ClipRemove { track, id } => {
-                if content(after, *track).is_none_or(|c| !c.clips.contains_key(id)) {
-                    engine.clip_remove(raw_clip(*id))?;
-                }
-            }
-            Op::ClipSet { track, id, prop } => {
-                let Some(clip) = content(after, *track).and_then(|c| c.clips.get(id)) else {
-                    return Ok(());
-                };
-                match prop {
-                    ClipProp::Start(_) | ClipProp::Length(_) => {
-                        let was_in_engine = content(before, *track)
-                            .and_then(|c| c.clips.get(id))
-                            .is_some_and(|c| c.length.0 >= 1);
-                        if was_in_engine && clip.length.0 >= 1 {
-                            engine.clip_set_range(raw_clip(*id), clip.start.0, clip.length.0)?;
-                        } else {
-                            // Into or out of the engine's range: add (with its notes) or remove.
-                            self.put_clip(*track, *id, clip)?;
-                        }
-                    }
-                    ClipProp::Name(_) => engine.clip_set_name(raw_clip(*id), &clip.name)?,
-                }
-            }
-            Op::NoteAdd { track, clip, id, .. } | Op::NoteSet { track, clip, id, .. } => {
-                let found = content(after, *track).and_then(|c| c.clips.get(clip));
-                if let Some(note) = found.filter(|c| c.length.0 >= 1).and_then(|c| c.notes.get(id)) {
-                    self.put_notes(*track, *clip, [(*id, note)])?;
-                }
-            }
-            Op::NoteRemove { track, clip, id } => {
-                let still_there = content(after, *track)
-                    .and_then(|c| c.clips.get(clip))
-                    .is_some_and(|c| c.notes.contains_key(id));
-                if !still_there {
-                    engine.notes_remove(raw_clip(*clip), &[raw_note(*id)])?;
-                }
-            }
-            Op::DeviceAdd { track, device, .. } => {
-                if let Some(device) = content(after, *track).and_then(|c| c.device(device.id)) {
-                    let behind = self.device_predecessor(after, *track, device.id);
-                    self.put_device(*track, device, behind)?;
-                }
-            }
-            Op::DeviceRemove { track, id } => {
-                if content(after, *track).is_none_or(|c| c.device(*id).is_none()) {
-                    engine.device_remove(raw_device(*id))?;
-                }
-            }
-            Op::DeviceMove { track, id, .. } => {
-                if content(after, *track).is_some_and(|c| c.device(*id).is_some()) {
-                    let behind = self.device_predecessor(after, *track, *id);
-                    engine.device_move(raw_device(*id), behind)?;
-                }
-            }
-            Op::DeviceSetParam { track, id, param, .. } => {
-                let Some(device) = content(after, *track).and_then(|c| c.device(*id)) else {
-                    return Ok(());
-                };
-                match &device.kind {
-                    DeviceKind::Builtin { .. } => {
-                        if engine.has(EntityKind::Device, raw_device(*id)) {
-                            self.put_builtin_changes(*track, device, [*param])?;
-                        }
-                    }
-                    DeviceKind::Plugin { .. } => {
-                        if engine.has(EntityKind::Device, raw_device(*id)) {
-                            let params = engine.device_params(raw_device(*id))?;
-                            self.put_param(*track, *id, &params, *param, device.params.get(param).copied())?;
-                        }
-                    }
-                }
-            }
-            Op::DeviceSetBypass { track, id, .. } => {
-                if let Some(device) = content(after, *track).and_then(|c| c.device(*id)) {
-                    engine.device_set_bypass(raw_device(*id), device.bypass)?;
-                }
-            }
-            Op::DeviceSetState { track, id, .. } => {
-                let Some(device) = content(after, *track).and_then(|c| c.device(*id)) else {
-                    return Ok(());
-                };
-                let DeviceKind::Plugin { state, .. } = &device.kind else {
-                    // The model ignores state for built-in devices.
-                    return Ok(());
-                };
-                if !engine.has(EntityKind::Device, raw_device(*id)) {
-                    return Ok(());
-                }
-                match state {
-                    Some(blob) => self.put_state(*track, *id, *blob),
-                    // No saved state: the plugin as it starts.
-                    None => engine.device_reset_state(raw_device(*id))?,
-                }
-                // The parameter values go on top of the state, as when the project is loaded.
-                self.put_params(*track, device)?;
-            }
-        }
-        Ok(())
-    }
-
     // ---- tempo
 
     pub(crate) fn put_tempo(&mut self, id: TempoId, tick: i64, milli_bpm: u32) -> Result<(), Error> {
@@ -405,26 +302,6 @@ impl<'a> Sync<'a> {
             self.problems.push(Problem::TempoClamped { id, milli_bpm, used });
         }
         self.engine.tempo_put(raw_tempo(id), tick, used)
-    }
-
-    /// A tempo point was put or removed. The engine holds the winner of each tick; the ticks
-    /// that can have changed are where the point was and where it is now.
-    fn tempo_changed(&mut self, before: &Project, id: TempoId, after: &Project) -> Result<(), Error> {
-        let winners = effective_tempo(after);
-        let now = after.tempo.get(&id).map(|p| tempo_tick(p.tick.0));
-        let was = before.tempo.get(&id).map(|p| tempo_tick(p.tick.0));
-        let wins = now.is_some_and(|tick| winners.get(&tick).is_some_and(|(w, _)| *w == id));
-        if !wins {
-            self.engine.tempo_remove(raw_tempo(id))?;
-        }
-        let mut ticks: Vec<i64> = was.into_iter().chain(now).collect();
-        ticks.dedup();
-        for tick in ticks {
-            if let Some(&(winner, milli_bpm)) = winners.get(&tick) {
-                self.put_tempo(winner, tick, milli_bpm)?;
-            }
-        }
-        Ok(())
     }
 
     // ---- tracks, clips, notes
@@ -511,14 +388,12 @@ impl<'a> Sync<'a> {
 
     /// The device in the engine that `device` goes behind: the nearest one to its left in the
     /// model that the engine has (a skipped plugin is not there), 0 if none.
-    pub(crate) fn device_predecessor(&self, project: &Project, track: TrackId, device: DeviceId) -> u64 {
-        let Some(c) = content(project, track) else {
+    pub(crate) fn device_predecessor(&self, content: &TrackContent, device: DeviceId) -> u64 {
+        let Some(index) = content.devices.iter().position(|d| d.id == device) else {
             return 0;
         };
-        let Some(index) = c.devices.iter().position(|d| d.id == device) else {
-            return 0;
-        };
-        c.devices
+        content
+            .devices
             .iter()
             .take(index)
             .rev()
@@ -749,9 +624,7 @@ impl<'a> Sync<'a> {
             reason,
         };
         match (self.blobs)(&blob) {
-            None => self
-                .problems
-                .push(not_applied("the blob is not at hand".to_string())),
+            None => self.problems.push(Problem::StateMissing { track, device, blob }),
             Some(bytes) => {
                 if let Err(e) = self.engine.device_set_state(raw_device(device), &bytes) {
                     self.problems.push(not_applied(e.message));

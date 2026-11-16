@@ -326,8 +326,9 @@ and creating the engine twice in one process.
 
 From Rust: `crates/mdaw-tracktion-sys` (hand-written declarations; its build script runs the
 CMake build in `target/native`, or in `MDAW_NATIVE_BUILD_DIR`) and `crates/mdaw-tracktion`
-(safe `Engine`, plus `load_project` and `apply_op`, which bring a canonical `mdaw_model`
-project into the engine whole or one operation at a time).
+(safe `Engine`, plus `load_project` and `sync_project`, which bring a canonical `mdaw_model`
+project into the engine whole or by the difference between two states of it, and
+`add_device` and `restore_device_state`, which put in a single device or its state).
 
 ```sh
 cargo test -p mdaw-tracktion-sys -p mdaw-tracktion

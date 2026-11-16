@@ -47,7 +47,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use mdaw_model::{
-    BlobHash, BuiltinKind, DeviceId, DeviceKind, Op, PluginFormat, Project, Tick, TickRange, TrackContent,
+    BlobHash, BuiltinKind, DeviceId, DeviceKind, PluginFormat, Project, Tick, TickRange, TrackContent,
     TrackId,
 };
 use mdaw_tracktion::{Config, Engine, EngineState, EntityKind, Event, Problem, Status};
@@ -1487,9 +1487,7 @@ impl Worker {
         let mut wanted = Vec::new();
         for problem in problems {
             match problem {
-                Problem::StateNotApplied { blob, reason, .. } if reason.contains("not at hand") => {
-                    wanted.push(*blob)
-                }
+                Problem::StateMissing { blob, .. } => wanted.push(*blob),
                 Problem::StateNotApplied { reason, .. } => {
                     self.notice(format!("A plugin did not take its settings: {reason}"))
                 }
@@ -1580,23 +1578,8 @@ impl Worker {
         let Some(project) = &self.synced else {
             return Vec::new();
         };
-        let Some(d) = project
-            .track(track)
-            .and_then(|t| t.content.device(device))
-            .cloned()
-        else {
-            return Vec::new();
-        };
-        if self.engine.has(EntityKind::Device, raw_device(device)) {
-            return Vec::new();
-        }
-        let op = Op::DeviceAdd {
-            track,
-            device: d,
-            after: None,
-        };
         let blobs = self.resolver();
-        match mdaw_tracktion::apply_op(&self.engine, project, &op, project, &blobs) {
+        match mdaw_tracktion::add_device(&self.engine, project, track, device, &blobs) {
             Ok(problems) => problems,
             Err(e) => {
                 self.notice(format!("The plugin could not be started: {}", e.message));
@@ -1713,12 +1696,7 @@ impl Worker {
         let blobs = self.resolver();
         let mut problems = Vec::new();
         for &(track, id) in &waiting {
-            let op = Op::DeviceSetState {
-                track,
-                id,
-                state: Some(hash),
-            };
-            match mdaw_tracktion::apply_op(&self.engine, project, &op, project, &blobs) {
+            match mdaw_tracktion::restore_device_state(&self.engine, project, track, id, &blobs) {
                 Ok(found) => problems.extend(found),
                 Err(e) => self.notice(format!("A plugin did not take its settings: {}", e.message)),
             }

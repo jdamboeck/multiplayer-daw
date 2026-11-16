@@ -3,8 +3,10 @@
 //!
 //! The engine holds a project *derived* from the application's canonical `mdaw_model::Project`
 //! (docs/decisions/0001-canonical-project-state.md): [`apply::load_project`] builds it from
-//! scratch, [`apply::apply_op`] carries one model op over incrementally, and
-//! [`sync::sync_project`] brings it from one state of the project to another by their difference.
+//! scratch, and [`sync::sync_project`] brings it from one state of the project to another by their
+//! difference. Two small functions put a single device in: [`apply::add_device`] one the engine
+//! lacks (a plugin that was missing or failed before), and [`apply::restore_device_state`] a
+//! plugin's state once its blob has arrived.
 //!
 //! The semantics of each call are those of `native/tracktion-bridge/include/mdaw_engine.h`.
 //! Ids are the application's own 64-bit ids (0 means "none"); time is ticks at 960 per quarter.
@@ -21,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub use apply::{BlobResolver, Problem, apply_op, find_plugin, load_project};
+pub use apply::{BlobResolver, Problem, add_device, find_plugin, load_project, restore_device_state};
 pub use sync::sync_project;
 
 /// Ticks per quarter note, in the engine as in the model.

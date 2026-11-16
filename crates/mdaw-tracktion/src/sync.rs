@@ -235,10 +235,9 @@ fn devices(sync: &mut Sync<'_>, track: TrackId, old: &TrackContent, new: &TrackC
         }
     }
     // New ones, in order, each behind its nearest left neighbour the engine has.
-    let project_new = single_track(track, new);
     for device in &new.devices {
         if find(old, device.id).is_none() || renew.contains(&device.id) {
-            let behind = sync.device_predecessor(&project_new, track, device.id);
+            let behind = sync.device_predecessor(new, device.id);
             sync.put_device(track, device, behind)?;
         }
     }
@@ -330,21 +329,4 @@ fn devices(sync: &mut Sync<'_>, track: TrackId, old: &TrackContent, new: &TrackC
     put_in_order(&mut have, &want, |id, behind| {
         engine.device_move(raw_device(id), behind.map_or(0, raw_device))
     })
-}
-
-/// A project of one track, for the helpers that look a track's devices up in a project.
-fn single_track(track: TrackId, content: &TrackContent) -> Project {
-    let mut project = Project::default();
-    project.tracks.insert(
-        track,
-        Arc::new(mdaw_model::Track {
-            shell: mdaw_model::TrackShell {
-                name: String::new(),
-                color: 0,
-            },
-            content: Arc::new(content.clone()),
-        }),
-    );
-    project.track_order.push_back(track);
-    project
 }

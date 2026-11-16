@@ -10,9 +10,7 @@ use mdaw_model::{
     Note, NoteId, NoteProp, Op, PluginFormat, Project, TempoId, TempoPoint, Tick, TrackContent, TrackId,
     TrackShell, two_osc,
 };
-use mdaw_tracktion::{
-    Config, Engine, EntityKind, Event, Problem, Status, apply_op, load_project, sync_project,
-};
+use mdaw_tracktion::{Config, Engine, EntityKind, Event, Problem, Status, load_project, sync_project};
 use mdaw_tracktion_sys as sys;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -210,17 +208,12 @@ struct World {
 }
 
 impl World {
-    /// Applies an op to the model, then to the engine.
+    /// Applies an op to the model, then brings the engine to the new model by difference.
     fn op(&mut self, op: Op) -> Vec<Problem> {
         let before = self.model.clone();
         mdaw_model::apply(&mut self.model, &op);
-        self.engine_op(&before, &op)
-    }
-
-    /// Applies an op to the engine only (to repeat one), with `before` as the state before it.
-    fn engine_op(&self, before: &Project, op: &Op) -> Vec<Problem> {
         let blobs = |h: &BlobHash| self.blobs.get(h).cloned();
-        apply_op(&self.engine, before, op, &self.model, &blobs).unwrap_or_else(|e| panic!("{op:?}: {e}"))
+        sync_project(&self.engine, &before, &self.model, &blobs).unwrap_or_else(|e| panic!("{op:?}: {e}"))
     }
 
     fn load(&self) -> Vec<Problem> {
@@ -354,7 +347,6 @@ fn the_engine_follows_the_model() {
     incremental_ops(&mut world, &ids);
     other_ops(&mut world, &ids, &mut ids_gen);
     incremental_equals_reload(&mut world, &ids, &mut ids_gen);
-    repeated_ops_are_idempotent(&mut world, &ids, &mut ids_gen);
     params_and_state(&world, &ids);
     unknown_param_reported(&mut world, &ids);
     no_events_for_own_changes(&world);
@@ -698,59 +690,6 @@ fn incremental_equals_reload(world: &mut World, ids: &Ids, ids_gen: &mut IdGen) 
     let reloaded = render(&world.engine, "reloaded", 16 * Q);
     assert!(problems.is_empty(), "reload: no problems: {problems:?}");
     assert_same_envelope(&incremental, &reloaded, "incremental vs reloaded");
-}
-
-/// Step 4: the same op twice in the engine has the effect of once.
-fn repeated_ops_are_idempotent(world: &mut World, ids: &Ids, ids_gen: &mut IdGen) {
-    let reference = render(&world.engine, "before_repeat", 16 * Q);
-    let op = Op::NoteSet {
-        track: ids.track,
-        clip: ids.clip,
-        id: ids.late,
-        prop: NoteProp::Dur(Tick(Q)),
-    };
-    let model = world.model.clone();
-    world.engine_op(&model, &op);
-    world.engine_op(&model, &op);
-    let clip_op = Op::ClipSet {
-        track: ids.track,
-        id: ids.clip,
-        prop: ClipProp::Start(Tick(4 * Q)),
-    };
-    world.engine_op(&model, &clip_op);
-    world.engine_op(&model, &clip_op);
-    let repeated = render(&world.engine, "repeated", 16 * Q);
-    assert_same_envelope(&reference, &repeated, "repeated ops");
-
-    // A note added twice is there once: removing it once leaves silence where it was.
-    // Clip beat 4 is song beat 8, 2 s at 240 bpm; the nearest notes end by 1.75 s and start at 2.5 s.
-    let id = ids_gen.note();
-    let add = Op::NoteAdd {
-        track: ids.track,
-        clip: ids.clip,
-        id,
-        note: Note {
-            start: Tick(4 * Q),
-            dur: Tick(Q / 4),
-            pitch: 70,
-            vel: 100,
-        },
-    };
-    let before = world.model.clone();
-    world.op(add.clone());
-    world.engine_op(&before, &add);
-    let wav = render(&world.engine, "added_twice", 16 * Q);
-    assert!(wav.peak_between(2.0, 2.3) > SOUND, "added twice: the note sounds");
-    world.op(Op::NoteRemove {
-        track: ids.track,
-        clip: ids.clip,
-        id,
-    });
-    let wav = render(&world.engine, "removed_once", 16 * Q);
-    assert!(
-        wav.peak_between(2.0, 2.45) < SILENT,
-        "added twice, removed once: gone"
-    );
 }
 
 /// Step 5: parameters and state of the built-in synth, through the safe API.
@@ -1369,8 +1308,8 @@ fn builtin_instrument(world: &mut World, ids_gen: &mut IdGen) {
         "SUB Off: low end gone again ({low_on} -> {low_off_again})"
     );
     assert_eq!(
-        state_calls, 3,
-        "a setting in 4osc's state: is the device there, read the state, write it"
+        state_calls, 4,
+        "a setting in 4osc's state: is the device there, read the state, write it, is it there for the order"
     );
 
     // (3) OSC 2 Wave None against Saw: one oscillator fewer, less energy.
@@ -1445,8 +1384,8 @@ fn builtin_instrument(world: &mut World, ids_gen: &mut IdGen) {
             set(world, p.id, value);
             assert_eq!(
                 world.engine.call_count() - calls,
-                2,
-                "{}: is the device there, set one parameter",
+                3,
+                "{}: is the device there, set one parameter, is it there for the order",
                 p.name
             );
             let expected = value.unwrap_or(p.default);
