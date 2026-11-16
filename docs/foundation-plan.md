@@ -1122,7 +1122,17 @@ test synth's parameters through the document. It starts at the comment line
 
 and ends with the `assert!` whose message begins `"clap: back to the default level`. Delete
 both and everything between. That part ended by putting both parameters back to their
-defaults, so the code after it sees the same engine as before. Everything before it stays (the
+defaults, so the code after it sees the same engine as before.
+
+Also delete the block at the end of `plugins` that begins with the comment
+
+```rust
+    // A stored parameter value stays on top of a reset, as on a load.
+```
+
+and ends with the `assert!` whose message begins `"clap: model value kept over the reset`.
+It uses the `set` closure of the part above and checks that a plugin's parameter values go on
+top of its state, which this task removes. Everything before it stays (the
 parameter list, `device_param_text`).
 
 After the deletion the compiler may report unused variables (`balance`, `base_right`, `raw`,
