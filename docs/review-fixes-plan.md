@@ -11,7 +11,8 @@ numbers.
 
 ## Rules for whoever carries this out
 
-1. **One task at a time, in order.** T2 uses the helper T1 adds.
+1. **One task at a time, in order.** T2 uses the helper T1 adds. T7 and T8 were added after
+   T1 to T6 were done.
 2. **Stay inside the task.** Each task has a "Files" list and a "Do not" list. If the work seems
    to need a file that is not listed, stop and report instead of widening the task.
 3. **Gates after every task**, all green before committing:
@@ -345,12 +346,113 @@ migrated with no usable copy of the old one. Nothing tests the backup or a migra
 
 ---
 
+## T7. A first edit that breaks the outbox does not break it for the session
+
+**Why.** T6 made `Outbox::keep` clear `broken` after it empties the file. But `keep` empties the
+file only when `pending.is_empty() && !self.ids.is_empty()`. If the first append of a session is
+the one that sets `broken` (the record was cut short and cutting it off failed too), that append
+never pushed an id, so `ids` stays empty, the file is never emptied, and every later edit of the
+session is refused locally ("edits are no longer saved"). The edits still reach the server; only
+the copy on this computer is missing.
+
+**Outcome.** Once nothing is pending, `keep` empties the file whenever it holds anything that
+could matter: confirmed edits, or the remains of a broken append.
+
+**Files**
+
+- `crates/mdaw-client/src/outbox.rs`
+
+**Steps**
+
+1. **Test first.** Add `a_first_append_that_breaks_the_file_is_cleared`, built like
+   `appending_works_again_once_the_file_is_emptied` but without the first successful append:
+   set `broken` through `append_record` with a stuck `CutShort` over a clone of the outbox's
+   file while `ids` is empty, call `keep(&[])`, then assert that an `append` succeeds and that a
+   reopened outbox reads back only that edit. Keep the failing output.
+2. In `keep`, change the condition to `pending.is_empty() && (!self.ids.is_empty() || self.broken)`.
+   Emptying the file is safe whenever nothing is pending, and it removes the torn bytes too.
+
+**Do not** change `append_record`, `append` or the record format.
+
+**Done when** the gates pass and the new test passes, having failed before step 2.
+
+---
+
+## T8. One client per profile
+
+**Why.** Nothing stops two mdaw processes from using the same profile (starting mdaw twice is
+enough). They then share the file of unsent edits: when one client's edits are all confirmed,
+its `keep` empties the file and so drops the other's unconfirmed edits, which are lost if that
+client crashes before they arrive. They also share the plugin guard's `plugins-starting`, so one
+starting can switch off a plugin the other is still starting, and the engine's settings folder.
+
+Note the order in both programs: `crates/mdaw-client/src/main.rs` and
+`crates/mdaw-client/src/bin/mdaw-slice.rs` start the audio engine (whose settings and guard files
+live in `<profile>/engine`) before they call `profile::open`, and a local session in `main.rs`
+never calls `profile::open`. So the lock is its own function, taken first.
+
+**Outcome.** The first process to use a profile holds an exclusive lock on `<profile>/lock`
+until it ends; a second one is refused with a clear message. The operating system releases the
+lock when the process ends in any way, `kill -9` included, so a crash leaves no stale lock.
+
+**Files**
+
+- `crates/mdaw-client/src/profile.rs`
+- `crates/mdaw-client/src/main.rs`
+- `crates/mdaw-client/src/bin/mdaw-slice.rs`
+- `crates/mdaw-client/tests/slice.rs` (one new test)
+
+**Steps**
+
+1. In `profile.rs`, add:
+
+   ```rust
+   /// Held for as long as this process uses the profile: other processes cannot lock it
+   /// meanwhile. The operating system lets go when the process ends, however it ends.
+   pub struct ProfileLock {
+       _file: std::fs::File,
+   }
+
+   /// Locks the profile in `dir` (created if missing) for this process. Fails with a message
+   /// for the user when another process holds it.
+   pub fn lock(dir: &Path) -> Result<ProfileLock>
+   ```
+
+   It creates `dir`, opens `dir.join("lock")` (create, read and write, no truncation), and calls
+   `File::try_lock()` (standard library, Rust 1.89 and later). On
+   `Err(TryLockError::WouldBlock)` return an error saying that mdaw is already running with this
+   profile, naming the folder, and that `--profile <dir>` chooses another. On any other error
+   (for example a file system without locks) print a warning to stderr and return a lock that
+   holds the file without the lock, so mdaw still starts. Never delete the lock file.
+
+2. `main.rs`: right after `profile_dir` is worked out and before the audio engine is started,
+   take `profile::lock` on it when there is one, keep the returned lock in a variable that lives
+   until `main` returns, and on an error print `mdaw: {err:#}` and return `ExitCode::FAILURE`.
+
+3. `mdaw-slice.rs`: the same, before `TracktionAudio::new`, on `args.profile`, with the
+   `mdaw-slice:` prefix.
+
+4. Unit tests in `profile.rs`: `a_locked_profile_is_refused` (lock a temporary folder, a second
+   `lock` on it fails and its message says "already running") and
+   `the_lock_is_free_again_when_dropped` (drop the first lock, then a second succeeds).
+
+5. In `slice.rs`, add `a_second_client_on_one_profile_is_refused`: start Ann with the file's
+   `Client::start`; then spawn a second `mdaw-slice` on the same profile with `Command` directly
+   (stderr piped, not null). Assert that it exits within 30 s with a failure status and that its
+   stderr says "already running". Then quit Ann.
+
+**Do not** change `Session`, the outbox or the plugin guard.
+
+**Done when** the gates pass, including every existing slice test (each restart there happens
+after the old process has ended).
+
+---
+
 ## Not fixed here
 
 | Finding | Why not |
 |---|---|
 | `append` says "could not be saved" when the hand-off to the sync thread fails after the record was written | Not a defect: with the sync thread gone, the edit is not on the disk for sure, so the notice is right. |
-| Two clients on one profile share `plugins-starting` | True, but a profile has no lock at all: two clients on one profile already share and break the outbox. That needs a profile lock, a task of its own. |
 | On the failed-reload path (foundation T2b), switched-off devices show no "switched off" status | Cosmetic, on a path that cannot be reached on demand. |
 | `Held` (foundation T9) after an engine reload while a key is held: a second source on that pitch is silent until all sources let go | Needs an engine reload during a held note; negligible. |
 | No test for the sync thread's error path or the T2b failure path | Both need fault injection the code does not have. |

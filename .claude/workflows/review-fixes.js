@@ -23,10 +23,12 @@ const TASKS = {
   T4: { heading: '## T4. Parameter values come back from the store bit for bit' },
   T5: { heading: '## T5. A migration backup is whole or absent' },
   T6: { heading: '## T6. Small outbox repairs' },
+  T7: { heading: '## T7. A first edit that breaks the outbox does not break it for the session' },
+  T8: { heading: '## T8. One client per profile' },
 }
 
 const STAGES = {
-  all: { tasks: ['T1', 'T2', 'T3', 'T4', 'T5', 'T6'] },
+  all: { tasks: ['T1', 'T2', 'T3', 'T4', 'T5', 'T6', 'T7', 'T8'] },
 }
 
 const input = args || {}
