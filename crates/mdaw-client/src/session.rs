@@ -21,7 +21,7 @@ use crate::audio::{Audio, DeviceStatus, EditorState, ParamEntry, PluginEntry, Tr
 use crate::clock;
 use crate::link::{Link, LinkEvent, Upload, Waker, Who};
 use crate::live::Live;
-use crate::outbox::{self, Outbox};
+use crate::outbox::Outbox;
 use crate::record::{Take, take_ops};
 use crate::theme;
 use crate::ui::piano_roll::PREVIEW_KEY;
@@ -868,12 +868,7 @@ impl Session {
     pub fn next_frame_in(&self) -> Option<Duration> {
         let plugins = self.audio.next_frame_in();
         let others = self.others_next_frame_in();
-        // Edits written to the outbox go to the disk on a later frame.
-        let outbox = self
-            .outbox
-            .as_ref()
-            .and_then(|o| o.unsynced().then_some(outbox::SYNC_EVERY));
-        [plugins, others, outbox].into_iter().flatten().min()
+        [plugins, others].into_iter().flatten().min()
     }
 
     fn others_next_frame_in(&self) -> Option<Duration> {

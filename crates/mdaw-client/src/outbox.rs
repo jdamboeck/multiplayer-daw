@@ -6,21 +6,23 @@
 //!
 //! - `pending`: the transactions, oldest first, each a record of a `u32` little-endian length,
 //!   four check bytes (the start of the BLAKE3 hash of the payload) and the postcard [`Txn`].
-//!   A transaction is appended and flushed to the operating system before it is sent. The file
-//!   is forced to the disk (`sync_data`) at most [`SYNC_EVERY`] later, not on every edit: an
-//!   edit is never lost to a crash of the client, while a power cut may take the last moments.
-//! - `blobs/<hash>`: the bytes of blobs a pending transaction names, written (and forced to the
-//!   disk) before the transaction, so they can be uploaded again after a restart.
+//!   A transaction is written to the operating system before it is sent, so a crash of the
+//!   client never loses it. A thread of the outbox forces it to the disk (`sync_data`) within
+//!   about 50 ms; the UI thread never waits for the disk, and a power cut may take the last
+//!   moments.
+//! - `blobs/<hash>`: the bytes of blobs a pending transaction names, written in place before the
+//!   transaction and forced to the disk by the same thread, so they can be uploaded again after
+//!   a restart. A blob is checked by its hash when it is read; one cut short is removed.
 //! - `format`: the protocol version (`PROTO_VERSION`) the transactions are encoded in. An
 //!   outbox that holds transactions of another version (or of a client from before this file)
 //!   is refused, not misread: their ops would decode as something else, or not at all.
 //!
-//! Confirmed transactions are dropped by writing the file anew (to the side, forced to disk,
-//! then renamed over the old one), at most every [`COMPACT_EVERY`], or at once when nothing is
+//! Confirmed transactions are dropped by emptying the file, with the blobs, once nothing is
 //! pending any more. Until then a confirmed transaction stays in the file; sent again after a
-//! restart, the server answers it from its receipt and applies nothing. A crash at any point
-//! leaves either the old file or the new one, never a transaction lost; a record cut short by a
-//! crash is the last one, which was not sent yet, and is dropped on the next start.
+//! restart, the server answers it from its receipt and applies nothing. That is also why emptying
+//! needs no sync: a power cut can bring back only confirmed transactions. A record cut short by a
+//! crash is the last one, which was not sent yet, and is dropped on the next start; a write that
+//! failed halfway is taken back at once, so the next record starts where a record may start.
 
 use anyhow::{Context, Result, bail};
 use mdaw_model::{BlobHash, Op};
@@ -28,15 +30,16 @@ use mdaw_net::JoinInfo;
 use mdaw_proto::{PROTO_VERSION, Txn, TxnId, blob_hash};
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
-/// Appended transactions reach the disk at most this long after they were written.
-pub const SYNC_EVERY: Duration = Duration::from_millis(250);
-/// Confirmed transactions are dropped from the file at most this often.
-pub const COMPACT_EVERY: Duration = Duration::from_secs(1);
+/// The sync thread rests this long after a round of syncs, so that during a long drag the file
+/// is forced to the disk at most twenty times a second.
+const SYNC_GAP: Duration = Duration::from_millis(50);
 
 const PENDING: &str = "pending";
 const BLOBS: &str = "blobs";
@@ -47,10 +50,21 @@ pub struct Outbox {
     file: File,
     /// The transactions in the file, in order.
     ids: Vec<TxnId>,
-    /// Written since the last `sync_data`.
-    unsynced: bool,
-    synced_at: Instant,
-    compacted_at: Instant,
+    /// A write failed halfway and could not be taken back: appending more would be unreadable.
+    broken: bool,
+    /// To the sync thread; `None` only while opening and after dropping.
+    disk: Option<Sender<Disk>>,
+    thread: Option<JoinHandle<()>>,
+    /// What the sync thread could not do, for [`Outbox::keep`] to report.
+    failed: Arc<Mutex<Option<String>>>,
+}
+
+/// What the sync thread is asked to do, in order.
+enum Disk {
+    /// Force this file's data to the disk (a handle to `pending`, or a blob just written).
+    Sync(File),
+    /// Answer when everything asked before this is done.
+    Flush(Sender<()>),
 }
 
 /// What an earlier run left in the outbox.
@@ -83,10 +97,14 @@ impl Outbox {
         let (txns, whole) = parse(&bytes);
         let mut blobs = HashMap::new();
         for hash in txns.iter().flat_map(|t| t.ops.iter().flat_map(Op::blobs)) {
-            if let Ok(bytes) = std::fs::read(blob_dir.join(hash.to_string()))
-                && blob_hash(&bytes) == hash
-            {
-                blobs.insert(hash, Arc::from(bytes));
+            let path = blob_dir.join(hash.to_string());
+            if let Ok(bytes) = std::fs::read(&path) {
+                if blob_hash(&bytes) == hash {
+                    blobs.insert(hash, Arc::from(bytes));
+                } else {
+                    // Cut short while it was written: `put_blob` would keep it as it is.
+                    let _ = std::fs::remove_file(&path);
+                }
             }
         }
         let file = OpenOptions::new()
@@ -99,9 +117,10 @@ impl Outbox {
             dir: dir.to_path_buf(),
             file,
             ids: txns.iter().map(|t| t.id).collect(),
-            unsynced: false,
-            synced_at: Instant::now(),
-            compacted_at: Instant::now(),
+            broken: false,
+            disk: None,
+            thread: None,
+            failed: Arc::default(),
         };
         if whole != bytes.len() {
             // A record cut short: appending after it would make everything after unreadable.
@@ -109,6 +128,14 @@ impl Outbox {
                 .rewrite(&txns)
                 .with_context(|| format!("repairing {}", path.display()))?;
         }
+        let (disk, jobs) = std::sync::mpsc::channel();
+        let failed = Arc::clone(&outbox.failed);
+        let thread = std::thread::Builder::new()
+            .name("mdaw-outbox-sync".into())
+            .spawn(move || sync_thread(&jobs, &failed))
+            .context("starting the thread that saves edits")?;
+        outbox.disk = Some(disk);
+        outbox.thread = Some(thread);
         Ok((outbox, Saved { txns, blobs }))
     }
 
@@ -125,60 +152,60 @@ impl Outbox {
     /// longer loses it; call before sending it.
     pub fn append(&mut self, txn: &Txn) -> Result<()> {
         let record = record(txn)?;
-        self.file.write_all(&record).context("saving an edit")?;
+        append_record(&mut self.file, &record, &mut self.broken)?;
         self.ids.push(txn.id);
-        self.unsynced = true;
-        Ok(())
+        let file = self.file.try_clone().context("saving an edit")?;
+        self.send(Disk::Sync(file)).context("saving an edit")
     }
 
     /// Keeps a blob that a transaction about to be appended names, on disk, until no pending
     /// transaction names it any more.
     pub fn put_blob(&self, hash: BlobHash, bytes: &[u8]) -> Result<()> {
-        let dir = self.dir.join(BLOBS);
-        let path = dir.join(hash.to_string());
+        let path = self.dir.join(BLOBS).join(hash.to_string());
         if path.is_file() {
             return Ok(());
         }
-        let part = dir.join(format!("{hash}.part"));
-        let mut file = File::create(&part).context("saving a blob")?;
+        // In place: `open` drops a blob whose bytes do not hash to its name.
+        let mut file = File::create(&path).context("saving a blob")?;
         file.write_all(bytes).context("saving a blob")?;
-        file.sync_data().context("saving a blob")?;
-        std::fs::rename(&part, &path).context("saving a blob")?;
-        sync_dir(&dir)
+        self.send(Disk::Sync(file)).context("saving a blob")
     }
 
-    /// Called often (every frame): drops what is no longer pending from the file now and then,
-    /// and forces what was appended to the disk once [`SYNC_EVERY`] has passed.
+    /// Called often (every frame): reports what the sync thread could not do, and empties the
+    /// file once nothing is pending any more.
     pub fn keep(&mut self, pending: &[&Txn]) -> Result<()> {
-        if self.ids.len() > pending.len() || self.has_stale(pending) {
-            let due = pending.is_empty() || self.compacted_at.elapsed() >= COMPACT_EVERY;
-            if due {
-                let txns: Vec<Txn> = pending.iter().map(|&t| t.clone()).collect();
-                return self.rewrite(&txns);
+        let failed = self.failed.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(text) = failed {
+            bail!("{text}");
+        }
+        if pending.is_empty() && !self.ids.is_empty() {
+            self.file.set_len(0).context("dropping confirmed edits")?;
+            self.ids.clear();
+            if let Ok(entries) = std::fs::read_dir(self.dir.join(BLOBS)) {
+                for entry in entries.filter_map(|e| e.ok()) {
+                    let _ = std::fs::remove_file(entry.path());
+                }
             }
         }
-        if self.unsynced && self.synced_at.elapsed() >= SYNC_EVERY {
-            self.sync()?;
+        Ok(())
+    }
+
+    /// Waits until everything written so far is on the disk. For tests and for shutdown.
+    pub fn flush(&self) {
+        let (reply, done) = std::sync::mpsc::channel();
+        if let Some(disk) = &self.disk
+            && disk.send(Disk::Flush(reply)).is_ok()
+        {
+            let _ = done.recv();
         }
-        Ok(())
     }
 
-    /// Whether something appended waits to be forced to the disk.
-    pub fn unsynced(&self) -> bool {
-        self.unsynced
-    }
-
-    /// Forces everything appended to the disk now.
-    pub fn sync(&mut self) -> Result<()> {
-        self.file.sync_data().context("saving edits")?;
-        self.unsynced = false;
-        self.synced_at = Instant::now();
-        Ok(())
-    }
-
-    fn has_stale(&self, pending: &[&Txn]) -> bool {
-        let pending: HashSet<TxnId> = pending.iter().map(|t| t.id).collect();
-        self.ids.iter().any(|id| !pending.contains(id))
+    fn send(&self, job: Disk) -> Result<()> {
+        let Some(disk) = &self.disk else {
+            bail!("the thread that saves edits is not running");
+        };
+        disk.send(job)
+            .map_err(|_| anyhow::anyhow!("the thread that saves edits has stopped"))
     }
 
     /// Replaces the file with one holding `txns`, and drops the blobs none of them names.
@@ -199,9 +226,6 @@ impl Outbox {
             .open(&path)
             .context("saving edits")?;
         self.ids = txns.iter().map(|t| t.id).collect();
-        self.unsynced = false;
-        self.synced_at = Instant::now();
-        self.compacted_at = Instant::now();
 
         let named: HashSet<String> = txns
             .iter()
@@ -218,6 +242,74 @@ impl Outbox {
         }
         Ok(())
     }
+}
+
+impl Drop for Outbox {
+    fn drop(&mut self) {
+        self.flush();
+        self.disk = None;
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Runs on its own thread: does the jobs in order, until the outbox is dropped.
+fn sync_thread(jobs: &Receiver<Disk>, failed: &Mutex<Option<String>>) {
+    while let Ok(first) = jobs.recv() {
+        let batch: Vec<Disk> = std::iter::once(first).chain(jobs.try_iter()).collect();
+        let mut flushed = false;
+        for job in batch {
+            match job {
+                Disk::Sync(file) => {
+                    if let Err(err) = file.sync_data() {
+                        *failed.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some(format!("saving edits: {err}"));
+                    }
+                }
+                Disk::Flush(reply) => {
+                    let _ = reply.send(());
+                    flushed = true;
+                }
+            }
+        }
+        if !flushed {
+            std::thread::sleep(SYNC_GAP);
+        }
+    }
+}
+
+/// A file a record is appended to, and taken back from when the write stops halfway.
+trait Rollback {
+    fn size(&self) -> io::Result<u64>;
+    fn cut_to(&self, size: u64) -> io::Result<()>;
+}
+
+impl Rollback for File {
+    fn size(&self) -> io::Result<u64> {
+        Ok(self.metadata()?.len())
+    }
+
+    fn cut_to(&self, size: u64) -> io::Result<()> {
+        self.set_len(size)
+    }
+}
+
+/// Appends a record whole or not at all: `write_all` may have written part of it when it
+/// fails, and reading stops at the first record that does not check out (`parse`).
+fn append_record<F: Write + Rollback>(file: &mut F, record: &[u8], broken: &mut bool) -> Result<()> {
+    if *broken {
+        bail!("the file of unsent edits is damaged; edits are no longer saved on this computer");
+    }
+    let before = file.size().context("saving an edit")?;
+    if let Err(err) = file.write_all(record) {
+        // Take the part of a record back, so the next one starts where a record may start.
+        if file.cut_to(before).is_err() {
+            *broken = true;
+        }
+        return Err(err).context("saving an edit");
+    }
+    Ok(())
 }
 
 fn record(txn: &Txn) -> Result<Vec<u8>> {
@@ -298,6 +390,7 @@ fn sync_dir(dir: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use mdaw_model::{Device, DeviceId, DeviceKind, EntityId, PluginFormat, TrackId};
+    use std::time::Instant;
 
     fn edit(n: u8, state: Option<BlobHash>) -> Txn {
         let device = Device::new(
@@ -407,23 +500,117 @@ mod tests {
         outbox.append(&a).unwrap();
         outbox.append(&b).unwrap();
 
-        // `a` is confirmed. Not compacted at once while something is still pending...
+        let blob = dir.path().join(BLOBS).join(hash.to_string());
+
+        // `a` is confirmed: nothing is dropped while something is still pending...
         outbox.keep(&[&b]).unwrap();
         assert_eq!(outbox.len(), 2);
-        // ...but once a second has passed.
-        outbox.compacted_at -= COMPACT_EVERY;
-        outbox.keep(&[&b]).unwrap();
-        assert_eq!(outbox.len(), 1);
-        assert!(!dir.path().join(BLOBS).join(hash.to_string()).exists());
-        // And at once when nothing is pending.
+        assert!(blob.exists());
+        // ...and everything once nothing is.
         outbox.keep(&[]).unwrap();
         assert!(outbox.is_empty());
+        assert!(!blob.exists());
         drop(outbox);
         let (_, saved) = Outbox::open(dir.path()).unwrap();
         assert!(saved.txns.is_empty());
     }
 
-    /// What saving an edit costs on this machine, with and without forcing it to the disk. Run
+    #[test]
+    fn a_torn_blob_is_not_restored() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut outbox, _) = Outbox::open(dir.path()).unwrap();
+        let hash = blob_hash(b"settings");
+        let a = edit(1, Some(hash));
+        outbox.append(&a).unwrap();
+        let blob = dir.path().join(BLOBS).join(hash.to_string());
+        std::fs::write(&blob, b"sett").unwrap();
+        drop(outbox);
+
+        let (_, saved) = Outbox::open(dir.path()).unwrap();
+        assert_eq!(saved.txns, [a]);
+        assert!(saved.blobs.is_empty());
+        assert!(!blob.exists(), "removed, so that it can be written again");
+    }
+
+    #[test]
+    fn the_file_is_on_disk_after_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut outbox, _) = Outbox::open(dir.path()).unwrap();
+        let a = edit(1, None);
+        outbox.append(&a).unwrap();
+        outbox.flush();
+        drop(outbox);
+        let (_, saved) = Outbox::open(dir.path()).unwrap();
+        assert_eq!(saved.txns, [a]);
+    }
+
+    /// Writes half of the first write, then fails; `cut_to` fails too if `stuck`.
+    struct CutShort {
+        file: File,
+        written: bool,
+        stuck: bool,
+    }
+
+    impl Write for CutShort {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.written {
+                return self.file.write(buf);
+            }
+            self.written = true;
+            self.file.write_all(&buf[..buf.len() / 2])?;
+            Err(io::Error::other("the disk is full"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.file.flush()
+        }
+    }
+
+    impl Rollback for CutShort {
+        fn size(&self) -> io::Result<u64> {
+            self.file.size()
+        }
+
+        fn cut_to(&self, size: u64) -> io::Result<()> {
+            if self.stuck {
+                return Err(io::Error::other("read-only"));
+            }
+            self.file.cut_to(size)
+        }
+    }
+
+    #[test]
+    fn a_write_cut_short_is_taken_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(PENDING);
+        let open = || OpenOptions::new().create(true).append(true).open(&path).unwrap();
+        let (a, b) = (edit(1, None), edit(2, None));
+
+        let mut broken = false;
+        let mut torn = CutShort {
+            file: open(),
+            written: false,
+            stuck: false,
+        };
+        assert!(append_record(&mut torn, &record(&a).unwrap(), &mut broken).is_err());
+        assert!(!broken);
+        append_record(&mut open(), &record(&b).unwrap(), &mut broken).unwrap();
+        let (txns, whole) = parse(&std::fs::read(&path).unwrap());
+        assert_eq!(txns, std::slice::from_ref(&b));
+        assert_eq!(whole, std::fs::metadata(&path).unwrap().len() as usize);
+
+        // When the part cannot be taken back, nothing more is appended.
+        let mut stuck = CutShort {
+            file: open(),
+            written: false,
+            stuck: true,
+        };
+        assert!(append_record(&mut stuck, &record(&a).unwrap(), &mut broken).is_err());
+        assert!(broken);
+        assert!(append_record(&mut open(), &record(&a).unwrap(), &mut broken).is_err());
+    }
+
+    /// What saving an edit costs on this machine, with and without waiting for the disk. Run
     /// by hand: `cargo test --release -p mdaw-client --lib outbox -- --ignored --nocapture`,
     /// with `MDAW_BENCH_DIR` on the disk to measure (the default temporary directory may be
     /// memory).
@@ -436,21 +623,21 @@ mod tests {
             None => tempfile::tempdir().unwrap(),
         };
         let (mut outbox, _) = Outbox::open(dir.path()).unwrap();
-        for sync in [false, true] {
+        for flush in [false, true] {
             let mut times = Vec::new();
             for n in 0..500 {
                 let txn = edit(n as u8, None);
                 let started = Instant::now();
                 outbox.append(&txn).unwrap();
-                if sync {
-                    outbox.sync().unwrap();
+                if flush {
+                    outbox.flush();
                 }
                 times.push(started.elapsed());
             }
             times.sort();
             eprintln!(
                 "append{}: p50 {:.3} ms, p99 {:.3} ms",
-                if sync { " + sync_data" } else { "" },
+                if flush { " + flush" } else { "" },
                 times[250].as_secs_f64() * 1e3,
                 times[495].as_secs_f64() * 1e3
             );

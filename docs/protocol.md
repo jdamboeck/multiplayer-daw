@@ -189,10 +189,11 @@ same way, behind the uploads that start over.
 
 **Pending edits are on disk.** The desktop client keeps an outbox per project, under its profile
 (`projects/<server fingerprint>/`): each transaction is appended to a file and handed to the
-operating system before it is sent, so a crash of the client never loses it; the file is forced
-to the disk within 250 ms, so a power cut may take the edits of that last moment. Blobs a pending
-transaction names are kept next to it until it is confirmed. Confirmed transactions are dropped
-from the file at most once a second, by writing it anew and renaming it over the old one. On the
+operating system before it is sent, so a crash of the client never loses it; a thread of the
+outbox forces the file to the disk within about 50 ms, so a power cut may take the edits of that
+last moment, and the UI never waits for the disk. Blobs a pending transaction names are written in
+place next to it until it is confirmed, and checked by their hash when read. Confirmed
+transactions are dropped by emptying the file once nothing is pending any more. On the
 next start the client shows what the outbox holds at once, uploads its blobs again and sends the
 transactions again; the server answers those it had from their receipts. One it had refused is
 refused again and taken back again, with the notice once more. Without a server (the local mode)
