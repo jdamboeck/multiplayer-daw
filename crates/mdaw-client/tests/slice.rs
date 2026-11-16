@@ -52,6 +52,22 @@ fn serve(dir: &Path, listen: &str) -> Server {
     .unwrap()
 }
 
+/// Waits until the plugin guard of the client with this profile has let go of the plugins
+/// it started (`plugins-starting` gone or empty), so that killing the client now does not
+/// switch them off. The client keeps running between commands, so its timer runs.
+fn wait_settled(profile: &Path) {
+    let file = profile.join("engine").join("plugins-starting");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while std::fs::metadata(&file).is_ok_and(|m| m.len() > 0) {
+        assert!(
+            Instant::now() < deadline,
+            "the plugin guard never settled: {}",
+            file.display()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 // ---- a client process ------------------------------------------------------------------------
 
 struct Client {
@@ -481,8 +497,6 @@ fn edits_survive_a_crash_and_arrive_once() {
     let mut ann = Client::start(&server, "Ann", &ann_profile, &clap);
     let mut ben = Client::start(&server, "Ben", &base.path().join("ben"), &clap);
     let seq = build_song(&mut ann);
-    // Ann's synth starts with the song: from here the plugin guard's settle time runs.
-    let ann_started = Instant::now();
     ben.wait_seq(seq);
 
     // Offline: two edits, then a crash.
@@ -492,20 +506,19 @@ fn edits_survive_a_crash_and_arrive_once() {
     ann.cmd("set-note Keys k 0 pitch 59");
     let pending: u64 = ann.get("seq", "unconfirmed").parse().unwrap();
     assert_eq!(pending, 2, "5: two edits waiting");
-    // Past the plugin guard's 5 s settle time, so the crash does not switch the synth off.
-    std::thread::sleep(Duration::from_millis(6000).saturating_sub(ann_started.elapsed()));
+    // Wait for the plugin guard to let go of the synth, so the crash does not switch it off.
+    wait_settled(&ann_profile);
     ann.crash();
 
     let server = serve(&data, &addr);
     let mut ann = Client::start(&server, "Ann", &ann_profile, &clap);
-    let ann_started = Instant::now();
     let after_restart = ann.seq();
     assert_eq!(after_restart, seq + 2, "5: the offline edits arrived once");
     ben.wait_seq(seq + 2);
 
     // Online: an edit, and a crash right after sending it.
-    // Past the plugin guard's 5 s settle time, so the crash does not switch the synth off.
-    std::thread::sleep(Duration::from_millis(6000).saturating_sub(ann_started.elapsed()));
+    // Wait for the plugin guard to let go of the synth, so the crash does not switch it off.
+    wait_settled(&ann_profile);
     ann.cmd("add-notes Keys k 2.5:74");
     ann.crash();
     let mut ann = Client::start(&server, "Ann", &ann_profile, &clap);
