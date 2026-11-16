@@ -399,6 +399,36 @@ fn plugin_devices(project: &Project) -> impl Iterator<Item = (TrackId, &mdaw_mod
     })
 }
 
+/// The plugins a sync from `before` to `view` is about to start: the plugin devices of
+/// `view` whose plugin is installed and that `before` does not hold as they are (no device
+/// under that id, or one of another kind or plugin). All installed ones when there is no
+/// `before` (a whole load).
+fn starting_plugins(
+    view: &Project,
+    before: Option<&Project>,
+    installed: impl Fn(PluginFormat, &str) -> bool,
+) -> Vec<PluginKey> {
+    plugin_devices(view)
+        .filter_map(|(track, d)| match &d.kind {
+            DeviceKind::Plugin { format, id, .. } => Some((track, d.id, *format, id)),
+            DeviceKind::Builtin { .. } => None,
+        })
+        .filter(|(_, _, format, id)| installed(*format, id))
+        .filter(|(track, device, format, id)| {
+            // As `mdaw_tracktion`'s sync judges a device new: none under that id on the track
+            // before, or one of another kind or plugin (its `same_kind`).
+            let held = before
+                .and_then(|p| p.track(*track))
+                .and_then(|t| t.content.device(*device))
+                .is_some_and(|was| {
+                    matches!(&was.kind, DeviceKind::Plugin { format: f, id: i, .. } if f == format && i == *id)
+                });
+            !held
+        })
+        .map(|(_, _, format, id)| (format, id.clone()))
+        .collect()
+}
+
 /// The sources (live keys) holding each pitch on each track.
 #[derive(Default)]
 struct Held(HashMap<(TrackId, u8), Vec<u64>>);
@@ -1598,7 +1628,8 @@ impl Worker {
             })
             .map(|(_, d)| d.id)
             .collect();
-        let marked = self.mark_starting(&view);
+        let before = self.synced.clone();
+        let mut marked = self.mark_starting(&view, before.as_ref());
         let engine = self.engine.clone();
         let result = {
             let blobs = self.resolver();
@@ -1617,6 +1648,8 @@ impl Worker {
                     "The audio engine is reloading the project ({}).",
                     e.message
                 ));
+                // The load clears the engine and starts every plugin again.
+                marked |= self.mark_starting(&view, None);
                 let loaded = {
                     let blobs = self.resolver();
                     mdaw_tracktion::load_project(&engine, &view, &blobs)
@@ -1669,20 +1702,35 @@ impl Worker {
         self.publish_statuses(&problems);
     }
 
-    /// Notes the plugins of `project` that the engine does not have, and so is about to
-    /// start, on the disk. True if there are any: the caller says when they have started.
-    fn mark_starting(&mut self, project: &Project) -> bool {
+    /// The plugins installed here, as the catalog has them; read so that the `shared` lock is
+    /// not held while the guard writes its file.
+    fn installed_keys(&self) -> Vec<PluginKey> {
+        lock(&self.shared)
+            .catalog
+            .iter()
+            .map(|p| (p.format, p.id.clone()))
+            .collect()
+    }
+
+    /// Notes the plugins that a sync from `before` to `project` is about to start (see
+    /// [`starting_plugins`]) on the disk. True if there are any: the caller says when they
+    /// have started.
+    fn mark_starting(&mut self, project: &Project, before: Option<&Project>) -> bool {
+        if self.guard.is_none() {
+            return false;
+        }
+        let installed = self.installed_keys();
+        let starting = starting_plugins(project, before, |format, id| {
+            installed.iter().any(|(f, i)| *f == format && i == id)
+        });
+        self.mark(starting)
+    }
+
+    /// Notes these plugins as starting on the disk. True if there are any.
+    fn mark(&mut self, starting: Vec<PluginKey>) -> bool {
         let Some(guard) = &mut self.guard else {
             return false;
         };
-        let engine = &self.engine;
-        let starting: Vec<PluginKey> = plugin_devices(project)
-            .filter(|(_, d)| !engine.has(EntityKind::Device, raw_device(d.id)))
-            .filter_map(|(_, d)| match &d.kind {
-                DeviceKind::Plugin { format, id, .. } => Some((*format, id.clone())),
-                DeviceKind::Builtin { .. } => None,
-            })
-            .collect();
         if starting.is_empty() {
             return false;
         }
@@ -1832,7 +1880,19 @@ impl Worker {
         let Some(project) = self.synced.clone() else {
             return Vec::new();
         };
-        let marked = self.mark_starting(&project);
+        // Only this device is started, and only if its plugin is installed.
+        let installed = self.installed_keys();
+        let starting: Vec<PluginKey> = project
+            .track(track)
+            .and_then(|t| t.content.device(device))
+            .and_then(|d| match &d.kind {
+                DeviceKind::Plugin { format, id, .. } => Some((*format, id.clone())),
+                DeviceKind::Builtin { .. } => None,
+            })
+            .filter(|key| installed.contains(key))
+            .into_iter()
+            .collect();
+        let marked = self.mark(starting);
         let result = {
             let blobs = self.resolver();
             mdaw_tracktion::add_device(&self.engine, &project, track, device, &blobs)
@@ -2074,6 +2134,105 @@ mod tests {
         assert_eq!(held.change(t, 3, 60, true), Some(true));
         assert_eq!(held.change(t, 4, 60, false), None);
         assert_eq!(held.change(t, 3, 60, false), Some(false));
+    }
+
+    fn plugin(device: DeviceId, id: &str) -> mdaw_model::Device {
+        mdaw_model::Device::new(
+            device,
+            DeviceKind::Plugin {
+                format: PluginFormat::Clap,
+                id: id.into(),
+                name: id.into(),
+                state: None,
+            },
+        )
+    }
+
+    /// A project with one track holding these devices.
+    fn project(track: TrackId, devices: Vec<mdaw_model::Device>) -> Project {
+        let content = TrackContent {
+            devices: devices.into_iter().collect(),
+            ..TrackContent::default()
+        };
+        let shell = mdaw_model::TrackShell {
+            name: "T".into(),
+            color: 0,
+        };
+        let mut project = Project::default();
+        project.track_order.push_back(track);
+        project
+            .tracks
+            .insert(track, Arc::new(mdaw_model::Track::new(shell, content)));
+        project
+    }
+
+    /// Installed here: every plugin but `missing`.
+    fn installed(_: PluginFormat, id: &str) -> bool {
+        id != "missing"
+    }
+
+    fn keys(ids: &[&str]) -> Vec<PluginKey> {
+        ids.iter()
+            .map(|id| (PluginFormat::Clap, id.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn a_plugin_not_installed_is_not_starting() {
+        let mut ids = IdGen::new(ActorId(1));
+        let (t, d) = (ids.track(), ids.device());
+        let before = project(t, vec![]);
+        let view = project(t, vec![plugin(d, "missing")]);
+        assert!(starting_plugins(&view, Some(&before), installed).is_empty());
+        assert!(starting_plugins(&view, None, installed).is_empty());
+    }
+
+    #[test]
+    fn a_new_installed_device_is_starting() {
+        let mut ids = IdGen::new(ActorId(1));
+        let (t, a, b) = (ids.track(), ids.device(), ids.device());
+        let before = project(t, vec![plugin(a, "synth")]);
+        let view = project(t, vec![plugin(a, "synth"), plugin(b, "delay")]);
+        assert_eq!(
+            starting_plugins(&view, Some(&before), installed),
+            keys(&["delay"])
+        );
+    }
+
+    #[test]
+    fn an_unchanged_device_is_not_starting() {
+        let mut ids = IdGen::new(ActorId(1));
+        let (t, d) = (ids.track(), ids.device());
+        let before = project(t, vec![plugin(d, "synth")]);
+        let mut view = before.clone();
+        view.master_gain = 0.5;
+        assert!(starting_plugins(&view, Some(&before), installed).is_empty());
+    }
+
+    #[test]
+    fn a_whole_load_starts_every_installed_plugin() {
+        let mut ids = IdGen::new(ActorId(1));
+        let (t, a, b, c) = (ids.track(), ids.device(), ids.device(), ids.device());
+        let view = project(
+            t,
+            vec![plugin(a, "synth"), plugin(b, "missing"), plugin(c, "delay")],
+        );
+        assert_eq!(
+            starting_plugins(&view, None, installed),
+            keys(&["synth", "delay"])
+        );
+    }
+
+    #[test]
+    fn a_device_whose_plugin_changed_is_starting() {
+        let mut ids = IdGen::new(ActorId(1));
+        let (t, d) = (ids.track(), ids.device());
+        let before = project(t, vec![plugin(d, "synth")]);
+        let view = project(t, vec![plugin(d, "delay")]);
+        assert_eq!(
+            starting_plugins(&view, Some(&before), installed),
+            keys(&["delay"])
+        );
     }
 
     #[test]

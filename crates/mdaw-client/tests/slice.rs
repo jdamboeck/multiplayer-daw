@@ -586,6 +586,55 @@ fn a_client_without_the_plugin_hears_the_rest() {
     println!("RESULT point 6: {:?}", started.elapsed());
 }
 
+/// A plugin Ben has not got is never started by him, so it does not hold his plugin guard open
+/// while he edits, and a crash right after an edit does not switch it off once he has it.
+#[test]
+fn a_plugin_this_client_lacks_does_not_hold_the_guard_open() {
+    let clap = clap_dir();
+    let base = tempfile::tempdir_in(scratch()).unwrap();
+    let server = serve(&base.path().join("server"), "127.0.0.1:0");
+    let mut ann = Client::start(&server, "Ann", &base.path().join("ann"), &clap);
+    let ben_profile = base.path().join("ben");
+    let mut ben = Client::start(&server, "Ben", &ben_profile, &empty_clap_dir());
+    let seq = build_song(&mut ann);
+    ben.wait_seq(seq);
+    let starting = ben_profile.join("engine").join("plugins-starting");
+    for (i, pitch) in [62, 65, 69, 71, 74, 77].into_iter().enumerate() {
+        ben.cmd(&format!("add-notes Keys k {}:{pitch}", i as f64 * 0.5 + 0.25));
+        ben.cmd("sleep 1000");
+        let held = std::fs::read_to_string(&starting).unwrap_or_default();
+        assert!(
+            held.trim().is_empty(),
+            "edit {i}: Ben's guard holds plugins he never starts: {held:?}"
+        );
+    }
+    ben.cmd("add-notes Keys k 3.5:79");
+    ben.crash();
+
+    let mut ben = Client::start(&server, "Ben", &ben_profile, &clap);
+    let status = ben.cmd("device-status Synth");
+    let notices: Vec<String> = ben
+        .cmd("notices")
+        .into_iter()
+        .filter(|(k, _)| k == "notice")
+        .map(|(_, v)| v)
+        .collect();
+    println!("RESULT lacks: ben {status:?}, notices {notices:?}");
+    for notice in &notices {
+        assert!(
+            !notice.contains("switched off") && !notice.contains("ended while starting"),
+            "a plugin Ben never started was switched off: {notice}"
+        );
+    }
+    assert!(
+        status.contains(&("device_status".into(), "Running".into())),
+        "the synth runs for Ben once he has it: {status:?}"
+    );
+    ann.quit();
+    ben.quit();
+    server.stop();
+}
+
 /// Point 3 with audio devices: both clients play on their own device, and their playheads
 /// move independently. Opens the default device twice and makes sound.
 #[test]

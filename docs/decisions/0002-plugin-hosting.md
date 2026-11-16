@@ -136,7 +136,8 @@ as `<format name><TAB><plugin id>`:
 - `plugins-starting`: the plugins being started. It is written, and forced to the disk, before
   the engine is asked to add a plugin, and removed 5 s after that call returned with the client
   still running, or when the client ends the normal way. A client that dies in between leaves it
-  behind.
+  behind. Only the plugins a call actually adds are noted: not devices whose plugin is not
+  installed here, nor ones that were skipped before and that the call leaves as they are.
 - `plugins-off`: the plugins switched off because an earlier run left them in
   `plugins-starting`. On the next start the client moves them there, says which in a notice, and
   never asks the engine to start them: their devices show as failed with that reason, and the
