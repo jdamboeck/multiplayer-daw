@@ -294,6 +294,9 @@ One commit.
    engine call: the `engine.has` per device in the ordering step of `sync.rs`'s `devices`
    (the state is still read once and written once). Change only the number, and make the
    message say "is the device there, read the state, write it, is it there for the order".
+   The same holds for the per-parameter loop over continuous parameters further down in
+   `builtin_instrument`: its count `2` ("is the device there, set one parameter") becomes `3`,
+   with the message "{}: is the device there, set one parameter, is it there for the order".
    Any other failure still means stop and report.
 
 2. `apply.rs`: change `Sync::device_predecessor` to take the track's content instead of a
@@ -370,15 +373,17 @@ One commit.
    `wanted`; `StateNotApplied { reason, .. }` → the notice. The text match
    `reason.contains("not at hand")` is gone.
 
-8. Docs: `grep -rn "apply_op" docs crates` must print nothing. Reword the sentences found (the
+8. Docs: `grep -rn "apply_op" docs crates | grep -v docs/foundation-plan.md` must print
+   nothing (this plan names `apply_op` itself and stays as it is). Reword the sentences found (the
    op path no longer exists; the engine follows the model by difference, and two functions put
    a single device or its state in).
 
 **Do not** change what `sync_project` does, the bridge, or any other part of
 `audio_tracktion.rs`.
 
-**Done when** the gates pass and `grep -rn "apply_op\|single_track\|not at hand" crates` prints
-nothing.
+**Done when** the gates pass, `grep -rn "apply_op\|single_track" crates` prints nothing, and
+`grep -rn 'contains("not at hand")' crates` prints nothing (the words "not at hand" stay in
+`StateMissing`'s doc comment and `Display` text; only the text match on them is gone).
 
 ---
 
