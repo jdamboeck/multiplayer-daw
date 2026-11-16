@@ -183,7 +183,7 @@ impl Outbox {
         if let Some(text) = failed {
             bail!("{text}");
         }
-        if pending.is_empty() && !self.ids.is_empty() {
+        if pending.is_empty() && (!self.ids.is_empty() || self.broken) {
             self.file.set_len(0).context("dropping confirmed edits")?;
             // Nothing torn is left to append after.
             self.broken = false;
@@ -651,6 +651,28 @@ mod tests {
         // `a` is confirmed and nothing is pending: the file is emptied, the torn part with it.
         outbox.keep(&[]).unwrap();
         let c = edit(4, None);
+        outbox.append(&c).unwrap();
+        drop(outbox);
+        let (_, saved) = Outbox::open(dir.path()).unwrap();
+        assert_eq!(saved.txns, [c]);
+    }
+
+    #[test]
+    fn a_first_append_that_breaks_the_file_is_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut outbox, _) = Outbox::open(dir.path()).unwrap();
+        let mut stuck = CutShort {
+            file: outbox.file.try_clone().unwrap(),
+            written: false,
+            stuck: true,
+        };
+        assert!(append_record(&mut stuck, &record(&edit(1, None)).unwrap(), &mut outbox.broken).is_err());
+        assert!(outbox.broken);
+        assert!(outbox.ids.is_empty());
+
+        // Nothing was confirmed and nothing is pending: the torn part is still emptied.
+        outbox.keep(&[]).unwrap();
+        let c = edit(2, None);
         outbox.append(&c).unwrap();
         drop(outbox);
         let (_, saved) = Outbox::open(dir.path()).unwrap();
