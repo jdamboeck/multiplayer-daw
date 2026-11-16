@@ -300,6 +300,8 @@ pub struct TracktionAudio {
     /// The plugin scan, while it runs.
     scanner: Option<JoinHandle<()>>,
     shared: Arc<Mutex<Shared>>,
+    /// The one live sink, shared by everyone who plays notes, so it sees all their sources.
+    live: Arc<TeLive>,
     enable_plugins: bool,
     playing: bool,
     /// A seek the engine may not have carried out yet: shown until it has.
@@ -384,17 +386,70 @@ fn plugin_devices(project: &Project) -> impl Iterator<Item = (TrackId, &mdaw_mod
     })
 }
 
-struct TeLive(Arc<Engine>);
+/// The sources (live keys) holding each pitch on each track.
+#[derive(Default)]
+struct Held(HashMap<(TrackId, u8), Vec<u64>>);
 
-impl LiveSink for TeLive {
-    fn note_on(&self, track: TrackId, _key: u64, pitch: u8, vel: u8) {
-        let _ = self
-            .0
-            .track_live_note(raw_track(track), pitch.min(127), vel.clamp(1, 127));
+impl Held {
+    /// Records that `key` starts (`on`) or lets go of `pitch` on `track`, and says what to send
+    /// to the engine: `Some(true)` a note-on, `Some(false)` a note-off, `None` nothing. The
+    /// engine hears a pitch start with its first source and end with its last.
+    fn change(&mut self, track: TrackId, key: u64, pitch: u8, on: bool) -> Option<bool> {
+        if on {
+            let keys = self.0.entry((track, pitch)).or_default();
+            if keys.contains(&key) {
+                return None;
+            }
+            keys.push(key);
+            (keys.len() == 1).then_some(true)
+        } else {
+            let keys = self.0.get_mut(&(track, pitch))?;
+            let at = keys.iter().position(|k| *k == key)?;
+            keys.swap_remove(at);
+            if !keys.is_empty() {
+                return None;
+            }
+            self.0.remove(&(track, pitch));
+            Some(false)
+        }
+    }
+}
+
+/// Live notes to the engine, which hears plain MIDI: a pitch held by two sources on one track
+/// sounds once and ends when the last of them lets go.
+struct TeLive {
+    engine: Arc<Engine>,
+    held: Mutex<Held>,
+}
+
+impl TeLive {
+    fn new(engine: Arc<Engine>) -> Self {
+        Self {
+            engine,
+            held: Mutex::new(Held::default()),
+        }
     }
 
-    fn note_off(&self, track: TrackId, _key: u64, pitch: u8) {
-        let _ = self.0.track_live_note(raw_track(track), pitch.min(127), 0);
+    /// Updates the held pitches and sends what follows, under the lock so that two threads
+    /// cannot reorder an on and an off of one pitch (`track_live_note` only posts and returns).
+    fn send(&self, track: TrackId, key: u64, pitch: u8, vel: u8, on: bool) {
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        let vel = match held.change(track, key, pitch, on) {
+            Some(true) => vel.clamp(1, 127),
+            Some(false) => 0,
+            None => return,
+        };
+        let _ = self.engine.track_live_note(raw_track(track), pitch.min(127), vel);
+    }
+}
+
+impl LiveSink for TeLive {
+    fn note_on(&self, track: TrackId, key: u64, pitch: u8, vel: u8) {
+        self.send(track, key, pitch, vel, true);
+    }
+
+    fn note_off(&self, track: TrackId, key: u64, pitch: u8) {
+        self.send(track, key, pitch, 0, false);
     }
 }
 
@@ -454,6 +509,7 @@ impl TracktionAudio {
             }
         }
         Ok(Self {
+            live: Arc::new(TeLive::new(engine.clone())),
             engine,
             queue,
             worker: Some(worker),
@@ -898,7 +954,7 @@ impl Audio for TracktionAudio {
     }
 
     fn live(&self) -> Arc<dyn LiveSink> {
-        Arc::new(TeLive(self.engine.clone()))
+        self.live.clone()
     }
 
     fn set_output_gain(&mut self, gain: f32) {
@@ -1783,5 +1839,61 @@ fn set_state(project: &mut Project, track: TrackId, device: DeviceId, hash: Blob
         {
             *state = Some(hash);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mdaw_model::{ActorId, IdGen};
+
+    fn tracks() -> (TrackId, TrackId) {
+        let mut ids = IdGen::new(ActorId(1));
+        (ids.track(), ids.track())
+    }
+
+    #[test]
+    fn two_sources_on_one_pitch_sound_once_until_both_let_go() {
+        let (t, _) = tracks();
+        for (first, second) in [(1, 2), (2, 1)] {
+            let mut held = Held::default();
+            assert_eq!(held.change(t, 1, 60, true), Some(true));
+            assert_eq!(held.change(t, 2, 60, true), None);
+            assert_eq!(held.change(t, first, 60, false), None);
+            assert_eq!(held.change(t, second, 60, false), Some(false));
+            assert!(held.0.is_empty());
+        }
+    }
+
+    #[test]
+    fn the_same_key_twice_starts_one_note() {
+        let (t, _) = tracks();
+        let mut held = Held::default();
+        assert_eq!(held.change(t, 7, 60, true), Some(true));
+        assert_eq!(held.change(t, 7, 60, true), None);
+        assert_eq!(held.change(t, 7, 60, false), Some(false));
+        assert_eq!(held.change(t, 7, 60, false), None);
+    }
+
+    #[test]
+    fn an_off_without_an_on_sends_nothing() {
+        let (t, _) = tracks();
+        let mut held = Held::default();
+        assert_eq!(held.change(t, 3, 60, false), None);
+        assert_eq!(held.change(t, 3, 60, true), Some(true));
+        assert_eq!(held.change(t, 4, 60, false), None);
+        assert_eq!(held.change(t, 3, 60, false), Some(false));
+    }
+
+    #[test]
+    fn pitches_and_tracks_are_apart() {
+        let (a, b) = tracks();
+        let mut held = Held::default();
+        assert_eq!(held.change(a, 1, 60, true), Some(true));
+        assert_eq!(held.change(a, 1, 61, true), Some(true));
+        assert_eq!(held.change(b, 1, 60, true), Some(true));
+        assert_eq!(held.change(a, 1, 60, false), Some(false));
+        assert_eq!(held.change(b, 1, 60, false), Some(false));
+        assert_eq!(held.change(a, 1, 61, false), Some(false));
     }
 }
