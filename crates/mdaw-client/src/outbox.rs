@@ -162,12 +162,17 @@ impl Outbox {
     /// transaction names it any more.
     pub fn put_blob(&self, hash: BlobHash, bytes: &[u8]) -> Result<()> {
         let path = self.dir.join(BLOBS).join(hash.to_string());
-        if path.is_file() {
+        // A file of another length was cut short while it was written: write it again.
+        if std::fs::metadata(&path).is_ok_and(|m| m.is_file() && m.len() == bytes.len() as u64) {
             return Ok(());
         }
         // In place: `open` drops a blob whose bytes do not hash to its name.
         let mut file = File::create(&path).context("saving a blob")?;
-        file.write_all(bytes).context("saving a blob")?;
+        if let Err(err) = file.write_all(bytes) {
+            drop(file);
+            let _ = std::fs::remove_file(&path);
+            return Err(err).context("saving a blob");
+        }
         self.send(Disk::Sync(file)).context("saving a blob")
     }
 
@@ -180,6 +185,8 @@ impl Outbox {
         }
         if pending.is_empty() && !self.ids.is_empty() {
             self.file.set_len(0).context("dropping confirmed edits")?;
+            // Nothing torn is left to append after.
+            self.broken = false;
             self.ids.clear();
             if let Ok(entries) = std::fs::read_dir(self.dir.join(BLOBS)) {
                 for entry in entries.filter_map(|e| e.ok()) {
@@ -532,8 +539,11 @@ mod tests {
         assert!(!blob.exists(), "removed, so that it can be written again");
     }
 
+    /// Checks that `flush` returns and that a reopened outbox reads the edit. It cannot check
+    /// that the bytes reached the disk: reopening reads the page cache whether or not anything
+    /// was synced.
     #[test]
-    fn the_file_is_on_disk_after_flush() {
+    fn an_edit_is_read_back_after_flush() {
         let dir = tempfile::tempdir().unwrap();
         let (mut outbox, _) = Outbox::open(dir.path()).unwrap();
         let a = edit(1, None);
@@ -608,6 +618,43 @@ mod tests {
         assert!(append_record(&mut stuck, &record(&a).unwrap(), &mut broken).is_err());
         assert!(broken);
         assert!(append_record(&mut open(), &record(&a).unwrap(), &mut broken).is_err());
+    }
+
+    #[test]
+    fn a_short_blob_file_is_written_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let (outbox, _) = Outbox::open(dir.path()).unwrap();
+        let bytes = b"settings".to_vec();
+        let hash = blob_hash(&bytes);
+        let blob = dir.path().join(BLOBS).join(hash.to_string());
+        std::fs::write(&blob, &bytes[..bytes.len() / 2]).unwrap();
+
+        outbox.put_blob(hash, &bytes).unwrap();
+        assert_eq!(std::fs::read(&blob).unwrap(), bytes);
+    }
+
+    #[test]
+    fn appending_works_again_once_the_file_is_emptied() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut outbox, _) = Outbox::open(dir.path()).unwrap();
+        let a = edit(1, None);
+        outbox.append(&a).unwrap();
+        let mut stuck = CutShort {
+            file: outbox.file.try_clone().unwrap(),
+            written: false,
+            stuck: true,
+        };
+        assert!(append_record(&mut stuck, &record(&edit(2, None)).unwrap(), &mut outbox.broken).is_err());
+        assert!(outbox.broken);
+        assert!(outbox.append(&edit(3, None)).is_err());
+
+        // `a` is confirmed and nothing is pending: the file is emptied, the torn part with it.
+        outbox.keep(&[]).unwrap();
+        let c = edit(4, None);
+        outbox.append(&c).unwrap();
+        drop(outbox);
+        let (_, saved) = Outbox::open(dir.path()).unwrap();
+        assert_eq!(saved.txns, [c]);
     }
 
     /// What saving an edit costs on this machine, with and without waiting for the disk. Run
