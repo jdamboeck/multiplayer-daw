@@ -335,4 +335,60 @@ mod tests {
         let value = serde_json::from_slice::<serde_json::Value>(&data).unwrap();
         assert!(value.get("seq").is_some(), "{value}");
     }
+
+    #[test]
+    fn parameter_values_come_back_exactly() {
+        use mdaw_model::{DeviceId, EntityId, Op, TrackId};
+        // xorshift64 with a fixed seed, turned into an f64 in 0..1 from its top 53 bits.
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let mut values = vec![0.9856906946328695];
+        values.extend((0..1000).map(|_| next()));
+
+        let store = Store::in_memory().unwrap();
+        for (i, &value) in values.iter().enumerate() {
+            let seq = i as u64 + 1;
+            let mut txn = [0; 16];
+            txn[..8].copy_from_slice(&seq.to_le_bytes());
+            let event = Event {
+                seq,
+                actor: ActorId(1),
+                user: UserId(1),
+                wall_ts: 0,
+                txn: TxnId(txn),
+                ops: vec![Op::DeviceSetParam {
+                    track: TrackId(EntityId(1)),
+                    id: DeviceId(EntityId(2)),
+                    param: 27,
+                    value: Some(value),
+                }],
+                superseded: Vec::new(),
+            };
+            store.append(UserId(1), &event).unwrap();
+        }
+
+        let events = store.events_after(0, values.len() as u64).unwrap();
+        assert_eq!(events.len(), values.len());
+        for (event, &value) in events.iter().zip(&values) {
+            let [
+                Op::DeviceSetParam {
+                    value: Some(back), ..
+                },
+            ] = event.ops.as_slice()
+            else {
+                panic!("event {} came back as {:?}", event.seq, event.ops);
+            };
+            assert_eq!(
+                back.to_bits(),
+                value.to_bits(),
+                "event {}: stored {value:?}, read back {back:?}",
+                event.seq
+            );
+        }
+    }
 }

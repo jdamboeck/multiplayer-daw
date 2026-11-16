@@ -30,6 +30,9 @@ event's encoding is far below the commit itself (about 0.25 ms, `tests/commit_be
 - What the server keeps on disk (`events.data`, `snapshots.data`, `receipts.reject`,
   `meta.runs`) is JSON, written by serde from the model and protocol types as they are. There
   are no separate stored copies of the types.
+- Numbers are written in their shortest exact form and read with `serde_json`'s
+  `float_roundtrip` feature, so every `f64` comes back bit for bit; stores written before this
+  was switched on hold the exact text already and need nothing.
 - **Free changes**, no version bump, no migration:
   - adding a struct field that has `#[serde(default)]`;
   - adding an enum variant;
