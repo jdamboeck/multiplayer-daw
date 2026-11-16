@@ -76,6 +76,9 @@ const LOOK_EVERY: Duration = Duration::from_millis(500);
 const TRACE_FROM: Duration = Duration::from_millis(50);
 /// Jobs that ran this long are marked slow in the trace.
 const TRACE_SLOW: Duration = Duration::from_millis(250);
+/// A reported position older than this is not carried forward: the engine's thread is
+/// busy, and the playhead waits for it rather than run ahead on a guess.
+const POSITION_AGE_MAX: f64 = 0.1;
 
 /// How to start the engine.
 #[derive(Clone, Debug)]
@@ -868,6 +871,20 @@ impl Audio for TracktionAudio {
             Some((tick, _)) => tick as f64,
             None => self.read().position_tick as f64,
         }
+    }
+
+    fn position_aged(&self) -> (f64, f64) {
+        if let Some((tick, _)) = self.seek.get() {
+            return (tick as f64, 0.0);
+        }
+        let state = self.read();
+        let moving = state.playing && state.device_open;
+        let age = if moving && state.position_age_seconds <= POSITION_AGE_MAX {
+            state.position_age_seconds.max(0.0)
+        } else {
+            0.0
+        };
+        (state.position_tick as f64, age)
     }
 
     fn position_heard(&self) -> (f64, i64) {

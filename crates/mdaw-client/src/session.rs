@@ -738,7 +738,8 @@ impl Session {
 
     /// The playhead in ticks.
     pub fn position(&self) -> f64 {
-        self.audio.position()
+        let (tick, age) = self.audio.position_aged();
+        carried_forward(&self.tempo, self.loop_range, tick, age)
     }
 
     /// The loop region, if looping is on.
@@ -1114,6 +1115,21 @@ impl Remote {
     }
 }
 
+/// Where a transport that was at `tick`, `age` seconds ago, is now.
+fn carried_forward(tempo: &TempoMap, loop_range: Option<TickRange>, tick: f64, age: f64) -> f64 {
+    if age <= 0.0 {
+        return tick;
+    }
+    let now = tempo.seconds_to_tick(tempo.tick_to_seconds(tick) + age);
+    match loop_range {
+        Some(range) if tick < range.end.0 as f64 && now >= range.end.0 as f64 => {
+            let length = (range.end.0 - range.start.0) as f64;
+            range.start.0 as f64 + (now - range.end.0 as f64) % length
+        }
+        _ => now,
+    }
+}
+
 fn notice(notices: &mut Vec<String>, text: &str) {
     if notices.last().is_some_and(|last| last == text) {
         return;
@@ -1161,5 +1177,53 @@ pub fn new_track(ids: &mut IdGen, index: usize, after: Option<TrackId>, instrume
         shell,
         content,
         after,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mdaw_model::{PPQ, TICKS_PER_BAR};
+
+    fn tempo_120() -> TempoMap {
+        TempoMap::from_points([TempoPoint {
+            tick: Tick(0),
+            milli_bpm: 120_000,
+        }])
+    }
+
+    fn one_bar() -> Option<TickRange> {
+        Some(TickRange {
+            start: Tick(0),
+            end: Tick(TICKS_PER_BAR),
+        })
+    }
+
+    #[test]
+    fn carried_forward_without_age_is_the_tick() {
+        assert_eq!(carried_forward(&tempo_120(), one_bar(), 123.0, 0.0), 123.0);
+    }
+
+    #[test]
+    fn carried_forward_half_a_second_at_120_bpm_is_one_beat() {
+        let now = carried_forward(&tempo_120(), None, 0.0, 0.5);
+        assert!((now - PPQ as f64).abs() < 1e-6, "{now}");
+    }
+
+    #[test]
+    fn carried_forward_wraps_at_the_loop_end() {
+        let tempo = tempo_120();
+        let tick = (TICKS_PER_BAR - 10) as f64;
+        let age = tempo.tick_to_seconds(tick + 30.0) - tempo.tick_to_seconds(tick);
+        let now = carried_forward(&tempo, one_bar(), tick, age);
+        assert!((now - 20.0).abs() < 1e-6, "{now}");
+    }
+
+    #[test]
+    fn carried_forward_past_the_loop_end_is_not_wrapped() {
+        let tempo = tempo_120();
+        let tick = (TICKS_PER_BAR + 100) as f64;
+        let now = carried_forward(&tempo, one_bar(), tick, 0.5);
+        assert!((now - (tick + PPQ as f64)).abs() < 1e-6, "{now}");
     }
 }

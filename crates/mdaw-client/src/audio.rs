@@ -135,6 +135,11 @@ pub trait Audio: Any {
     fn is_playing(&self) -> bool;
     /// The playhead in ticks.
     fn position(&self) -> f64;
+    /// The playhead in ticks as the engine last reported it, and how many seconds ago that was.
+    /// The age is 0 when the position is exact or the transport stands.
+    fn position_aged(&self) -> (f64, f64) {
+        (self.position(), 0.0)
+    }
     /// The playhead in ticks, with when it is heard on [`crate::clock::now_micros`].
     fn position_heard(&self) -> (f64, i64);
 
