@@ -367,17 +367,15 @@ transaction is committed by itself, without grouping several into one commit.
 
 | Table | Holds |
 |---|---|
-| `events(seq, data)` | The log. `data` is the postcard `Event`. |
-| `receipts(user, txn, seq, reject)` | One per transaction answered, keyed by user and `TxnId`: `seq` of its event, or `reject`, the postcard `RejectReason`. Written in the same SQLite transaction as the event. |
-| `snapshots(seq, data)` | The document every 1000 events, to shorten loading. |
+| `events(seq, data)` | The log. `data` is the `Event` as JSON. |
+| `receipts(user, txn, seq, reject)` | One per transaction answered, keyed by user and `TxnId`: `seq` of its event, or `reject`, the `RejectReason` as JSON. Written in the same SQLite transaction as the event. |
+| `snapshots(seq, data)` | The document every 1000 events, as JSON, to shorten loading. |
 | `users(id, key, name)` | `UserId` per install key. |
 | `meta(key, value)` | Format version, session token, the key session secrets are derived from, actor counter, runs. |
 
 Blobs are files in `blobs/`, named by their hash in hex.
 
-The format entry is `<store version>/<protocol version>`, now `7/11`. A database with another
-format is not opened; the prototype has no migrations, so a breaking change means a new data
-directory. In particular, data directories of protocol 10 and earlier (mdaw 0.1 included) are not
-readable: move them away and start a new project.
+The format entry is the store version, now `8`. How it changes is in
+`docs/decisions/0003-stored-format.md`.
 
 A client whose outgoing queue reaches 4096 messages is disconnected and resumes later.

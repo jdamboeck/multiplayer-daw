@@ -35,7 +35,7 @@ fn run(synchronous: &str) -> Vec<Duration> {
                                 PRIMARY KEY (user, txn));",
     )
     .unwrap();
-    // About the size of a note edit as postcard.
+    // About the size of a note edit as stored.
     let data = vec![7u8; 120];
     let mut times = Vec::with_capacity(COMMITS);
     for seq in 1..=COMMITS as i64 {

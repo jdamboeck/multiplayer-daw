@@ -9,7 +9,7 @@
 
 use anyhow::{Context, Result, bail};
 use mdaw_model::{ActorId, Project, UserId};
-use mdaw_proto::{Event, PROTO_VERSION, RejectReason, TxnId};
+use mdaw_proto::{Event, RejectReason, TxnId};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 
@@ -19,8 +19,17 @@ fn int(n: u64) -> i64 {
     n as i64
 }
 
-/// Bumped when the tables change.
-const STORE_VERSION: u32 = 7;
+/// Bumped by every change to the stored format that is not free; see
+/// `docs/decisions/0003-stored-format.md`.
+const STORE_VERSION: u32 = 8;
+
+fn encode<T: serde::Serialize>(value: &T) -> Result<Vec<u8>> {
+    serde_json::to_vec(value).context("encoding for the store")
+}
+
+fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8], what: &str) -> Result<T> {
+    serde_json::from_slice(bytes).with_context(|| format!("decoding {what}"))
+}
 
 /// What the server answered a transaction with, kept for when it arrives again.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -66,16 +75,23 @@ impl Store {
                  name TEXT NOT NULL);",
         )?;
         let store = Self { db };
-        let format = format!("{STORE_VERSION}/{PROTO_VERSION}").into_bytes();
         match store.meta("format")? {
-            None => store.set_meta("format", &format)?,
-            Some(found) if found == format => {}
-            Some(found) => bail!(
-                "the project was written in format {}, this server uses {}. Formats are not migrated yet: \
-                 move the data directory away to start a new project.",
-                String::from_utf8_lossy(&found),
-                String::from_utf8_lossy(&format)
-            ),
+            None => store.set_meta("format", STORE_VERSION.to_string().as_bytes())?,
+            Some(found) => {
+                let found = String::from_utf8_lossy(&found).into_owned();
+                match found.parse::<u32>() {
+                    Err(_) => bail!(
+                        "the project was written in format {found}, from before formats could be migrated: \
+                         move the data directory away to start a new project."
+                    ),
+                    Ok(version) if version == STORE_VERSION => {}
+                    Ok(version) if version > STORE_VERSION => bail!(
+                        "the project was written by a newer server (format {found}, this server reads up to \
+                         {STORE_VERSION})."
+                    ),
+                    Ok(_) => bail!("format {found} cannot be migrated"),
+                }
+            }
         }
         Ok(store)
     }
@@ -122,9 +138,7 @@ impl Store {
         Ok(match row {
             None => None,
             Some((Some(seq), _)) => Some(Receipt::Accepted(seq as u64)),
-            Some((None, Some(reject))) => Some(Receipt::Rejected(
-                postcard::from_bytes(&reject).context("decoding a stored refusal")?,
-            )),
+            Some((None, Some(reject))) => Some(Receipt::Rejected(decode(&reject, "a stored refusal")?)),
             Some((None, None)) => bail!("a receipt without an outcome"),
         })
     }
@@ -132,7 +146,7 @@ impl Store {
     /// Appends `event`, the transaction `event.txn` of `user`, to the log together with its
     /// receipt, in one SQLite transaction: both are on disk when this returns, or neither is.
     pub fn append(&self, user: UserId, event: &Event) -> Result<()> {
-        let data = postcard::to_stdvec(event)?;
+        let data = encode(event)?;
         // Rolled back when dropped uncommitted, on any error below.
         let tx = self.db.unchecked_transaction()?;
         tx.prepare_cached("INSERT INTO events (seq, data) VALUES (?1, ?2)")?
@@ -146,7 +160,7 @@ impl Store {
     /// Records that `user`'s transaction `txn` was refused, so that it is refused again for the
     /// same reason should it come again.
     pub fn reject(&self, user: UserId, txn: TxnId, reason: &RejectReason) -> Result<()> {
-        let reject = postcard::to_stdvec(reason)?;
+        let reject = encode(reason)?;
         let tx = self.db.unchecked_transaction()?;
         tx.prepare_cached("INSERT INTO receipts (user, txn, reject) VALUES (?1, ?2, ?3)")?
             .execute(params![user.0, txn.0.as_slice(), reject])?;
@@ -162,13 +176,13 @@ impl Store {
         let rows = query.query_map(params![int(seq), int(limit)], |row| row.get::<_, Vec<u8>>(0))?;
         let mut events = Vec::new();
         for data in rows {
-            events.push(postcard::from_bytes(&data?).context("decoding a stored event")?);
+            events.push(decode(&data?, "a stored event")?);
         }
         Ok(events)
     }
 
     pub fn put_snapshot(&self, seq: u64, project: &Project) -> Result<()> {
-        let data = postcard::to_stdvec(project)?;
+        let data = encode(project)?;
         let tx = self.db.unchecked_transaction()?;
         tx.execute(
             "INSERT OR REPLACE INTO snapshots (seq, data) VALUES (?1, ?2)",
@@ -191,10 +205,7 @@ impl Store {
             .optional()?;
         match row {
             None => Ok(None),
-            Some((seq, data)) => Ok(Some((
-                seq as u64,
-                postcard::from_bytes(&data).context("decoding the snapshot")?,
-            ))),
+            Some((seq, data)) => Ok(Some((seq as u64, decode(&data, "the snapshot")?))),
         }
     }
 
@@ -224,14 +235,14 @@ impl Store {
     /// of the log it started with. Returns every run so far, this one included, oldest first.
     pub fn start_run(&self, head: u64) -> Result<Vec<Run>> {
         let mut runs: Vec<Run> = match self.meta("runs")? {
-            Some(bytes) => postcard::from_bytes(&bytes).context("stored runs")?,
+            Some(bytes) => decode(&bytes, "the stored runs")?,
             None => Vec::new(),
         };
         runs.push(Run {
             last_actor: self.last_actor()?,
             head,
         });
-        self.set_meta("runs", &postcard::to_stdvec(&runs)?)?;
+        self.set_meta("runs", &encode(&runs)?)?;
         Ok(runs)
     }
 
@@ -255,4 +266,30 @@ pub struct Run {
     /// made, or a data directory put back from a backup, can still lose them, and this keeps such
     /// a client from taking the events written since under those seqs for its own.
     pub head: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stored_rows_are_json() {
+        let store = Store::in_memory().unwrap();
+        let event = Event {
+            seq: 1,
+            actor: ActorId(1),
+            user: UserId(1),
+            wall_ts: 0,
+            txn: TxnId([1; 16]),
+            ops: Vec::new(),
+            superseded: Vec::new(),
+        };
+        store.append(UserId(1), &event).unwrap();
+        let data: Vec<u8> = store
+            .db
+            .query_row("SELECT data FROM events WHERE seq = 1", [], |row| row.get(0))
+            .unwrap();
+        let value = serde_json::from_slice::<serde_json::Value>(&data).unwrap();
+        assert!(value.get("seq").is_some(), "{value}");
+    }
 }

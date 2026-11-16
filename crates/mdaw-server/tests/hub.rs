@@ -526,6 +526,17 @@ fn a_store_in_another_format_is_refused() {
     );
 }
 
+#[test]
+fn a_store_of_a_newer_server_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("project.db");
+    let store = Store::open(&path).unwrap();
+    store.set_meta("format", b"999").unwrap();
+    drop(store);
+    let error = Store::open(&path).err().unwrap();
+    assert!(format!("{error:#}").contains("newer server"), "{error:#}");
+}
+
 /// Prints the tracks of a copy of a server's project. Run by hand with
 /// `MDAW_PROBE_DB=<copied project.db> cargo test -p mdaw-server --test hub -- --ignored probe --nocapture`.
 #[test]
